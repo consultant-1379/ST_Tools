@@ -1,0 +1,817 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+import traceback
+import argparse
+import re
+import pprint
+import pexpect
+
+import ntpath
+import signal
+import textwrap
+import socket
+import getpass
+import ipaddress
+
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.gentraf
+import hss_utils.rosetta
+import hss_utils.rosetta.services
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+HOSTNAME = socket.gethostname()
+USERID = getpass.getuser()
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+
+def quit_program(exit_code):
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+def run_cliss_cmd(cmd):
+    _INF('Executing: %s' % cmd)
+    try:
+        stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+        if returncode is not 0:
+            error_info = st_command.get_stFramework_error_message(stderr_value)
+            if error_info is None:
+                _ERR('Error: There was a problem with execution of command: %s ' % cmd )
+                _ERR('Error: For more info execute manually.')
+                quit_program(EXECUTION_ERROR)
+            else:
+                _ERR('Error: %s' % error_info)
+                quit_program(EXECUTION_ERROR)
+    except Exception as e:
+        _ERR('Error: %s. Problem with command execution.' % str(e))
+        quit_program(EXECUTION_ERROR)
+    return stdout_value
+
+
+def main():
+
+    user_config = parse_commandline()
+
+    translation_dict = {}
+    st_config = None
+    if user_config.udm:
+        if user_config.enable_http1:
+            translation_dict.update({'ENABLE_HSS_UDM_HTTP1=':'ENABLE_HSS_UDM_HTTP1=TRUE' })
+        else:
+            translation_dict.update({'ENABLE_HSS_UDM_HTTP1=':'ENABLE_HSS_UDM_HTTP1=FALSE' })
+
+        http1_tgs = user_config.http1_tgs_ports
+        _INF('TG:PORT defined for HTTP1 Servers:%s' % http1_tgs)
+        http2_tgs = user_config.http2_tgs_ports
+        _INF('TG:PORT defined for HTTP2 Servers:%s' % http2_tgs)
+        if not (set(http1_tgs) == set(http1_tgs) - set(http2_tgs)):
+            _ERR('Error: Same TG:PORT defined for both HTTP Servers:\n\t%s\n\t%s' % (http1_tgs, http2_tgs))
+            quit_program(WRONG_PARAMETER)
+
+    if user_config.maidem:
+        _INF('For the population of a maiden the Rosetta usage is mandatory. Trying to fetch info....')
+        try:
+            envs = hss_utils.rosetta.related_environments(HOSTNAME)
+            if not envs or envs[0] is None:
+                _ERR('Error: Rosetta return an empty list or None')
+                quit_program(EXECUTION_ERROR)
+        except Exception as e:
+            _ERR('Can not fetch Object "%s" from Rosetta (%s)' % (HOSTNAME,e))
+            quit_program(EXECUTION_ERROR)
+
+        st_config = hss_utils.rosetta.services.st_config_for(envs[0])
+        user_config.node = st_config.get_cabinet_oam_vip()
+        translation_dict.update({'VIPOAM_IPV4=':'VIPOAM_IPV4=%s' % user_config.node})
+        translation_dict.update({'RADDIA_IPV4=':'RADDIA_IPV4=%s' % st_config.get_cabinet_vip_raddia()})
+        RADIA_IP = translation_dict['RADDIA_IPV4='].split("=")[1]
+        translation_dict.update({'DIASCTP_IPV4=':'DIASCTP_IPV4=%s' % st_config.get_cabinet_vip_diasctp()})
+        translation_dict.update({'EXTDB_IPV4=':'EXTDB_IPV4=%s' % st_config.get_extdb_ldap_ip()})
+        if user_config.udm:
+            translation_dict.update({'UDM_IPV4=':'UDM_IPV4=%s' % st_config.get_cabinet_http_vip()})
+            UDM_IP = translation_dict['UDM_IPV4='].split("=")[1]
+            if UDM_IP == 'None':
+                _ERR('Error: Problem reading UDM IPv4')
+                quit_program(EXECUTION_ERROR)
+
+            translation_dict.update({'HTTP_MAXOUTGOINGCONNECTIONS=':'HTTP_MAXOUTGOINGCONNECTIONS=%s' % user_config.http_maxoutcons})
+            translation_dict.update({'HTTP2_MAXOUTGOINGCONNECTIONS=':'HTTP2_MAXOUTGOINGCONNECTIONS=%s' % user_config.http2_maxoutcons})
+
+        translation_dict.update({'MPV_OWNGTADDRESS=':'MPV_OWNGTADDRESS=%s' % st_config.get_hss_ss7_gt_address()})
+        translation_dict.update({'VECTOR_SUPPLIER=':'VECTOR_SUPPLIER=%s' % user_config.vector_supplier})
+        translation_dict.update({'BASE_VECTOR_SUPPLIER=':'BASE_VECTOR_SUPPLIER=' })
+        translation_dict.update({'VECTOR_PREV_CONFIGURED=':'VECTOR_PREV_CONFIGURED=FALSE' })
+        if user_config.modules:
+            modules_list = ' '.join(user_config.modules)
+            _INF('Modules list to populate "%s" ' % modules_list)
+            translation_dict.update({'MODULES=':'MODULES=(%s)'% modules_list })
+            if user_config.vector_supplier == 'AVG' and 'AVG' not in modules_list:
+                _WRN('AVG module is not in the Modules list but vector supplier is AVG')
+            #    modules_list += ' AVG'
+
+        if user_config.ipv6:
+            translation_dict.update({'VIPOAM_IPV6=':'VIPOAM_IPV6=%s' % st_config.get_cabinet_oam_vip(IPv6=True)})
+            translation_dict.update({'RADDIA_IPV6=':'RADDIA_IPV6=%s' % st_config.get_cabinet_vip_raddia(IPv6=True)})
+            translation_dict.update({'DIASCTP_IPV6=':'DIASCTP_IPV6=%s' % st_config.get_cabinet_vip_diasctp(IPv6=True)})
+            translation_dict.update({'EXTDB_IPV6=':'EXTDB_IPV6=%s' % st_config.get_extdb_ldap_ip(IPv6=True)})
+            if user_config.udm:
+                translation_dict.update({'UDM_IPV6=':'UDM_IPV6=%s' % st_config.get_cabinet_http_vip(IPv6=True)})
+                UDM_IP = translation_dict['UDM_IPV6='].split("=")[1]
+                if UDM_IP == 'None':
+                    _ERR('Error: Problem reading UDM IPv6')
+                    quit_program(EXECUTION_ERROR)
+
+        radius_client_list = []
+        for host in st_config.generators:
+            try:
+                _DEB('Getting info from TG %s ' % host)
+                cmd = "get_nic_ip_to_dest_host -v --node %s %s" % (host, RADIA_IP)
+                _INF('Executing: %s' % cmd)
+                stdout, stderr, returncode = st_command.execute_cmd('%s' % cmd ,stderr = True)
+                if returncode is 0:
+                    radius_client_list.append(stdout.rstrip())
+                else:
+                    error_info = st_command.get_stFramework_error_message(stderr)
+                    if error_info is None:
+                        _ERR('Error: There was a problem with execution of command: %s ' % cmd )
+                    else:
+                        _ERR('Error: %s' % error_info)
+                    quit_program(EXECUTION_ERROR)
+
+            except Exception as e:
+                _ERR("Error found: %s" % str(e))
+                quit_program(EXECUTION_ERROR)
+
+        translation_dict.update({'RADIUS_CLIENT_LIST=':'RADIUS_CLIENT_LIST=(%s)' % ' '.join(radius_client_list)})
+
+        _INF('For maiden installations, the user type by default is hssadministrator.')
+        user_type='hssadministrator'
+
+    else:
+    ## HSS environment already populated
+        if not user_config.node:
+            _INF('Missing --node in a re-population. Using Rosetta.')
+            try:
+                envs = hss_utils.rosetta.related_environments(HOSTNAME)
+                if not envs or envs[0] is None:
+                    _ERR('Error: Rosetta return an empty list or None')
+                    quit_program(EXECUTION_ERROR)
+            except Exception as e:
+                _ERR('Can not fetch Object "%s" from Rosetta (%s)' % (HOSTNAME,e))
+                quit_program(EXECUTION_ERROR)
+
+            st_config = hss_utils.rosetta.services.st_config_for(envs[0])
+            user_config.node = st_config.get_cabinet_oam_vip()
+
+        cmd = 'CBA_check_AandA_enabled --node %s --user com-emergency' % user_config.node
+        (output,output_err,returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if returncode:
+            _INF( 'A&A not enabled. Using user root for population.')
+            user_type='root'
+        else:
+            _INF( 'A&A enabled. Using user hssadministrator for population.')
+            user_type='hssadministrator'
+
+        cmd = 'CBA_get_traffic_info -v --node %s --user com-emergency' % user_config.node
+        try:
+            _INF('Executing: %s' % cmd)
+            stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+            if returncode is not 0:
+                error_info = st_command.get_stFramework_error_message(stderr_value)
+                if error_info is None:
+                    _ERR('Error: There was a problem with execution of command: %s ' % cmd )
+                    _ERR('Error: For more info execute manually.')
+                else:
+                    _ERR('Error: %s' % error_info)
+                quit_program(EXECUTION_ERROR)
+            else:
+                info = {}
+                for line in stdout_value.split('\n'):
+                    if line:
+                        info.update({'%s' % line.split('=')[0]:'%s' % line.split('=')[1]})
+
+                translation_dict.update({'VIPOAM_IPV4=':'VIPOAM_IPV4=%s' % info['oam']})
+                translation_dict.update({'RADDIA_IPV4=':'RADDIA_IPV4=%s' % info['dia_tcp']})
+                translation_dict.update({'DIASCTP_IPV4=':'DIASCTP_IPV4=%s' % info['dia_sctp']})
+                translation_dict.update({'EXTDB_IPV4=':'EXTDB_IPV4=%s' % info['extdb']})
+                if user_config.udm:
+                    translation_dict.update({'UDM_IPV4=':'UDM_IPV4=%s' % info['udm']})
+
+                translation_dict.update({'VECTOR_SUPPLIER=':'VECTOR_SUPPLIER=%s' % info['vector_supplier']})
+                translation_dict.update({'BASE_VECTOR_SUPPLIER=':'BASE_VECTOR_SUPPLIER=%s' % info['vector_supplier']})
+                translation_dict.update({'MPV_OWNGTADDRESS=':'MPV_OWNGTADDRESS=%s' % info['ownGTAddress']})
+                translation_dict.update({'RADIUS_CLIENT_LIST=':'RADIUS_CLIENT_LIST=(%s)' % info['radiusClient']})
+        except Exception as e:
+                _ERR('Error: %s. Problem with command execution.' % str(e))
+                quit_program(EXECUTION_ERROR)
+
+        if user_config.modules:
+            modules_list = ' '.join(user_config.modules)
+            _INF('Modules list to populate "%s" ' % modules_list)
+            translation_dict.update({'MODULES=':'MODULES=(%s)'% modules_list })
+            if user_config.vector_supplier == 'AVG' and 'AVG' not in modules_list:
+                _WRN('AVG module is not in the Modules list but vector supplier is AVG')
+            #    modules_list += ' AVG'
+
+        if user_config.vector_supplier is None:
+            translation_dict.update({'VECTOR_PREV_CONFIGURED=':'VECTOR_PREV_CONFIGURED=TRUE' })
+        else:
+            # We have to update the vector supplier according to the parameter
+            translation_dict.update({'VECTOR_SUPPLIER=':'VECTOR_SUPPLIER=%s' % user_config.vector_supplier})
+            if user_config.vector_supplier == 'AVG':
+            # Checking if it was already populated as AVG
+                _INF('VECTOR_SUPPLIER is AVG. Checking configuration to update parameter VECTOR_PREV_CONFIGURED')
+                cmd = 'CBA_run_cliss_command --node %s --cliss_user com-emergency --user com-emergency "show ManagedElement=1,HSS-Function=HSS_FUNCTION,HSS-AvgApplication=HSS_AVG,HSS-AvgConfigurationContainer=HSS-AvgConfigurationContainer,HSS-AvgFSetContainer=HSS-AvgFSetContainer" ' % user_config.node 
+                stdout_value = run_cliss_cmd (cmd)
+                prev_avg=False
+                for line in stdout_value.split('\n'):
+                    if 'HSS-AvgFSet=' in line:
+                        value = int(line.split('=')[1])
+                        if value != 0:
+                            _INF('HSS-AvgFSet defined with value different to 0: %s' % line)
+                            prev_avg=True
+
+                if prev_avg:
+                    _INF('Setting parameter VECTOR_PREV_CONFIGURED to TRUE' )
+                    translation_dict.update({'VECTOR_PREV_CONFIGURED=':'VECTOR_PREV_CONFIGURED=TRUE' })
+                else:
+                    _INF('HSS-AvgFSet only defined with value 0: %s' % stdout_value)
+                    _INF('Setting parameter VECTOR_PREV_CONFIGURED to FALSE' )
+                    translation_dict.update({'VECTOR_PREV_CONFIGURED=':'VECTOR_PREV_CONFIGURED=FALSE' })
+            else:
+                _INF('VECTOR_SUPPLIER is HLR. Checking configuration to update parameter VECTOR_PREV_CONFIGURED')
+            # Checking if it was already populated as HLR
+                cmd = 'CBA_run_cliss_command --node %s --cliss_user com-emergency --user com-emergency "show ManagedElement=1,HSS-Function=HSS_FUNCTION,HSS-IsmSdaApplication=HSS_ISMSDA,HSS-ConfigurationContainer=HSS-ConfigurationContainer,HSS-ServicesSupportContainer=HSS-ServicesSupportContainer,HSS-InstallationSupport=HSS-InstallationSupport,hss-MapStandardVersion" ' % user_config.node 
+                stdout_value = run_cliss_cmd (cmd)
+
+                if 'hss-MapStandardVersion=""' in stdout_value:
+                    _INF('hss-MapStandardVersion parameter not defined in the system: %s' % stdout_value)
+                    _INF('Setting parameter VECTOR_PREV_CONFIGURED to FALSE' )
+                    translation_dict.update({'VECTOR_PREV_CONFIGURED=':'VECTOR_PREV_CONFIGURED=FALSE' })
+                else:
+                    _INF('hss-MapStandardVersion parameter already defined in the system: %s' % stdout_value)
+                    _INF('Setting parameter VECTOR_PREV_CONFIGURED to TRUE' )
+                    translation_dict.update({'VECTOR_PREV_CONFIGURED=':'VECTOR_PREV_CONFIGURED=TRUE' })
+
+        if 'MPV_OWNGTADDRESS=' == translation_dict['MPV_OWNGTADDRESS=']:
+            _INF('MPV_OWNGTADDRESS not defined in the environment. Trying to fetch info from rosetta.... ')
+            if not st_config:
+                try:
+                    envs = hss_utils.rosetta.related_environments(HOSTNAME)
+                    if not envs or envs[0] is None:
+                        _ERR('Error: Rosetta return an empty list or None')
+                        quit_program(EXECUTION_ERROR)
+                except Exception as e:
+                    _ERR('Can not fetch Object "%s" from Rosetta (%s)' % (HOSTNAME,e))
+                    quit_program(EXECUTION_ERROR)
+                st_config = hss_utils.rosetta.services.st_config_for(envs[0])
+
+            translation_dict.update({'MPV_OWNGTADDRESS=':'MPV_OWNGTADDRESS=%s' % st_config.get_hss_ss7_gt_address()})
+
+        if user_config.udm and 'None' in translation_dict['UDM_IPV4=']:
+            _WRN('Missing UDM IPv4....Trying to fetch info from rosetta.... ')
+            if not st_config:
+                try:
+                    envs = hss_utils.rosetta.related_environments(HOSTNAME)
+                    if not envs or envs[0] is None:
+                        _ERR('Error: Rosetta return an empty list or None')
+                        quit_program(EXECUTION_ERROR)
+                except Exception as e:
+                    _ERR('Can not fetch Object "%s" from Rosetta (%s)' % (HOSTNAME,e))
+                    quit_program(EXECUTION_ERROR)
+                st_config = hss_utils.rosetta.services.st_config_for(envs[0])
+
+            translation_dict.update({'UDM_IPV4=':'UDM_IPV4=%s' % st_config.get_cabinet_http_vip()})
+
+        if user_config.udm:
+            UDM_IP = translation_dict['UDM_IPV4='].split("=")[1]
+            if UDM_IP == 'None':
+                _ERR('Error: Problem reading UDM IPv4')
+                quit_program(EXECUTION_ERROR)
+
+        if user_config.ipv6:
+            cmd = 'CBA_get_traffic_info -v --node %s -6 --user com-emergency' % user_config.node
+            try:
+                _INF('Executing: %s' % cmd)
+                stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                if returncode:
+                    error_info = st_command.get_stFramework_error_message(stderr_value)
+                    if error_info is None:
+                        _ERR('Error: There was a problem with execution of command: %s ' % cmd )
+                        _ERR('Error: For more info execute manually.')
+                    else:
+                        _ERR('Error: %s' % error_info)
+                    quit_program(EXECUTION_ERROR)
+                else:
+                    info = {}
+                    for line in stdout_value.split('\n'):
+                        if line:
+                            info.update({'%s' % line.split('=')[0]:'%s' % line.split('=')[1]})
+
+                    translation_dict.update({'RADDIA_IPV6=':'RADDIA_IPV6=%s' %  info['dia_tcp']})
+                    translation_dict.update({'DIASCTP_IPV6=':'DIASCTP_IPV6=%s' % info['dia_sctp']})
+                    translation_dict.update({'EXTDB_IPV6=':'EXTDB_IPV6=%s' % info['extdb']})
+                    if user_config.udm:
+                        translation_dict.update({'UDM_IPV6=':'UDM_IPV6=%s' % info['udm']})
+                        UDM_IP = translation_dict['UDM_IPV6='].split("=")[1]
+
+            except Exception as e:
+                    _ERR('Error: %s. Problem with command execution.' % str(e))
+                    quit_program(EXECUTION_ERROR)
+            
+            if user_config.udm and 'None' in translation_dict['UDM_IPV6=']:
+                _WRN('Missing UDM IPv6....Trying to fetch info from rosetta.... ')
+                if not st_config:
+                    try:
+                        _INF('Reading info from Rosetta')
+                        envs = hss_utils.rosetta.related_environments(HOSTNAME)
+                        if not envs or envs[0] is None:
+                            _ERR('Error: Rosetta return an empty list or None')
+                            quit_program(EXECUTION_ERROR)
+                    except Exception as e:
+                        _ERR('Can not fetch Object "%s" from Rosetta (%s)' % (HOSTNAME,e))
+                        quit_program(EXECUTION_ERROR)
+                    st_config = hss_utils.rosetta.services.st_config_for(envs[0])
+
+
+                translation_dict.update({'UDM_IPV6=':'UDM_IPV6=%s' % st_config.get_cabinet_http_vip(IPv6=True)})
+                UDM_IP = translation_dict['UDM_IPV6='].split("=")[1]
+
+            if user_config.udm and UDM_IP == 'None':
+                _ERR('Error: Problem reading UDM IPv6')
+                quit_program(EXECUTION_ERROR)
+
+            if st_config:
+                translation_dict.update({'VIPOAM_IPV6=':'VIPOAM_IPV6=%s' % st_config.get_cabinet_oam_vip(IPv6=True)})
+            else:
+                cmd = 'CBA_run_command "ip a | grep -A 6 ln_om_sc | grep inet6 " --node %s --user com-emergency -v' % user_config.node
+
+                try:
+                    _INF('Executing: %s' % cmd)
+                    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                    if returncode is not 0:
+                        error_info = st_command.get_stFramework_error_message(stderr_value)
+                        if error_info is None:
+                            _ERR('Error: There was a problem with execution of command: %s ' % cmd )
+                            _ERR('Error: For more info execute manually.')
+                        else:
+                            _ERR('Error: %s' % error_info)
+                        quit_program(EXECUTION_ERROR)
+                    else:
+                        ip = None
+                        for line in stdout_value.split('\n'):
+                            if '/128' in line:
+                                ip = line.split()[1].split('/')[0]
+
+                    translation_dict.update({'VIPOAM_IPV6=':'VIPOAM_IPV6=%s' % ip})
+
+                except Exception as e:
+                    _ERR('Error: %s. Problem with command execution.' % str(e))
+                    quit_program(EXECUTION_ERROR)
+
+    _INF('Ldap Server to populate "%s" ' % user_config.ldap_server)
+    translation_dict.update({'LDAP_IPADDRESS=':'LDAP_IPADDRESS=%s'% user_config.ldap_server })
+
+    if user_config.tlsmode != 0:
+        translation_dict.update({'HTTP2_TLSMODE=':'HTTP2_TLSMODE=%s' % user_config.tlsmode})
+        cmd = 'CBA_get_active_SC_for_COM --node %s --user com-emergency %s' % (user_config.node, ('-6' if user_config.ipv6 else ''))
+        _INF('Executing: %s' % cmd)
+        (output,output_err,returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if returncode is 0:
+            SC_IP = output.split()[1]
+            _INF( 'SC ACTIVE IP is %s for HTTP2_TLSMODE=%s' % (SC_IP, user_config.tlsmode))
+            if user_config.ipv6:
+                translation_dict.update({'SC_IP_ADDRESS_IPV6=':'SC_IP_ADDRESS_IPV6=%s' % SC_IP})
+            else:
+                translation_dict.update({'SC_IP_ADDRESS=':'SC_IP_ADDRESS=%s' % SC_IP})
+                translation_dict.update({'SC_IP_ADDRESS_IPV4=':'SC_IP_ADDRESS_IPV4=%s' % SC_IP})
+        else:
+            error_info = st_command.get_stFramework_error_message(stderr)
+            if error_info is None:
+                _ERR('Error: There was a problem with execution of command: %s ' % cmd )
+            else:
+                _ERR('Error: %s' % error_info)
+            quit_program(EXECUTION_ERROR)
+
+    if user_config.udm:
+        translation_dict.update({'HTTP_MAXOUTGOINGCONNECTIONS=':'HTTP_MAXOUTGOINGCONNECTIONS=%s' % user_config.http_maxoutcons})
+        translation_dict.update({'HTTP2_MAXOUTGOINGCONNECTIONS=':'HTTP2_MAXOUTGOINGCONNECTIONS=%s' % user_config.http2_maxoutcons})
+
+        _INF('HTTP_SERVER1 configuration: %s' % http1_tgs)
+        _INF('HTTP_SERVER2 configuration: %s' % http2_tgs)
+        generators_list = []
+        for tg_port in http1_tgs:
+            tg = tg_port.split(':')[0]
+            if tg not in generators_list:
+                generators_list.append(tg)
+        for tg_port in http2_tgs:
+            tg = tg_port.split(':')[0]
+            if tg not in generators_list:
+                generators_list.append(tg)
+        tgs_ips_dict = {}
+        for generator in generators_list:
+            try:
+                cmd = "get_nic_ip_to_dest_host -v --node %s %s %s " % (generator, ('-6' if user_config.ipv6 else ''), UDM_IP)
+                _INF('Executing: %s' % cmd)
+                stdout, stderr, returncode = st_command.execute_cmd('%s' % cmd ,stderr = True)
+                if returncode is 0:
+                    tgs_ips_dict[generator] = stdout.rstrip()
+                else:
+                    error_info = st_command.get_stFramework_error_message(stderr)
+                    if error_info is None:
+                        _ERR('Error: There was a problem with execution of command: %s ' % cmd )
+                    else:
+                        _ERR('Error: %s' % error_info)
+                    quit_program(EXECUTION_ERROR)
+
+            except Exception as e:
+                _ERR("Error found: %s" % str(e))
+                quit_program(EXECUTION_ERROR)
+
+        uri_list = []
+        for tg_port in http1_tgs:
+            tg = tg_port.split(':')[0]
+            port = tg_port.split(':')[1]
+            if user_config.ipv6 :
+                uri_list.append('[%s]:%s' % (tgs_ips_dict[tg],port))
+            else:
+                uri_list.append('%s:%s' % (tgs_ips_dict[tg],port))
+        _INF('HTTP URI LIST: %s ' % ' '.join(uri_list))
+        if user_config.ipv6 :
+            translation_dict.update({'HTTP_URI_LIST_IPV6=':'HTTP_URI_LIST_IPV6=(%s)' % ' '.join(uri_list)})
+        else:
+            translation_dict.update({'HTTP_URI_LIST=':'HTTP_URI_LIST=(%s)' % ' '.join(uri_list)})
+            translation_dict.update({'HTTP_URI_LIST_IPV4=':'HTTP_URI_LIST_IPV4=(%s)' % ' '.join(uri_list)})
+
+        uri_list = []
+        for tg_port in http2_tgs:
+            tg = tg_port.split(':')[0]
+            port = tg_port.split(':')[1]
+            uri_list.append('%s:%s' % (tgs_ips_dict[tg],port))
+        _INF('HTTP2 URI LIST: %s ' % ' '.join(uri_list))
+        if user_config.ipv6 :
+            translation_dict.update({'HTTP2_URI_LIST_IPV6=':'HTTP2_URI_LIST_IPV6=(%s)' % ' '.join(uri_list)})
+        else:
+            translation_dict.update({'HTTP2_URI_LIST=':'HTTP2_URI_LIST=(%s)' % ' '.join(uri_list)})
+            translation_dict.update({'HTTP2_URI_LIST_IPV4=':'HTTP2_URI_LIST_IPV4=(%s)' % ' '.join(uri_list)})
+
+
+    cmd = 'CBA_get_PL -v --node %s --user com-emergency' % user_config.node
+    try:
+        _INF('Executing: %s' % cmd)
+        stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+        if returncode is not 0:
+            error_info = st_command.get_stFramework_error_message(stderr_value)
+            if error_info is None:
+                _ERR('Error: There was a problem with execution of command: %s ' % cmd )
+                _ERR('Error: For more info execute manually.')
+            else:
+                _ERR('Error: %s' % error_info)
+            quit_program(EXECUTION_ERROR)
+        else:
+            number_PL = stdout_value.strip()
+            _INF('Number of PLs found: %s' % len(number_PL.split()))
+            translation_dict.update({'NUM_PLS=':'NUM_PLS=%s' % len(number_PL.split())})
+
+    except Exception as e:
+        _ERR('Error: %s. Problem with command execution.' % str(e))
+        quit_program(EXECUTION_ERROR)
+
+    missing = False
+    for key, value in translation_dict.iteritems():
+        if 'None' in value:
+            _ERR('Info not found      %s' % value)
+            missing = True
+    if missing:
+        quit_program(EXECUTION_ERROR)
+
+
+    config = {'host':HOSTNAME, 'user' : USERID}
+
+    GENTRAF = hss_utils.node.gentraf.GenTraf(config)
+    working_dir = user_config.output_path
+    GENTRAF.working_dir = working_dir
+
+    # Update the config file
+
+    cmd = 'cp -rf %s .' % user_config.netconf
+    _INF('Executing: %s' % cmd)
+    content = GENTRAF.run_command(cmd)
+    if GENTRAF.get_result_code():
+        _ERR('Error: %s' % content)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'cd ST_Population_Netconf'
+    content = GENTRAF.run_command(cmd)
+    if GENTRAF.get_result_code():
+        _ERR('Error: %s' % content)
+        quit_program(EXECUTION_ERROR)
+
+    if user_config.commit is not None:
+        cmd = 'git checkout -f %s' % user_config.commit
+        _INF('Executing: %s' % cmd)
+        content = GENTRAF.run_command(cmd)
+        if GENTRAF.get_result_code():
+            _ERR('Error: %s' % content)
+            quit_program(EXECUTION_ERROR)
+
+    cmd = 'cat ism_sda_node.data'
+    _INF('Updating file ism_sda_node.data')
+    content = GENTRAF.run_command(cmd)
+    if GENTRAF.get_result_code():
+        _ERR('Error: %s' % content)
+        quit_program(EXECUTION_ERROR)
+
+
+    with open('%s/ST_Population_Netconf/ism_sda_node.data' % working_dir, "w") as text_file:
+        for line in content:
+            fields = line.split('=')
+            if 'USER_TYPE=' in line:
+                text_str = 'USER_TYPE=%s' % user_type
+
+            elif 'RE_POPULATION=' in line:
+                text_str = 'RE_POPULATION=%s' % ('FALSE' if user_config.maidem else 'TRUE')
+
+            elif 'DIA_PEER_NODES=' in line:
+                text_str = 'DIA_PEER_NODES=%s' % ('TRUE' if user_config.peer_nodes else 'FALSE')
+
+            elif 'ACTIVATE_AUTH_FEAT=' in line:
+                text_str = 'ACTIVATE_AUTH_FEAT=%s' % ('TRUE' if user_config.maidem else 'FALSE')
+
+            elif 'IS_IPV6=' in line:
+                text_str = 'IS_IPV6=%s' % ('TRUE' if user_config.ipv6 else 'FALSE')
+
+            # Modified due to comment in the SCP_IP_ADDRESS line with the "=" character
+            elif len (fields) >= 2:
+                try:
+                    text_str = translation_dict['%s=' % fields[0]]
+                except KeyError:
+                    text_str = line
+            else:
+                text_str = line
+
+            text_file.write('%s\n' % text_str)
+
+    _INF('File ism_sda_node.data updated')
+
+    if user_config.skip_configuration:
+        _INF('Configuration skipped')
+        quit_program(SUCCESS)
+
+    channel = GENTRAF.get_channel()
+    cmd = './run_configure.sh'
+    _INF('Executing: %s' % cmd)
+    channel.write_line(cmd)
+    while (True):
+        try:
+
+            result = channel.expect([GENTRAF.get_sync_expression(),
+                                    '\n'])
+
+            if result == 0:
+                _INF('run_configure.sh execution finished')
+                break
+
+            if result == 1:
+                _INF('  %s' % channel.stdout)
+
+        except pexpect.TIMEOUT, e:
+            continue
+
+        except pexpect.EOF, e:
+            _ERR('EOF received when executing run_configure.sh')
+            quit_program(EXECUTION_ERROR)
+
+
+def parse_commandline():
+    global CWD
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description=textwrap.dedent('''
+        Prepare and execute the run_configure script.
+
+            - For a maidem (-m) all the needed information will be fetched from command line and from Rosetta that is mandatory
+
+            - For a re-population all the needed information will be fetched from HSS Node....so using of Rosetta can be skipped
+                setting --node parameter
+
+        '''),
+        epilog=textwrap.dedent(get_exit_status()))
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='IP address of the OAM IP node. If omitted, the local hostname will be used to find env in rosetta',
+                        dest='node')
+    scenario_params.add_argument('-m', '--maidem',
+                        default=False, action='store_true', dest='maidem',
+                        help='For a maidem configuration some info shall be provided by user instead of being recovered from cabinet')
+
+    scenario_params.add_argument('--vector_supplier',
+                        default=None, action='store', dest='vector_supplier', choices=['AVG','HLR'],
+                        help='For a maidem configuration this parameter is mandatory')
+
+    scenario_params.add_argument('--netconf',
+                        default='$GIT_PATH/ST_Population_Netconf', action='store', dest='netconf',
+                        help='Full path for the ST_Population_Netconf GIT repository. By default is "%(default)s"')
+
+    scenario_params.add_argument('--commit',
+                        default=None, action='store', dest='commit',
+                        help='Set an specific commit id for ST_Population_Netconf GIT repository')
+
+    scenario_params.add_argument('--udm',
+                        default=False, action='store_true',
+                        dest='udm',
+                        help='Configure information related to the UDM optional feature')
+
+    scenario_params.add_argument('--peer-nodes',
+                        default=False, action='store_true',
+                        dest='peer_nodes',
+                        help='It will populate all the peer nodes for the Diameter stacks.')
+
+    scenario_params.add_argument('--modules',nargs='+',
+                        default=None, action='store', dest='modules',
+                        choices = ['ISMSDA', 'ESM', 'SM', 'AVG'],
+                        help='List of modules to populate. Allowed values: ISMSDA SM ESM AVG. By default is None to populate all of them')
+
+## New parameters for the script (HSSSTT-260)
+    scenario_params.add_argument('--enable-http1',
+                        default=False, action='store_true',
+                        dest='enable_http1',
+                        help='Only to configure or keep the environment with the HTTP1 configuration. If omitted, HTTP1 will not be configured or it will be removed when repopulation if exists.')
+
+## New parameters for the script (HSSSTT-187)
+    scenario_params.add_argument('--tlsmode',
+                        default=0, action='store', dest='tlsmode',
+                        choices = ['0', '1', '2'],
+                        help='TLS mode for HTTP2 connections. 0 as cleartext, 1 as mTls, 2 as simple Tls. It only applies for UDM configuration. By default is "%(default)s"')
+    scenario_params.add_argument('--http-tgs-ports', nargs='+',
+                        action='store', default=['%s:10001' % (HOSTNAME)],
+                        help='List of pairs TG:Port where the HttpServer1.1 is running. It only applies for UDM configuration. If omitted, the local hostname TG will be used with the port 10001 by default. Example for several values:\n --http-tgs-ports seliiscs00092:10001 seliics00093:10001',
+                        dest='http1_tgs_ports')
+
+    scenario_params.add_argument('--http2-tgs-ports', nargs='+',
+                        action='store', default=['%s:10002' % (HOSTNAME)],
+                        help='List of pairs TG:Port where the HttpServer2.0 is running. It only applies for UDM configuration. If omitted, the local hostname TG will be used with the port 10002 by default. Example for several values:\n --http2-tgs-ports seliiscs00092:20001 seliics00092:20002',
+                        dest='http2_tgs_ports')
+
+    scenario_params.add_argument('--http-maxoutcons',
+                        action='store', default=12,
+                        dest='http_maxoutcons',
+                        help='Number of Max outgoing connections for UDM HTTP1.1 server. Default number for ST value is %(default)s')
+
+    scenario_params.add_argument('--http2-maxoutcons',
+                        action='store', default=12,
+                        dest='http2_maxoutcons',
+                        help='Number of Max outgoing connections for UDM HTTP2.0 server. Default number for ST value is %(default)s')
+
+
+## HSSSTT-168 Add LdapServer parameter
+    scenario_params.add_argument('--ldap_server',
+                        action='store', default="10.198.22.203",
+                        dest='ldap_server',
+                        help='LDAP Server IP address of the CBA environment. Default ldap server for ST value is %(default)s')
+
+    scenario_params.add_argument('-6',
+                        default=False, action='store_true',
+                        dest='ipv6',
+                        help='Select IPv6')
+
+    behaviour_params = parser.add_argument_group('Define behaviour ')
+    behaviour_params.add_argument('--skip-configuration',
+                      action='store_true', default=False,
+                      help='Do not configure, just prepare the data file.',
+                      dest='skip_configuration')
+
+
+    logging=e3utils.log.add_logging_options(parser)
+    logging.add_argument('-o', '--output',
+                        default=None, action='store', dest='output_path',
+                        help='Output path. Default is "%s/population"' % CWD)
+    args = parser.parse_args()
+
+    if args.output_path is not None and args.log_file is not None:
+        _ERR('Error: --log_file and --output_path can not be used at the same time' )
+        quit_program(ROSETTA_ERROR)
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_run_configure_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.output_path is None:
+        args.output_path = '%s/population' % CWD
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(args.output_path, 'CBA_run_configure_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    os.chdir(args.output_path)
+    CWD = os.getcwd()
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.maidem and args.vector_supplier is None:
+        _ERR('If --maidem is present --vector_supplier is mandatory')
+        quit_program(WRONG_PARAMETER)
+
+    args.netconf = st_command.real_path(args.netconf)
+    args.output_path = st_command.real_path(args.output_path)
+
+    if args.udm:
+        _INF('UDM will be configured')
+    else:
+        _WRN('UDM configuration will be skipped')
+
+    if not st_command.validate_ip(args.ldap_server, IPv6=False):
+        error_info = 'Wrong IP adress format for LDAP Server: "%s"' % args.ldap_server
+        _ERR(error_info)
+        quit_program(WRONG_PARAMETER)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    CWD = os.getcwd()
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

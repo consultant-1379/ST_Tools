@@ -1,0 +1,341 @@
+hss-utils-bin (7.38) UNRELEASED; urgency=medium
+
+  * User com-emergency by default (Jira HSSSTT-336)
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Tue, 28 Apr 2024 13:00:00 +0200
+
+hss-utils-bin (7.37) UNRELEASED; urgency=medium
+
+  * Update CBA_run_get_traffic_sample script (Jira HSSSTT-326)
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Wed, 24 Apr 2024 08:30:00 +0200
+
+hss-utils-bin (7.36) UNRELEASED; urgency=medium
+
+  * Update CBA_run_configure script (Jira HSSSTT-267)
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Fri, 20 Jan 2023 08:30:00 +0200
+
+hss-utils-bin (7.35) UNRELEASED; urgency=medium
+
+  * Updates on some scripts (Jiras HSSSTT-261 and HSSSTT-263)
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Tue, 17 Jan 2023 14:30:00 +0200
+
+hss-utils-bin (7.34) UNRELEASED; urgency=medium
+
+  * Update CBA_run_configure for HTTP1 configuration (Jira HSSSTT-260)
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Tue, 13 Dec 2022 11:30:00 +0200
+
+hss-utils-bin (7.33) UNRELEASED; urgency=medium
+
+  * Handle possible key exceptions in PL times (Jira HSSSTT-252)
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Mon, 12 Sep 2022 11:30:00 +0200
+
+hss-utils-bin (7.32) UNRELEASED; urgency=medium
+
+  * Update to N/A multiple parameters before getting the value
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Thu, 29 Jul 2022 08:30:00 +0200
+
+hss-utils-bin (7.31) UNRELEASED; urgency=medium
+
+  * Check 2 restarts in TC-CROB-0600 summary
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Thu, 28 Jul 2022 11:30:00 +0200
+
+hss-utils-bin (7.30) UNRELEASED; urgency=medium
+
+  * Fix some bugs in script CBA_testcase_release_SS7_Association (Jira HSSSTT-230)
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Mon, 04 Apr 2022 11:30:00 +0200
+
+hss-utils-bin (7.29) UNRELEASED; urgency=medium
+
+  * Fix bug in script CBA_testcase_release_SS7_Association (Jira HSSSTT-224)
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Tue, 08 Mar 2022 12:30:00 +0200
+
+hss-utils-bin (7.28) UNRELEASED; urgency=medium
+
+  * Update script CBA_testcase_upgrade
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Mon, 21 Feb 2022 12:30:00 +0200
+
+hss-utils-bin (7.27) UNRELEASED; urgency=medium
+
+  * Fix bug in both scripsts CBA_report_exec and CBA_testcase_release
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Mon, 21 Dec 2021 12:30:00 +0200
+
+hss-utils-bin (7.26) UNRELEASED; urgency=medium
+
+  * Fix bug when getting GTLA Ldap IP
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Thu, 25 Nov 2021 10:30:00 +0200
+
+hss-utils-bin (7.25) UNRELEASED; urgency=medium
+
+  * Update GTLA and CUDB scripts when both are defined in the environment
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Web, 24 Nov 2021 10:30:00 +0200
+
+hss-utils-bin (6.42) UNRELEASED; urgency=medium
+
+  * Update IP LDAP NETWORK_2 IPV6 and fix bug in HSS_getConfigEnv
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Fri, 04 Jun 2021 12:00:00 +0200
+
+hss-utils-bin (6.41) UNRELEASED; urgency=medium
+
+  * Updates for CERT Test Cases and Jira HSSSTT-194
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 31 May 2021 12:00:00 +0200
+
+hss-utils-bin (6.40) UNRELEASED; urgency=medium
+
+  * Updates for CERT and MAIDEN Test Cases
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 24 May 2021 08:00:00 +0200
+
+hss-utils-bin (6.39) UNRELEASED; urgency=medium
+
+  * Updates on scripts for Maiden TC (Jira HSSSTT-192)
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Wed, 28 Apr 2021 08:00:00 +0200
+
+hss-utils-bin (6.38) UNRELEASED; urgency=medium
+
+  * FIx bug in CBA_testcase_upgrade
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 26 Apr 2021 08:00:00 +0200
+
+hss-utils-bin (6.37) UNRELEASED; urgency=medium
+
+  * Updates for TC-CACC-0110 Maiden (Jira HSSSTT-192)
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Fri, 23 Apr 2021 08:00:00 +0200
+
+hss-utils-bin (6.36) UNRELEASED; urgency=medium
+
+  * Fix bug on parameter check pmf counter script
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 19 Apr 2021 08:00:00 +0200
+
+hss-utils-bin (6.35) UNRELEASED; urgency=medium
+
+  * Update script CBA_testcase_upgrade (Jira HSSSTT-191)
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Fri, 16 Apr 2021 12:00:00 +0200
+
+hss-utils-bin (6.34) UNRELEASED; urgency=medium
+
+  * Update scripts for Certificate TCs
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 05 Apr 2021 12:00:00 +0200
+
+hss-utils-bin (6.33) UNRELEASED; urgency=medium
+
+  * Update script CBA_run_configure not dependant on Rosetta
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 01 Feb 2021 17:00:00 +0200
+
+hss-utils-bin (6.32) UNRELEASED; urgency=medium
+
+  * Fix bug in script CBA_run_configure
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Fri, 26 Feb 2021 10:00:00 +0200
+
+hss-utils-bin (6.31) UNRELEASED; urgency=medium
+
+  * Update script CBA_run_configure new params (Jira HSSSTT-187)
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Tue, 23 Feb 2021 15:00:00 +0200
+
+hss-utils-bin (6.30) UNRELEASED; urgency=medium
+
+  * Update script CBA_run_configure (Jira HSSSTT-187)
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 15 Feb 2021 15:00:00 +0200
+
+hss-utils-bin (6.29) UNRELEASED; urgency=medium
+
+  * Update script to create TLS certificate in hardened envs
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Thu, 04 Feb 2021 15:00:00 +0200
+
+hss-utils-bin (6.28) UNRELEASED; urgency=medium
+
+  * New script for certificates expiration TCs
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 01 Feb 2021 09:00:00 +0200
+
+hss-utils-bin (6.27) UNRELEASED; urgency=medium
+
+  * Update scripts for Virtual TCs
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Wed, 28 Dec 2020 09:00:00 +0200
+
+hss-utils-bin (6.26) UNRELEASED; urgency=medium
+
+  * Improve display log messages to print on summary.txt file
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Wed, 02 Dec 2020 17:00:00 +0200
+
+hss-utils-bin (6.25) UNRELEASED; urgency=medium
+
+  * Fix bug in CBA_testcase_create_delete_restore_backup script
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 30 Nov 2020 17:00:00 +0200
+
+hss-utils-bin (6.24) UNRELEASED; urgency=medium
+
+  * New --add-severity parameter in CBA_check_alarm_logs
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Mon, 30 Nov 2020 10:30:00 +0200
+
+hss-utils-bin (6.23) UNRELEASED; urgency=medium
+
+  * Fix bug in CBA_testcase_create_delete_restore_backup script
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 30 Nov 2020 08:00:00 +0200
+
+hss-utils-bin (6.22) UNRELEASED; urgency=medium
+
+  * Allow wildcard in -i CBA_check_alarm_logs parameter
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Fri, 27 Nov 2020 08:00:00 +0200
+
+hss-utils-bin (6.21) UNRELEASED; urgency=medium
+
+  * Add info to summary from TCs executions
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Wed, 26 Nov 2020 10:00:00 +0200
+
+hss-utils-bin (6.19) UNRELEASED; urgency=medium
+
+  * Some improvements for Virtual Environment TCs
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Thu, 12 Nov 2020 13:00:00 +0200
+
+hss-utils-bin (6.18) UNRELEASED; urgency=medium
+
+  * New scripts and updates for Virtual Environment TCs
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Tue, 03 Nov 2020 13:00:00 +0200
+
+hss-utils-bin (6.17) UNRELEASED; urgency=medium
+
+  * Add IPv6 support in in CBA_run_install_vHSS
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Thu, 22 Oct 2020 08:00:00 +0200
+
+hss-utils-bin (6.16) UNRELEASED; urgency=medium
+
+  * New scripts for Expiration Certificates TCs
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Wed, 21 Oct 2020 10:00:00 +0200
+
+hss-utils-bin (6.15) UNRELEASED; urgency=medium
+
+  * Add IPv6 support in several scripts (HSSSTT-169)
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Fri, 2 Oct 2020 09:00:00 +0200
+
+hss-utils-bin (6.13) UNRELEASED; urgency=medium
+
+  * Add ldapServer parameter to CBA_run_configure (HSSSTT-168)
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Tue, 29 Sep 2020 17:00:00 +0200
+
+hss-utils-bin (6.12) UNRELEASED; urgency=medium
+
+  * Update CBA_testcase_Redundancy_bounding script
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 14 Sep 2020 10:00:00 +0200
+
+hss-utils-bin (6.11) UNRELEASED; urgency=medium
+
+  * Use synchronous bind in ExtDb_search_subscriber
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Wed, 9 Sep 2020 08:00:00 +0200
+
+hss-utils-bin (6.10) UNRELEASED; urgency=medium
+
+  * Fix bug in node variable when -V parameter defined
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 07 Sep 2020 11:00:00 +0200
+
+hss-utils-bin (6.9) UNRELEASED; urgency=medium
+
+  * New TCs for Virtual environments 
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Tue, 01 Sep 2020 10:00:00 +0200
+
+hss-utils-bin (6.7) UNRELEASED; urgency=medium
+
+  * Remove alarm monitoring from some TCs
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Thu, 27 Aug 2020 12:00:00 +0200
+
+hss-utils-bin (6.6) UNRELEASED; urgency=medium
+
+  * Check answer ls commands 
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Tue, 25 Aug 2020 12:30:00 +0200
+
+hss-utils-bin (6.5) UNRELEASED; urgency=medium
+
+  * change PATH  info directory in lock_unlock_sc
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 24 Aug 2020 12:30:00 +0200
+
+hss-utils-bin (6.4) UNRELEASED; urgency=medium
+
+  * Primary SC obtained with get_primary_sc
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Thu, 18 Aug 2020 13:30:00 +0200
+
+hss-utils-bin (6.3) UNRELEASED; urgency=medium
+
+  * Allow dumpcap usage for any user
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Thu, 13 Aug 2020 08:00:00 +0200
+
+hss-utils-bin (6.2) UNRELEASED; urgency=medium
+
+  * Check BAT compilation configuration
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Thu, 06 Aug 2020 13:00:00 +0200
+
+hss-utils-bin (6.1) UNRELEASED; urgency=medium
+
+  * Do not display ARMTOKEN in cnHSS_deb_pack_upload
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Mon, 03 Aug 2020 09:00:00 +0200
+
+hss-utils-bin (6.0) UNRELEASED; urgency=medium
+
+  * HCR50
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Fri, 24 Jul 2020 10:00:04 +0200
+
+hss-utils-bin (5.10) UNRELEASED; urgency=medium
+
+  * New tools for debian packages handling
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Thu, 02 Jul 2020 14:00:04 +0200
+
+hss-utils-bin (5.06) UNRELEASED; urgency=medium
+
+  * Allow  python_ldap-3.2.0 library
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Wed, 07 Aug 2019 14:49:04 +0200
+
+hss-utils-bin (4.82) UNRELEASED; urgency=medium
+
+  * Initial release. (Closes: #XXXXXX)
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Wed, 07 Aug 2019 14:49:04 +0200

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+
+"""Restuful API simulator"""
+
+import os
+import ssl
+import sys
+import json
+import time
+import logging
+import argparse
+
+import arfrontend as frontends
+import apisimulator
+
+
+_MAIN_VERSION_ = '1.0'
+__version__ = 'p{}_f{}_b{}'.format(_MAIN_VERSION_, frontends.__version__, apisimulator.__version__)
+
+EXIT_OK = 0
+EXIT_BAD_CMDLINE = 1
+EXIT_BAD_API = 2
+
+DEFAULT_HTTP1_PORT = 8081
+
+
+def main():
+    user_options = parse_commandline()
+    if not user_options:
+        return EXIT_BAD_CMDLINE
+
+    with open(user_options.API_DEFINITION, 'r') as contents:
+        try:
+            api = json.load(contents)
+        except Exception as error:
+            logging.error('Cannot read API definition: {}'.format(error))
+            return EXIT_BAD_API
+    api = apisimulator.new('rest', api)
+    logging.debug('API REST handler ready')
+
+    if (user_options.cert is not None) or (user_options.key is not None):
+        logging.debug('Initialize SSL/TLS context')
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        if user_options.no_ssl2:
+            ssl_ctx.options |= ssl.OP_NO_SSLv2
+        if user_options.no_ssl3:
+            ssl_ctx.options |= ssl.OP_NO_SSLv3
+        ssl_ctx.load_cert_chain(user_options.cert, user_options.key)
+    else:
+        ssl_ctx = None
+    
+    logging.info('Creating frontends...')
+    frontend_pool = []
+    if user_options.HTTP1_PORT:
+        frontend_pool.append(
+            frontends.new('http1', user_options.ADDRESS, user_options.HTTP1_PORT, ssl_ctx, api)
+        )
+    if user_options.HTTP2_PORT:
+        frontend_pool.append(
+            frontends.new('http2', user_options.ADDRESS, user_options.HTTP2_PORT, ssl_ctx, api)
+        )
+
+    logging.info('Starting...')
+    for frontend in frontend_pool:
+        frontend.start()
+
+    logging.info('Waiting for shutdown...')
+    try:
+        wait_forever()
+    except KeyboardInterrupt:
+        logging.info('Shutdown by Ctrl-C')
+
+    logging.info('Terminating frontends...')
+    for frontend in frontend_pool:
+        try:
+            frontend.stop()
+            frontend.join()
+        except Exception as error:
+            logging.warning('Cannot stop frontend: {}'.format(error))
+
+    return EXIT_OK
+
+
+def parse_commandline():
+    '''Parse and check command line'''
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('API_DEFINITION', help='JSON file with the API REST configuration')
+    parser.add_argument('ADDRESS', nargs='?', default='0.0.0.0',
+                        help='Server address to listen to')
+    parser.add_argument('HTTP1_PORT', nargs='?', default=DEFAULT_HTTP1_PORT, type=int,
+                        help='Frontend port for HTTP1 to listen to')
+    parser.add_argument('-2', '--http2-port', default=0, type=int, dest='HTTP2_PORT',
+                        help='Enable HTTP2 frontend at given port. Disabled by default.')
+    parser.add_argument('-d', '--debug', action='store_true', default=False, dest='debug',
+                        help='Enable verbose messages')
+    parser.add_argument('--version', action='version', version=__version__)
+    
+    ssltls = parser.add_argument_group('SSL/TLS configuration')
+    ssltls.add_argument('-c', '--cert', default=None, dest='cert',
+                        help='Path to server certificate for SSL/TLS server')
+    ssltls.add_argument('-k', '--key', default=None, dest='key',
+                        help='Path to server key for SSL/TLS server')
+    ssltls.add_argument('--no-ssl2', action='store_true', default=False, dest='no_ssl2',
+                        help='Prevents an SSLv2 connection')
+    ssltls.add_argument('--no-ssl3', action='store_true', default=False, dest='no_ssl3',
+                        help='Prevents an SSLv3 connection')
+    
+    args = parser.parse_args()
+
+    if not os.path.exists(args.API_DEFINITION):
+        logging.error('API definion "{}" not found!'.format(args.API_DEFINITION))
+        return
+    
+    if args.cert is not None:
+        if not os.path.exists(args.cert):
+            logging.error('Certificate file "{}" not found!'.format(args.cert))
+            return
+        if not args.keys:
+            logging.warning('Server key file not specified!')
+
+    if args.key is not None:
+        if not os.path.exists(args.key):
+            logging.error('Key file "{}" not found!'.format(args.key))
+            return
+        if not args.cert:
+            logging.warning('Certificate file not specified!')
+
+    if args.HTTP1_PORT == args.HTTP2_PORT:
+        if not args.HTTP1_PORT:
+            logging.error('HTTP1 and HTTP2 frontends are disabled (port 0). This means no action!')
+        else:
+            logging.error('HTTP1 and HTTP2 cannot share the same port!')
+        return
+
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+        
+    return args
+
+
+def wait_forever():
+    '''Do nothing forever'''
+    while True:
+        time.sleep(30.0)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

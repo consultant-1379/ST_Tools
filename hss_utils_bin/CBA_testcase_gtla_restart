@@ -1,0 +1,275 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def main():
+    global TC
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+
+        TC.connect_to_node()
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        _INF('Processors status')
+        TC.display_processors_state()
+        TC.start_alarm_monitoring()
+        alarm_filters = [{'specificProblem':'HSS, External Database, Primary URL Connection Error'}]
+
+        TC.add_alarm_filters(alarm_filters)
+        TC.display_alarm_filter()
+
+        cmd = 'GTLA_restart --node %s -v' % user_config.extdb
+        timestamp = datetime.now()
+        action = 'Restart GTLA '
+        restart_begin = time.time()
+        TC.run_stFramework_command(cmd, check_result = True)
+
+        _INF('Wait for ldap connections to be up')
+        timeout = float(user_config.wait_time)
+        for processor in TC.processors:
+            now = time.time()
+            TC.wait_for_all_ExtDb_connections_up(processor, timeout,wait_time=2)
+            timeout -= time.time() - now
+
+            if timeout < float(0):
+                error_info = 'Timeout. Waiting for more than %s sec.' % user_config.wait_time
+                _ERR(error_info)
+                quit_program(st_command.EXECUTION_ERROR, error_info)
+
+        restart_time = time.time() - restart_begin
+        TC.send_test_case_info('%-*s executed at %s   Action time (sec) %.2f' % (15,action,
+                                                                                  timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                                  float(restart_time)))
+        if not TC.wait_for_expected_alarms(5.0):
+            info = 'Expected alarm has not been received'
+            _ERR(info)
+            quit_program(st_command.EXECUTION_ERROR,message=info)
+
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+    except connection.Unauthorized, e: 
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed), e: 
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF), e: 
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError, e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError, e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Restart a gtla and wait until all the ldap connections are up',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('--gtla',
+                        default=None, action='store', dest='extdb',
+                        help='OAM IP of GTLA. If ommitted local hostname will be used to find it in rosetta')
+
+    scenario_params.add_argument('-t', '--time',
+                        default=120, type=int, action='store', dest='wait_time',
+                        help='Waiting time for all ldap connections to be up. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_gtla_restart_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_gtla_restart_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    if args.extdb is None:
+        _INF('Using rosetta for getting OAM IP of GTLA.')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            for extdb in config.raw['extdbs']:
+                if extdb['type'] in ['GTLA','vGTLA']:
+                    args.extdb = config.get_extdb_oam_ip(extdb=0)
+                    _INF('%s         : %s' % (extdb['type'], args.extdb))
+                    break
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable,KeyError), e:
+            error_info = 'Error: %s. Use command line parameter --gtla' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    if args.extdb is None:
+            error_info = 'Error: OAM IP of GTLA not found. Use command line parameter --gtla'
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

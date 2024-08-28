@@ -1,0 +1,1007 @@
+#!/usr/bin/env python
+import cmd
+import sys
+sys.path.append('/tsp/projects/HSS/ST_tools/lib/python2.7/site-packages')
+import json
+import time
+import Queue
+import select
+import socket
+import os.path
+CWD = os.getcwd()
+import hashlib
+import logging
+import telnetlib
+import threading
+from optparse import OptionParser
+
+try:
+    from gais.log import INF
+    from gais.log import DEB
+    from gais.log import ERR
+    from gais.log import WRN
+
+    import gais.net.types
+    import gais.net.session.factory
+    import gais.net.connection.common
+    import gais.net.connection.protocols.telnet
+    import gais.net.connection.protocols.telnet._telnet
+
+except ImportError:
+    print 'ERROR: required GAIS libraries not found in this system!'
+    sys.exit(-1)
+
+DEFAULT_TTCN_CLI_PROMPT = 'TTCN> '
+DEFAULT_TTCN_CLI_PORT = 44570
+
+# Exit codes
+NO_ERROR = 0
+CMDLINE_ERROR =  1
+NET_ERROR = 2
+USER_CANCEL = 3
+NOT_CONNECTED = 4
+
+def isEqual (aliasValue, expectedValue):
+    try:
+        a = float(aliasValue)
+        b = float(expectedValue)
+    except:
+        a = str(aliasValue)
+        b = str(expectedValue)
+    finally:
+        return a == b
+        
+def isNotEqual (aliasValue, expectedValue):
+    try:
+        a = float(aliasValue)
+        b = float(expectedValue)
+    except:
+        a = str(aliasValue)
+        b = str(expectedValue)
+    finally:
+        return a != b
+        
+def isGreater (aliasValue, expectedValue):
+    try:
+        a = float(aliasValue)
+        b = float(expectedValue)
+    except:
+        a = str(aliasValue)
+        b = str(expectedValue)
+    finally:
+        return a > b
+        
+def isGreaterEqual (aliasValue, expectedValue):
+    try:
+        a = float(aliasValue)
+        b = float(expectedValue)
+    except:
+        a = str(aliasValue)
+        b = str(expectedValue)
+    finally:
+        return a >= b
+       
+def isLess (aliasValue, expectedValue):
+    try:
+        a = float(aliasValue)
+        b = float(expectedValue)
+    except:
+        a = str(aliasValue)
+        b = str(expectedValue)
+    finally:
+        return a < b
+        
+def isLessEqual (aliasValue, expectedValue):
+    try:
+        a = float(aliasValue)
+        b = float(expectedValue)
+    except:
+        a = str(aliasValue)
+        b = str(expectedValue)
+    finally:
+        return a <= b
+       
+OPERATORS ={'gt':isGreater,
+            'ge':isGreaterEqual,
+            'eq':isEqual,
+            'ne':isNotEqual,
+            'lt':isLess,
+            'le':isLessEqual }
+
+
+class ShellOptionParser(OptionParser):
+    def error(self, msg):
+        print msg
+    def exit(self, code=0, msg=None):
+        if msg is not None:
+            print msg
+
+
+class TTCNClient(object):
+    def __init__(self):
+        self.__connection = None
+        self.prompt = DEFAULT_TTCN_CLI_PROMPT
+        self.__buffer = ''
+        self.__use_alias_only = True
+        self.__force_quit = False
+        self.__phase_control = {
+            'mode': 'ScGrpMode',
+            'phase': 'ScGrpCurrentPhase',
+            'start': 'ScGrpStart',
+            'terminate': 'ScGrpTerminate',
+            'status': 'ScStatus'
+            }
+        
+    @property
+    def forced_to_quit(self):
+        return self.__force_quit
+
+    @property
+    def phase_control(self):
+        return self.__phase_control
+
+    def set_phase_control(self, key, value):
+        if key not in self.__phase_control.keys():
+            return False
+        self.__phase_control[key] = value
+        return True
+
+    @property
+    def use_alias_only(self):
+        return self.__use_alias_only
+
+    def use_variables_as_literals(self):
+        self.__use_alias_only = False
+
+    def use_variables_as_alias(self):
+        self.__use_alias_only = True
+
+    def _variable_name_(self, variable):
+        return ('$%s$' % variable) if self.__use_alias_only else variable
+
+    def _R_(self, variable):
+        return (self._variable_name_('read_%s' % variable)
+                if self.__use_alias_only else variable)
+
+    def _W_(self, variable):
+        return (self._variable_name_('write_%s' % variable)
+                if self.__use_alias_only else variable)
+
+    def _wait_prompt_(self):
+        try:
+            result = self.__connection.expect([self.prompt,
+                                               gais.net.connection.common.EOF,
+                                               gais.net.connection.common.TIMEOUT],
+                                              timeout=10.0)
+            if result in [1, 2]:
+                WRN('TTCN connection closed from remote! (cause: %s)' % result)
+                self._force_close_()
+                return False
+            
+            self.__buffer = self.__connection.before + self.__connection.match
+            DEB("TTCN buffer: %s" % repr(self.__buffer))
+            
+            return True
+        except Exception, e:
+            INF('Exception: %s' % e)
+            return False
+
+    @property
+    def online(self):
+        return self.__connection is not None
+
+    def connect(self, uri):
+        try:
+            self.__connection = gais.net.connection.factory.new_connection(uri)
+            self.__connection.open(timeout=10.0)
+            if not self._wait_prompt_():
+                WRN('TTCN connected but unexpected prompt')
+
+        except gais.net.connection.common.CannotDecodeURI:
+            ERR('Invalid URI format "%s"' % uri)
+            self.__connection = None
+        except gais.net.connection.protocols.telnet._telnet.TelnetConnectionError:
+            ERR('Cannot connect to %s' % uri)
+            self.__connection = None
+
+    def _force_close_(self):
+        try:
+            if self.__connection is not None:
+                self.__connection.close()
+        except:
+            WRN('Error closing connection')
+        finally:
+            self.__connection = None
+        self.__force_quit = True
+
+    def close(self):
+        if not self.online:
+            return
+        self.__connection.close()
+        self.__connection = None
+
+    def shutdown(self):
+        if not self.online:
+            return
+        self.__connection.sendline('stop')
+        self.close()
+
+    def __parse_alias_buffer__(self):
+        DEB('Get alias from: "%s"' % repr(self.__buffer))
+        buffer = self.__buffer.splitlines()
+        aliases = {}
+        for line in buffer[2:-1]:
+            if line.startswith('No aliases'):
+                return {}
+            if line == "":
+                continue
+            line = line.strip()
+            line = line.split('-')
+            if len(line) < 2:
+                WRN('Cannot parse alias definition: "%s"' % repr(line))
+                continue
+            original = '-'.join(line[:-1])
+            original = original.strip()
+            alias = line[-1].strip()
+            aliases[alias] = original
+        return aliases
+
+    def __parse_get_buffer__(self):
+        DEB('Get value from: "%s"' % repr(self.__buffer))
+        buffer = self.__buffer.splitlines()
+        aliases = {}
+        for line in buffer[1:-1]:
+            if line.startswith('The variable "'):
+                return None
+            line = line.strip()
+            line = line.split(':=')
+            if len(line) < 2:
+                WRN('Cannot parse value definition: "%s"' % repr(line))
+                continue
+            return line[-1].strip()
+
+    def __parse_set_buffer__(self):
+        DEB('Set value from: "%s"' % repr(self.__buffer))
+        buffer = self.__buffer.splitlines()
+        for line in buffer[1:-1]:
+            if line.startswith('The variable "'):
+                return False
+            if line.startswith('Usage:'):
+                return False
+            if line.startswith('Cannot set variable '):
+                return False
+            if line.startswith('Set content OK.'):
+                return True
+            WRN('Cannot parse SET output: "%s"' % repr(line))
+        # Asume NO-OK
+        WRN('Unknown SET output, assuming NOK')
+        return False
+
+    def keepalive(self):
+        if not self.online:
+            return False
+        self.__connection.sendline('')
+        return self._wait_prompt_()
+
+    @property
+    def alias(self):
+        if not self.online:
+            return {}
+        self.__connection.sendline('allalias')
+        if self._wait_prompt_():
+            return self.__parse_alias_buffer__()
+        else:
+            WRN('TTCN prompt lost')
+            return {}
+
+    def create_alias(self, alias_name, original):
+        if not self.online:
+            return
+        self.__connection.sendline('alias %s %s' % (original, alias_name))
+        if not self._wait_prompt_():
+            WRN('TTCN prompt lost')
+
+    def remove_alias(self, alias_name):
+        if not self.online:
+            return
+        self.__connection.sendline('unalias %s' % (alias_name))
+        if not self._wait_prompt_():
+            WRN('TTCN prompt lost')
+        if 'is not a registered alias!' in self.__buffer:
+            return False
+        elif 'Alias removed!' in self.__buffer:
+            return True
+        else:
+            WRN('Unknown TTCN response to "unalias"')
+            WRN('Response: "%s"' % repr(self.__buffer))
+            return False
+
+    def get_value(self, variable_name):
+        if not self.online:
+            return
+        self.__connection.sendline('get %s' % self._R_(variable_name))
+        if not self._wait_prompt_():
+            WRN('TTCN prompt lost')
+        else:
+            return self.__parse_get_buffer__()
+
+    def set_value(self, variable_name, value):
+        if not self.online:
+            return
+        self.__connection.sendline('set %s:=%s' % (
+                self._W_(variable_name),
+                value))
+        if not self._wait_prompt_():
+            WRN('TTCN prompt lost')
+        return self.__parse_set_buffer__()
+
+    def wait_for(self, variable_name, value, evaluation=isEqual, poll_time=5.0, timeout=0.0,
+                 step_callback=None):
+        if not self.online:
+            return
+
+        # Ensure input are valid
+        poll_time = float(poll_time)
+        timeout = float(timeout)
+
+        # Check if variable exists
+        current_value = self.get_value(variable_name)
+        if current_value is None:
+            return False
+
+        # Create poll bucle
+        now = time.time()
+        while not evaluation (current_value, value):
+            if step_callback is not None:
+                step_callback(current_value)
+            if timeout > 0:
+                if (time.time() - now) > timeout:
+                    WRN('TIMEOUT waiting for %s==%s' % (variable_name, value))
+                    return False
+            if timeout > 0:
+                remain = timeout - (time.time() - now)
+                if remain < 0.0:
+                    remain = 0.0
+            else:
+                remain = poll_time
+            time.sleep(min(poll_time, remain))
+            current_value = self.get_value(variable_name)
+            if current_value is None:
+                return False
+        return True
+
+    def start_phase(self, phase_name):
+        if phase_name not in ['preexec', 'loadgen', 'postexec']:
+            return False
+        if not self.set_value(self.__phase_control['mode'], 'MANUAL'):
+            WRN('Cannot set mode to MANUAL')
+            return False
+        if not self.set_value(self.__phase_control['phase'], phase_name):
+            WRN('Cannot set phase to "%s"' % phase_name)
+            return False
+        if not self.set_value(self.__phase_control['start'], 'true'):
+            WRN('Cannot start phase')
+            return False
+        return True
+
+    def stop_phase(self):
+        if not self.set_value(self.__phase_control['terminate'], 'true'):
+            WRN('Cannot set terminate to "true"')
+            return False
+        return True
+
+    @property
+    def phase_status(self):
+        status = self.get_value(self.__phase_control['status'])
+        if status is None:
+            return
+        if ('[' in status) and (']' in status):
+            st = status[:status.index('[')] + status[status.rindex(']') + 1:]
+            status = st.strip()
+        else:
+            WRN('Led status not found, ignored')
+        return status
+
+    def phase_wait(self, poll_time=5.0, timeout=0.0):
+        if not self.online:
+            return
+        # Ensure input are valid
+        poll_time = float(poll_time)
+        timeout = float(timeout)
+
+        # Create poll bucle
+        current_value = self.phase_status
+        now = time.time()
+        while current_value not in ['Terminated', 'Finished', 'Stopped', None]:
+            if timeout > 0:
+                if (time.time() - now) > timeout:
+                    WRN('TIMEOUT waiting for %s==%s' % (variable_name, value))
+                    return False
+            if timeout > 0:
+                remain = timeout - (time.time() - now)
+                if remain < 0.0:
+                    remain = 0.0
+            else:
+                remain = poll_time
+            time.sleep(min(poll_time, remain))
+            current_value = self.phase_status
+        return current_value
+
+
+class MonitorShell(cmd.Cmd):
+    intro = 'Welcome to TTCN Monitor shell. Type help or ? to list commands.\n'
+    prompt = 'ttcn_monitor: '
+    #use_rawinput = False
+    client = TTCNClient()
+
+    def postloop(self):
+        if self.client.online:
+            self.client.close()
+
+    def default(self, line):
+        # Ignore comments
+        line = line.strip()
+        if line.startswith('#'):
+            return
+        cmd.Cmd.default(self, line)
+
+    def do_connect(self, arg):
+        'Connect to TTCN CLI: connect <url>.'
+        if len(arg) == 0:
+            print 'ERROR: URL missing'
+        else:
+            self.client.connect(arg)
+
+    def complete_connect(self, text, line, begidx, endidx):
+        if not text:
+            completions = ['telnet://']
+        else:
+            completions = [ f for f in ['telnet://'] if f.startswith(text)]
+        return completions
+
+    def help_connect(self):
+        print '''connect telnet://<ttcn_host>:<ttcn_cli_port>
+\tConnect to TTCN CLI session using telnet protocol.'''
+
+    def do_close(self, arg):
+        'Disconnect from TTCN CLI.'
+        if not self.client.online:
+            WRN('Client not connected!')
+        else:
+            self.client.close()
+
+    def do_status(self, arg):
+        'Get status of TTCN Monitor.'
+        print 'TTCN CLI is %s' % ('online' if self.client.online else 'offline')
+        print 'Client handles variable names as %s' % (
+            'alias' if self.client.use_alias_only else 'literals')
+        print 'Phase control variables:'
+        variables = self.client.phase_control.keys()
+        variables.sort()
+        for key in variables:
+            print '\t"%s" controled by "%s"' % (key,
+                                                self.client.phase_control[key])
+
+    def do_shutdown(self, arg):
+        'Terminate TTCN and close Monitor.'
+        if not self.client.online:
+            WRN('Client not connected: shutdown ignored.')
+        else:
+            self.client.shutdown()
+        return True
+
+    def _parse_get_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_get(self, arg):
+        'Get variable value.'
+        if not self.client.online:
+            WRN('Client not connected,use "connect" first.')
+            return
+        options, args = self._parse_get_args_(arg)
+        if len(args) < 1:
+            print 'ERROR: "get" value requires a variable name.'
+            return
+        value = self.client.get_value(args[0])
+        if value is None:
+            print 'ERROR: variable "%s" not found!' % args[0]
+        print value
+
+    def help_get(self):
+        print '''get <variable_name>
+\tGet value of a given variable name.'''       
+
+    def _parse_set_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_set(self, arg):
+        'Set variable value.'
+        if not self.client.online:
+            WRN('Client not connected, use "connect" first.')
+            return
+        options, args = self._parse_get_args_(arg)
+        if len(args) < 2:
+            print 'ERROR: "set" requires a variable name and a value.'
+            return
+        if not self.client.set_value(args[0], args[1]):
+            print 'ERROR: cannot set variable (exists and it is writable?)'
+
+    def help_set(self):
+        print '''set <variable_name> <value>
+\tSet variable given by <variable_name> to <value>.'''
+
+    def _parse_wait_args_(self, args):
+        parser = ShellOptionParser()
+        parser.add_option('-t', '--timeout',
+                          action='store', default=0.0,
+                          dest='timeout')
+        parser.add_option('-p', '--poll-time',
+                          action='store', default=5.0,
+                          dest='poll')
+        parser.add_option('-s', '--show-history',
+                          action='store_true', default=False,
+                          dest='history')
+        parser.add_option('-o', '--operator',
+                          action='store', default='eq',
+                          dest='operator')
+        return parser.parse_args(args.split())
+
+    def _wait_history_(self, msg):
+        print msg
+
+    def do_wait(self, arg):
+        'Wait until some variable gets some value.'
+        if not self.client.online:
+            WRN('Client not connected, use "connect" first.')
+            return
+        options, args = self._parse_wait_args_(arg)
+        if len(args) < 2:
+            print 'ERROR: "wait" requires a variable and a value.'
+            return
+        
+        
+        if options.operator not in OPERATORS.keys():
+            print 'ERROR: "%s" is not a valid operator.' % options.operator
+            return
+          
+        
+        callback = self._wait_history_ if options.history else None
+        try:
+            if not self.client.wait_for(args[0], args[1],
+                                        OPERATORS[options.operator], 
+                                        options.poll,
+                                        options.timeout, callback):
+                print 'ERROR: variable not exists or timeout reached.'
+        except KeyboardInterrupt:
+            print 'ERROR: waiting cancelled by user'
+
+    def help_wait(self):
+        print '''wait [-t timeout] [-p poll_time] [-o operator] [-s] <variable_name> <value>
+\twait until comparison between current value for <variable_name> and <value> 
+\tAllowed operator values: eq, ne, gt, ge, lt and le'''
+
+    def do_new(self, arg):
+        'Define new alias.'
+        if not self.client.online:
+            WRN('Client not connectedm use "connect" first.')
+            return
+
+        arg = arg.split()
+        if len(arg) < 2:
+            print 'ERROR: new alias require two arguments.'
+            return
+        alias_name = arg[0]
+        original = ' '.join(arg[1:])
+        self.client.create_alias(alias_name, original)
+
+    def help_new(self):
+        print '''new <alias> <original_variable>
+\tCreate a new alias called <alias> for the variable given by <original_variable>.'''
+
+    def _parse_remove_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_remove(self, arg):
+        'Remove an alias.'
+        if not self.client.online:
+            WRN('Client not connected, use "connect" first.')
+            return
+        options, args = self._parse_remove_args_(arg)
+        if len(args) < 1:
+            print 'ERROR: "remove" requires an alias name.'
+            return
+        if not self.client.remove_alias(args[0]):
+            print 'ERROR: alias not exists.'
+
+    def do_list(self, arg):
+        'List all defined alias.'
+        if not self.client.online:
+            WRN('Client not connected,use "connect" first.')
+            return
+
+        aliases = self.client.alias
+        if len(aliases.keys()) == 0:
+            print 'No alias defined yet.'
+        else:
+            alias_names = aliases.keys()
+            alias_names.sort()
+            for alias in alias_names:
+                print '%s -> %s' % (alias, aliases[alias])
+
+    def do_use(self, arg):
+        'Configure variable names as alias or literals'
+        if arg not in ['alias', 'literals']:
+            print 'ERROR: require argument "alias" or "literals"'
+            return
+
+        if arg == 'alias':
+            self.client.use_variables_as_alias()
+        else:
+            self.client.use_variables_as_literals()
+
+    def complete_use(self, text, line, begidx, endidx):
+        completions = ['alias', 'literals']
+        if not text:
+            return completions
+        else:
+            return [ f for f in completions if f.startswith(text)]
+
+    def help_use(self):
+        print '''use {alias|literals}
+\tClient can handle variable names as alias or literals. If you use "alias",
+client adds "$" characters to variable name and "read_" and "write_"
+prefix automatically. If you use "literals", variable names are passed to
+TTCN as is, without any modification.'''
+
+    def _parse_phase_args_(self, args):
+        parser = ShellOptionParser() 
+        parser.add_option('-t', '--timeout',
+                          action='store', default=0.0,
+                          dest='timeout')
+        parser.add_option('-p', '--poll-time',
+                          action='store', default=5.0,
+                          dest='poll')
+        return parser.parse_args(args.split())
+
+    def do_phase(self, arg):
+        'Phase tools: set phase, get status, etc.'
+        if not self.client.online:
+            WRN('Client not connected, use "connect" first.')
+            return
+        options, args = self._parse_phase_args_(arg)
+        if len(args) < 1:
+            print 'ERROR: "phase" requires at least one subcommand.'
+            return
+        subcommand = args[0]
+        args = args[1:]
+        if subcommand == 'set':
+            if lrn(args) < 2:
+                print 'ERROR: "set" subcommand requires a key and a value'
+                return
+            if not self.client.set_phase_control(args[0],
+                                                 args[1]):
+                print 'ERROR: cannot set value of given key. Key exists?'
+                return
+        elif subcommand == 'start':
+            if len(args) < 1:
+                print 'ERROR: "start" subcommand requires phase name'
+                return
+            if not self.client.start_phase(args[0]):
+                print 'ERROR: cannot start phase "%s".' % args[0]
+                return
+        elif subcommand == 'stop':
+            if not self.client.stop_phase():
+                print 'ERROR: cannot stop phase.'
+                return
+        elif subcommand == 'status':
+            status = self.client.phase_status
+            if not status:
+                print 'ERROR: cannot get status of running phase.'
+                return
+            print status
+        elif subcommand == 'wait':
+            try:
+                if not self.client.phase_wait(options.poll, options.timeout):
+                    print 'ERROR: wait ended but phase is not terminated.'
+            except KeyboardInterrupt:
+                print 'ERROR: wait cancel by user.'
+        else:
+            print 'ERROR: unknown subcommand: "%s"' % subcommand
+
+    def complete_phase(self, text, line, begidx, endidx):
+        completions = ['start', 'stop', 'status', 'wait', 'set']
+        if not text:
+            return completions
+        else:
+            return [ f for f in completions if f.startswith(text)]
+
+    def help_phase(self):
+        print '''phase {start {phase}|stop|status|wait|set {key} {variable}}
+\tClient can execute some phase and waits until execution ends. Execution
+control is performed by setting some values in TTCN variables. Those variables
+can be changed with "set" subcommand.'''
+
+    def do_exit(self, arg):
+        'Close connection and exit from TTCN monitor.'
+        return True
+
+    def do_EOF(self, arg):
+        'Close connection and exit from TTCN monitor.'
+        return True
+
+
+def udp_command(command, client):
+    if command.startswith('connect '):
+        try:
+            command, url = command.split()
+        except:
+            return 'ERROR: connect telnet://<host>:<port>'
+        client.connect(url)
+        return 'OK' if client.online else 'ERROR: cannot connect'
+    elif command.startswith('close'):
+        client.close()
+        return 'OK' if not client.online else 'ERROR: cannot disconnect'
+    elif command.startswith('status'):
+        return 'ONLINE' if client.online else 'OFFLINE'
+    elif command.startswith('shutdown'):
+        client.shutdown()
+        return
+    elif command.startswith('stop'):
+        client.shutdown()
+        return
+    elif command.startswith('exit'):
+        return
+    elif command.startswith('get '):
+        try:
+            command, alias = command.split()
+        except:
+            return 'ERROR: get <alias>'
+        value = client.get_value(alias)
+        if value is None:
+            return 'ERROR: variable "%s" not found!' % alias
+        return str(value)
+    elif command.startswith('set '):
+        try:
+            command, alias, value = command.split()
+        except:
+            return 'ERROR: set <alias> <value>'
+        if not client.set_value(alias, value):
+            return 'ERROR: cannot set variable (exists and it is writable?)'
+        return 'OK'
+    elif command.startswith('wait '):
+        try:
+            command, alias, value, operator, timeout = command.split()
+        except:
+            return 'ERROR: wait <alias> <value> <operator> <timeout>'
+
+        if operator not in OPERATORS.keys():
+            return 'ERROR: "%s" is not a valid operator. Allowed values are: eq, ne, gt, ge, lt and le' % operator
+            
+
+        if not client.wait_for(alias, value, OPERATORS[operator], timeout=timeout):
+            return 'ERROR: variable does not exist or timeout waiting for'
+        return 'OK'
+    elif command.startswith('new '):
+        try:
+            command, alias, variable = command.split()
+        except:
+            return 'ERROR: new <alias> <variable>'
+        client.create_alias(alias, variable)
+        return 'OK'
+    elif command.startswith('remove '):
+        try:
+            command, alias = command.split()
+        except:
+            return 'ERROR: remove <alias>'
+        if not client.remove_alias(alias):
+            return 'ERROR: alias not exists.'
+        return 'OK'
+    elif command.startswith('list'):
+        aliases = client.alias
+        if len(aliases.keys()) == 0:
+            return 'OK: no alias defined yet.'
+        else:
+            alias_names = aliases.keys()
+            alias_names.sort()
+            out = ''
+            for alias in alias_names:
+                out += '%s -> %s\n' % (alias, aliases[alias])
+            return out
+    elif command.startswith('phase set '):
+        try:
+            command, subcommand, desired_phase = command.split()
+        except:
+            return 'ERROR: phase set <phase name>'
+        if not client.set_phase_control(subcommand, desired_phase):
+            return 'ERROR: cannot set value of phase. Alias exists?'
+        return 'OK'
+    elif command.startswith('phase start '):
+        try:
+            command, subcommand, desired_phase = command.split()
+        except:
+            return 'ERROR: phase start <phase name>'
+        if not client.start_phase(desired_phase):
+            return 'ERROR: cannot start phase "%s".' % desired_phase
+        return 'OK'
+    elif command.startswith('phase '):
+        try:
+            command, subcommand = command.split()
+        except:
+            return 'ERROR: phase {stop|status|wait}'
+        if subcommand == 'stop':
+            if not client.stop_phase():
+                return 'ERROR: cannot stop phase.'
+            return 'OK'
+        elif subcommand == 'status':
+            status = client.phase_status
+            if not status:
+                return 'ERROR: cannot get status of running phase.'
+            return 'OK: %s' % status
+        elif subcommand == 'wait':
+            if not client.phase_wait():
+                return 'ERROR: wait ended but phase is not terminated.'
+            return 'OK'
+        else:
+            return 'ERROR: unknown subcommand: "%s"' % subcommand
+    else:
+        return 'UNKNOWN COMMAND'
+
+
+def start_udp_server(udp_port, ttcn_client=None, ignore_user=False):
+    INF('Starting UDP server on 0.0.0.0:%s' % udp_port)
+
+    if ttcn_client is None:
+        ttcn_client = TTCNClient()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(3.0)
+    sock.bind(('0.0.0.0', udp_port))
+
+    wait_commands = True
+    while wait_commands:
+        try:
+            data, client = sock.recvfrom(4096)
+        except KeyboardInterrupt:
+            if ignore_user:
+                INF('User press Ctrl-C but ignored (-i)')
+                continue
+            WRN('Monitor interrupted by user (Ctrl-C)')
+            ttcn_client.close()
+            return
+        except socket.timeout:
+            if ttcn_client.keepalive():
+                continue
+            if ttcn_client.forced_to_quit:
+                WRN('TTCN closes the connection')
+                wait_commands = False
+            continue
+        if ttcn_client.forced_to_quit:
+            WRN('TTCN closes the connection')
+            wait_commands = False
+            continue
+        data = data.strip()
+        DEB('UDP Client sends: %s' % data)
+        return_data = udp_command(data, ttcn_client)
+        if return_data is None:
+            INF('UDP Client send termination to monitor')
+            wait_commands = False
+            return_data='DONE'
+        DEB('UDP Client receives: %s' % return_data)
+        sent = sock.sendto(return_data, client)
+
+
+if __name__ == '__main__':
+
+    log_level = (logging.DEBUG if ('--verbose' in sys.argv or '-v' in sys.argv) else logging.INFO)
+
+    gais.log.set_core_name('ttcn_monitor_%s.log' % os.getpid(),
+                           logdir=CWD, timestamp=False, level=log_level)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    fd = sys.stdin
+    client = None
+
+    parser = OptionParser() 
+    parser = OptionParser(
+            usage='%prog [options] [telnet://cli_host:cli_port]')
+    parser.add_option('-u', '--udp', default=None,
+                      action='store',
+                      dest='udp_port',
+                      help='Start monitor in UDP mode, needs listen port')
+    parser.add_option('-s', '--silent',
+                      action='store_true', default=False,
+                      help='No output.',
+                      dest='silent')
+    parser.add_option('-i', '--ignore-user',
+                      action='store_true', default=False,
+                      help='Ignore Ctrl-C signal.',
+                      dest='ignore_user')
+    parser.add_option('-v', '--verbose',
+                      action='store_true', default=False,
+                      help='Verbose. Set max logging level.',
+                      dest='verbose')
+    options, args = parser.parse_args(sys.argv)
+    args = args[1:]
+
+    if options.silent:
+        WRN = DEB
+        INF = DEB
+
+    udp_port = False
+    if options.udp_port is not None:
+        try:
+            udp_port = int(options.udp_port)
+        except:
+            ERR('Invalid port definition: %s' % options.udp_port)
+            sys.exit(CMDLINE_ERROR)
+
+    client = None
+    shell = None
+    for arg in args:
+        if arg.startswith('telnet://'):
+            if client is None:
+                client = TTCNClient()
+            client.connect(arg)
+            if not client.online:
+                ERR('Cannot connect to TTCN!')
+                sys.exit(NOT_CONNECTED)
+        else:
+            # Maybe is a file
+            if not os.path.exists(arg):
+                ERR('Cannot open "%s"' % arg)
+                if client is not None:
+                    client.close()
+                sys.exit(CMDLINE_ERROR)
+            if udp_port:
+                ERR('Running a script cannot be done with "-u"')
+                if client is not None:
+                    client.close()
+                sys.exit(CMDLINE_ERROR)
+
+            if client is None:
+                client = TTCNClient()
+
+            fd = open(arg, 'r')
+            shell = MonitorShell(stdin=fd)
+            if fd != sys.stdin:
+                shell.use_rawinput = False
+            shell.client = client
+            shell.cmdloop()
+            fd.close()
+
+    if client is None:
+        client = TTCNClient()
+
+    try:
+
+        if udp_port:
+            start_udp_server(udp_port, client, options.ignore_user)
+        elif shell is None:
+            shell = MonitorShell(stdin=sys.stdin)
+            shell.client = client
+            shell.cmdloop()
+            
+    except KeyboardInterrupt:
+        INF('User send Ctrl-C')
+    
+    except Exception, e:
+        ERR('Unhandled Exception, please report this LOG to tools team')
+        DEB('Additional information: %s' % str(e))
+        DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            DEB(tb)
+
+    if client.online:
+        client.close()
+
+    INF('Shutdown completed.')
+    sys.exit(NO_ERROR)

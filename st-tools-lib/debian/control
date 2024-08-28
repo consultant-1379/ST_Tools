@@ -1,0 +1,16 @@
+Source: libst-tools
+Maintainer: <mitxel.garcia@ericsson.com>
+Build-Depends: cmake, dh-cmake, dh-cmake-compat (= 1), dh-sequence-cmake, debhelper-compat (= 12)
+Standards-Version: 3.9.2
+Section: networking
+Priority: optional
+
+Package: libst-tools
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: This package contains the shared libraries for the ST tools.
+
+Package: libst-tools-dev
+Architecture: any
+Depends: libst-tools (= ${binary:Version}), ${misc:Depends}
+Description: This package contains the development files for ST tools.

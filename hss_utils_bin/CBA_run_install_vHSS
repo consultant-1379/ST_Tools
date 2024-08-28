@@ -1,0 +1,949 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+import traceback
+import argparse
+import re
+import pprint
+import pexpect
+
+import ntpath
+import signal
+import textwrap
+import socket
+import getpass
+from packaging import version as fversion
+import essclient
+import json
+import pprint
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.gentraf
+import hss_utils.rosetta
+import hss_utils.rosetta.services
+import e3utils.clients.jenkins
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+HOSTNAME = socket.gethostname()
+USER = getpass.getuser()
+ESS_KEY = '/proj/hss_est/tcm_env/node_tools/generators/etc/id_rsa_ess'
+JENKINS_DESTROY_VHSS_URL = 'https://e3tools-jenkins.seli.gic.ericsson.se/job/CBA_run_install/job/CBA-run-install-VNF-DESTROYER/'
+INSTALLATION_HELPER = None
+GENTRAF = None
+ESS_CLIENT = None
+DEPLOYMENT_ID = None
+BASELINE_ID = None
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+
+def quit_program(exit_code):
+    if ESS_CLIENT:
+        try:
+            ESS_CLIENT.remove_deployment(DEPLOYMENT_ID)
+        except Exception as e:
+            _WRN('Problem in ESS client remove_deployment: %s' % e)
+
+        if BASELINE_ID:
+            try:
+                ESS_CLIENT.remove_baseline(BASELINE_ID)
+            except Exception as e:
+                _WRN('Problem in ESS client remove_baseline: %s' % e)
+
+    if INSTALLATION_HELPER:
+        try:
+            INSTALLATION_HELPER.release()
+        except Exception as e:
+            _WRN('Problem in release scenario: %s' % e)
+
+    if GENTRAF:
+        try:
+            GENTRAF.release()
+        except Exception as e:
+            _WRN('Problem in in release gentraf: %s' % e)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+DEFAULT_VALUES = {
+    'TIMEZONE_AREA': 'Europe',
+    'TIMEZONE_CITY': 'Stockholm',
+
+    'NW_EVIP_NET_ID': '169.254.102.0',
+    'NW_EVIP_NET_MASK': '24',
+    'NW_TIPC_NET_ID': '10.0.7.0',
+    'NW_TIPC_NET_MASK': '24',
+
+    'NW_LDE_SCALE_END': '169.254.101.232',
+    'NW_LDE_MIP_BOOT': '169.254.101.102',
+    'NW_LDE_MIP_LA_LDAP': '169.254.101.130',
+    'NW_LDE_NODENAME_IP': '169.254.101.199',
+    'NW_LDE_MIP_CPM': '169.254.101.103',
+    'NW_LDE_SCALE_INIT': '169.254.101.200',
+    'NW_LDE_FIXED_IP_NODE_04': '169.254.101.4',
+    'NW_LDE_NET_WILDCARD': '169.254.101.*',
+    'NW_LDE_NET_ID': '169.254.101.0',
+    'NW_LDE_MIP_NFS': '169.254.101.101',
+    'NW_LDE_FIXED_IP_NODE_03': '169.254.101.3',
+    'NW_LDE_FIXED_IP_NODE_02': '169.254.101.2',
+    'NW_LDE_FIXED_IP_NODE_01': '169.254.101.1',
+    'NW_LDE_NET_MASK': '24',
+
+    'DIA_INSTALLER_0': 'HSS_ISMSDA',
+    'DIA_INSTALLER_1': 'HSS_SM',
+    'DIA_INSTALLER_2': 'HSS_ESM',
+
+    'CLIENT_LDAP_NETWORK_1': '10.82.232.0',
+    'CLIENT_LDAP_NETWORK_2': '10.82.141.0',
+    'CLIENT_LDAP_NETMASK_2': '24',
+    'CLIENT_LDAP_NETMASK_1': '22',
+    'CLIENT_LDAP_NETMASK_1_IPv6': '64',
+    'CLIENT_LDAP_NETMASK_2_IPv6': '64',
+    'CLIENT_LDAP_NETWORK_1_IPv6': '2001:1b70:82c8:5::',
+    'CLIENT_LDAP_NETWORK_2_IPv6': '2001:1b70:82c8:6::',
+    'CLIENT_SIGTRAN_NETWORK_2': '10.2.131.223',
+    'HLR_SIGTRAN_IP_2': '10.2.131.223',
+    'CLIENT_SIGTRAN_NETWORK_1': '10.2.131.222',
+    'HLR_SIGTRAN_IP_1': '10.2.131.222',
+    'REMOTE_SPC': '315',
+    'LOCAL_SPC':  '545',
+    'OWNGTADD' :  '35191115450',
+    'NTP_SERVER_1': '10.36.146.36',
+    'NTP_SERVER_2': '10.36.146.44'
+
+}
+
+def update_vHSS_cloud_package(local_dir, pack_name):
+    package_to_add = INSTALLATION_HELPER.get_single_package('vHSS_Enterprise')
+    package_to_add_name = package_to_add.split('/')[-1]
+
+    cmd = 'download_package %s %s/%s -t 3600 -v' % (package_to_add, local_dir, package_to_add_name)
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+    if returncode:
+        _ERR('download package failed')
+        error_info = 'Faulty with exit code %s' % returncode
+        for line in stderr_value.split('\n'):
+            position = line.find('stFramework_message ')
+            if  position != -1:
+                error_info = line[position + len('stFramework_message ') :]
+                _ERR('%s' % error_info)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'mkdir -p temp'
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=local_dir)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'tar -xzvf %s -C temp/' % pack_name
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=local_dir)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'tar -xzvf %s -C temp/' % package_to_add_name
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=local_dir)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'tar -czvf ../%s *' % pack_name
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd='%s/temp' % local_dir)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+
+
+def update_vHSS_Ephemeral(local_dir, pack_name):
+    package_to_add = INSTALLATION_HELPER.get_single_package('vHSS_Enterprise')
+    package_to_add_name = package_to_add.split('/')[-1]
+
+    cmd = 'download_package %s %s/%s -t 3600 -v' % (package_to_add, local_dir, package_to_add_name)
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+    if returncode:
+        _ERR('download package failed')
+        error_info = 'Faulty with exit code %s' % returncode
+        for line in stderr_value.split('\n'):
+            position = line.find('stFramework_message ')
+            if  position != -1:
+                error_info = line[position + len('stFramework_message ') :]
+                _ERR('%s' % error_info)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'mkdir -p temp'
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=local_dir)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'unzip %s -d temp/' % pack_name
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=local_dir)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'mkdir -p temp2'
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=local_dir)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'tar -xzvf %s -C temp2/' % package_to_add_name
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=local_dir)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'cp temp2/vhss_enterprise/vhss_enterprise.yaml temp/HOT/main.yaml'
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=local_dir)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+
+    cmd = 'zip -r ../%s *' % pack_name
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd='%s/temp' % local_dir)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+
+def main():
+    global ESS_CLIENT
+    global DEPLOYMENT_ID
+    global BASELINE_ID
+    global INSTALLATION_HELPER
+    global GENTRAF
+
+    user_config = parse_commandline()
+    try:
+        envs = hss_utils.rosetta.related_environments(HOSTNAME)
+        if not envs or envs[0] is None:
+            _ERR('Error: Rosetta return an empty list or None')
+            quit_program(EXECUTION_ERROR)
+    except Exception as e:
+        _ERR('Can not fetch environment for "%s" from Rosetta (%s)' % (HOSTNAME,e))
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        info = hss_utils.rosetta.services.installation_info_for(envs[0])
+    except KeyError as e:
+        _ERR('Missing data in rosetta: %s' % e)
+        quit_program(EXECUTION_ERROR)
+    except ValueError as e:
+        _ERR('%s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    if user_config.vector_supplier == 'ROSETTA':
+        try:
+            user_config.vector_supplier = envs[0].parameters.get('vector_supplier','NONE')
+        except Exception as e:
+            _WRN('Problem reading vector suppier from Rosetta: %s' % e)
+            _WRN('Node configuration will be skipped')
+
+
+    try:
+        node_name  = info['cabinet']['name']
+        node_type = info['cabinet']['type']
+        node_config = DEFAULT_VALUES
+        node_config.update(info['cabinet']['config'])
+        nof_pls = info['cabinet']['nof_pls']
+    except KeyError as e:
+        _ERR('Problem getting node info from Rosetta %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        hlr_config = info['hlrs']['config']
+    except KeyError as e:
+        hlr_config = {}
+
+    DEPLOYMENT_ID = '%s-%s' % (node_name, user_config.id)
+
+    _INF('Node name   : %s' % node_name)
+    _INF('Node type   : %s' % node_type)
+    _INF('')
+
+    node_config.update(hlr_config)
+
+    with open(os.path.join(user_config.output_dir,'data_from_rosetta.json'), 'w') as fd:
+        json.dump(node_config, fd, sort_keys=True, indent=2)
+
+    config = {'cloud_based': True,
+              'cloud_uri' : node_config['CEE_CLOUD_URI'],
+              'node_type' : 'HSS',
+              'cloud_api' : info['cabinet']['CLOUD'],
+              'cloud_user' : node_config['HSS_VNF_USERNAME']}
+
+    with open(os.path.join(user_config.output_dir,'config.json'), 'w') as fd:
+        json.dump(config, fd, sort_keys=True, indent=2)
+
+    if user_config.rosetta_info:
+        quit_program(SUCCESS)
+
+    if not user_config.baseline:
+        _ERR('Baseline is mandatory')
+        quit_program(WRONG_PARAMETER)
+
+    if user_config.ess is None:
+        try:
+            user_config.ess = info['ait']['mgmt'][0]
+        except (KeyError, TypeError) as e:
+            _ERR('Can not fetch ESS from Rosetta (%s)' % HOSTNAME)
+            quit_program(EXECUTION_ERROR)
+
+    ess_uri = 'pot://%s' % user_config.ess
+    _INF('ESS URI     : %s' % ess_uri)
+
+    try:
+        ESS_CLIENT = essclient.ESS(ess_uri)
+    except Exception as e:
+        _ERR('Problem in ESS client creation: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    ESS_CLIENT.default_timeout=60.0
+
+    try:
+        if ESS_CLIENT.ping() != 'pong':
+            _ERR('No connection to ESS %s' % ess_uri)
+            quit_program(EXECUTION_ERROR)
+    except Exception as e:
+        _ERR('Problem in ESS client ping: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        status = ESS_CLIENT.status
+    except Exception as e:
+        _ERR('Problem in ESS client status: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    for key, value in status.iteritems():
+        if not value:
+            _ERR('ESS service %s is off line' % key)
+            quit_program(EXECUTION_ERROR)
+
+    _INF('All ESS services are running')
+
+    try:
+        available_baselines = ESS_CLIENT.available_baselines
+    except Exception as e:
+        _ERR('Problem in ESS client available_baselines: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    if info['cabinet']['disk_sc'] == 100:
+        user_config.id += '_100G'
+
+    if user_config.delete_baseline:
+        BASELINE_ID = user_config.id
+
+    if fversion.parse(user_config.baseline) > fversion.parse('HSS-1.28.1.15-R29B15'):
+        _DEFAULT_MANIFEST_ = {
+            'appname': 'HSS',
+            'version': 'build_id',
+            'required_packages': ['CXP9038590', 'CXP9035165']
+            }
+        HSS_PACKAGES = ['HSS_Dump','HSS_FE_Tools','vHSS Ephemeral']
+    else:
+        _DEFAULT_MANIFEST_ = {
+            'appname': 'HSS',
+            'version': 'build_id',
+            'required_packages': ['CXP9035062', 'CXP9035165']
+            }
+        HSS_PACKAGES = ['HSS_Dump','HSS_FE_Tools','vHSS_cloud_package']
+
+    INSTALLATION_HELPER = st_command.Installation_helper(user_config, HSS_PACKAGES)
+
+    _DEB('Available baselines: %s' % ' '.join(available_baselines))
+
+    if user_config.id in available_baselines:
+        _INF('%s HSS baseline already exists in ESS' % user_config.id)
+    else:
+        _INF('Building %s HSS baseline in ESS.......It could take a long time' % user_config.id)
+        file_packages = []
+        cmd = 'ssh -i %s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@%s "mktemp -d"' % (ESS_KEY, user_config.ess)
+        _INF('Executing: %s' % cmd)
+        stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+        if returncode:
+            _ERR(stderr_value)
+            quit_program(EXECUTION_ERROR)
+
+        remote_dir = stdout_value.strip()
+        try:
+            packages = INSTALLATION_HELPER.packages
+            local_dir = INSTALLATION_HELPER.local_dir
+        except st_command.CommandFailure as e:
+            _ERR('%s' % e)
+            quit_program(EXECUTION_ERROR)
+
+        for package in packages:
+            pack_name = package.split('/')[-1]
+            cmd = 'download_package %s %s/%s -t 3600 -v' % (package, local_dir, pack_name)
+            _INF('Executing: %s' % cmd)
+            stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+            if returncode:
+                _ERR('download package failed')
+                error_info = 'Faulty with exit code %s' % returncode
+                for line in stderr_value.split('\n'):
+                    position = line.find('stFramework_message ')
+                    if  position != -1:
+                        error_info = line[position + len('stFramework_message ') :]
+                        _ERR('%s' % error_info)
+                quit_program(EXECUTION_ERROR)
+
+            if info['cabinet']['disk_sc'] == 100:
+                if INSTALLATION_HELPER.get_package_by_file_location(package) == 'vHSS_cloud_package':
+                    update_vHSS_cloud_package(local_dir, pack_name)
+                elif INSTALLATION_HELPER.get_package_by_file_location(package) == 'vHSS Ephemeral':
+                    update_vHSS_Ephemeral(local_dir, pack_name)
+
+            cmd = 'scp -i %s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no %s/%s root@%s:%s' % (ESS_KEY, local_dir, pack_name, user_config.ess, remote_dir)
+            _INF('Executing: %s' % cmd)
+            stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+            if returncode:
+                _ERR(stderr_value)
+                quit_program(EXECUTION_ERROR)
+
+            file_packages += ['file://%s/%s' % (remote_dir, pack_name)]
+
+        _DEFAULT_MANIFEST_.update({'version':user_config.id})
+
+        ESS_CLIENT.default_timeout=600.0
+        manifest = _DEFAULT_MANIFEST_
+        if '-' in user_config.id:
+            version = '-'.join(user_config.id.split('-')[1:])
+            manifest['version']= version[0:version.rindex('_')] if version.endswith('_100G') else version
+
+        try:
+            ESS_CLIENT.install_baseline(manifest, file_packages,user_config.id)
+        except Exception as e:
+            _ERR('Problem in ESS client install_baseline: %s' % e)
+            quit_program(EXECUTION_ERROR)
+
+        ESS_CLIENT.default_timeout=60.0
+
+        cmd = 'ssh -i %s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@%s "rm -rf %s"' % (ESS_KEY, user_config.ess, remote_dir)
+        _INF('Executing: %s' % cmd)
+        stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+        if returncode:
+            _WRN('Remote directory %s can not be deleted: %s' % (remote_dir, stderr_value))
+
+    DEPLOYMENT_ID = '%s-%s' % (node_name, user_config.id)
+    _INF('Create deployment %s' % DEPLOYMENT_ID)
+    try:
+        ESS_CLIENT.create_deployment(DEPLOYMENT_ID, 'cee', user_config.id)
+    except Exception as e:
+        _ERR('Problem in ESS client create_deployment: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        di = ESS_CLIENT.get_deployment_info(DEPLOYMENT_ID)
+    except Exception as e:
+        _ERR('Problem in ESS client get_deployment_info: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+
+    # Update PLs information 
+    if user_config.nof_pls is None:
+        _INF('Number of PLs %s' % (int(di['blade_number']) - 2))
+    #elif user_config.nof_pls > nof_pls:
+            #_ERR('Max number of PLs is %s' % nof_pls)
+            #quit_program(EXECUTION_ERROR)
+    else:
+        _INF('Set number of PLs to %s' % user_config.nof_pls)
+        di['blade_number'] = user_config.nof_pls + 2
+
+    # Update di 
+    di.update(config)
+    try:
+        di = ESS_CLIENT.get_deployment_info(DEPLOYMENT_ID)
+    except Exception as e:
+        _ERR('Problem in ESS client get_deployment_info: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    config={}
+    for k,v in di.items():
+        if k.startswith('_'):
+            continue
+        config[k]=v
+
+    with open(os.path.join(user_config.output_dir,'config.json'), 'w') as fd:
+        json.dump(config, fd, sort_keys=True, indent=2)
+
+    # Update di with node_config
+    adaptor = di['_current_adaptor']
+    adaptor.update(node_config)
+    di['_current_adaptor'] = adaptor
+
+    with open(os.path.join(user_config.output_dir,'adaptor.json'), 'w') as fd:
+        json.dump(adaptor, fd, sort_keys=True, indent=2)
+
+    di['_cloud_password']= adaptor['HSS_VNF_USERNAME_PWD']
+
+    credentials={
+        'user':di['cloud_user'],
+        'password':di['_cloud_password']
+        }
+
+    credentials.update(di['cloud_api'])
+    with open(os.path.join(user_config.output_dir,'credentials.json'), 'w') as fd:
+        json.dump(credentials, fd, sort_keys=True, indent=2)
+
+    # Create, update and up-load installation templates
+    try:
+        deployment_templates = ESS_CLIENT.get_available_builders(DEPLOYMENT_ID)
+        if deployment_templates is None:
+            _ERR('Deployment templates not found for %s' % DEPLOYMENT_ID)
+            quit_program(EXECUTION_ERROR)
+    except Exception as e:
+        _ERR('Problem in ESS client get_available_builders: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    for element in deployment_templates:
+        try:
+            template = ESS_CLIENT.build_template(DEPLOYMENT_ID, element)
+        except Exception as e:
+            _ERR('Problem in ESS client build_template: %s' % e)
+            quit_program(EXECUTION_ERROR)
+        if element == 'post_installation_config':
+            try:
+                my_json = json.loads(template)
+            except Exception as e:
+                _ERR('Problem decoding %s json template: %s' % (template, e))
+                quit_program(EXECUTION_ERROR)
+            #my_json.update({'com_emergency_account_users':{'com-emergency':'com-emergency'}}) 
+            my_json.update({'la_admin_account_user_id':{'la-admin':'la-admin'}}) 
+            my_json["customize_values"].update({"com_emergency_account_users":{"com-emergency":'com-emergency'}})
+            if not user_config.map_pm_jobs:
+                my_json['PmJobs'] = []
+                my_json['Tasks'].remove('post_inst_map_threshold_monitor_pm_jobs')
+
+            if user_config.snmp_target_addr is None:
+                my_json['Tasks'].remove('post_inst_set_snmp_target')
+            else:
+                my_json['SITE_SPECIFIC_bt1_snmp_target_addr'] = user_config.snmp_target_addr
+
+            template = json.dumps(my_json, sort_keys=True, indent=2)
+
+        if element.startswith('cloud_flavor_pl'):
+            try:
+                my_json = json.loads(template)
+            except Exception as e:
+                _ERR('Problem decoding %s json template: %s' % (template, e))
+                quit_program(EXECUTION_ERROR)
+            my_json['vcpus']= '%s' % info['cabinet']['cpus_pl']
+            my_json['ram']='%s' % info['cabinet']['ram_pl']
+            my_json['disk']='%s' % info['cabinet']['disk_pl']
+            template = json.dumps(my_json, sort_keys=True, indent=2)
+
+        elif element.startswith('cloud_flavor_sc'):
+            try:
+                my_json = json.loads(template)
+            except Exception as e:
+                _ERR('Problem decoding %s json template: %s' % (template, e))
+                quit_program(EXECUTION_ERROR)
+            my_json['vcpus']='%s' % info['cabinet']['cpus_sc']
+            my_json['ram']='%s' % info['cabinet']['ram_sc']
+            my_json['disk']='%s' % info['cabinet']['disk_sc']
+            template = json.dumps(my_json, sort_keys=True, indent=2)
+
+        with open(os.path.join(user_config.output_dir,element), 'w') as fd:
+            try:
+                fd.write(template)
+            except TypeError as e:
+                _ERR('Problem creating template %s' % element)
+                quit_program(EXECUTION_ERROR)
+
+        try:
+            ESS_CLIENT.store_deployment_template(DEPLOYMENT_ID, element, template)
+        except Exception as e:
+            _ERR('Problem in ESS client store_deployment_template for %s: %s' % (element,e))
+            quit_program(EXECUTION_ERROR)
+
+    # Installation start
+    if user_config.skip_installation:
+        quit_program(SUCCESS)
+
+    try:
+        license_file = INSTALLATION_HELPER.license_file
+    except st_command.CommandFailure as e:
+        _ERR('%s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        with open(license_file, 'r') as fd:
+            license = fd.read()
+    except IOError as e:
+        _ERR('Problem with license file %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        ESS_CLIENT.store_deployment_template(DEPLOYMENT_ID, 'lic_file', license)
+    except Exception as e:
+        _ERR('Problem in ESS client store_deployment_template for lic_file: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        ESS_CLIENT.rebuild_deployment_tasks(DEPLOYMENT_ID,'ess_deployment_tasks')
+    except Exception as e:
+        _ERR('Problem in ESS client rebuild_deployment_tasks: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    _INF('Cleaning older stack, flavors and images ....')
+    data = {
+        'CEE_CLOUD_URI' : node_config['CEE_CLOUD_URI'],
+        'HSS_VNF_TENANT_NAME' : node_config['HSS_VNF_TENANT_NAME'],
+        'HSS_VNF_USERNAME' : node_config['HSS_VNF_USERNAME'],
+        'HSS_VNF_USERNAME_PWD' : node_config['HSS_VNF_USERNAME_PWD'],
+        'VNF_NAME' : node_config['VNF_NAME']
+        }
+
+    client = e3utils.clients.jenkins.Jenkins(url=JENKINS_DESTROY_VHSS_URL,
+                                        token= '11d517726942731c46c3f3a2e3efac8b58',
+                                         user='hsscicd')
+
+    try:
+        task_id = client.build(data)
+        _INF('Jenkins job for Cleaning older stack: %s' % task_id)
+    except Exception as e:
+        _ERR('Problem in Cleaning older stack: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        _INF('Waiting for %s Jenkins job' % task_id)
+        answer = client.wait_for_build(task_id,timeout=1800)
+        if answer['result'] != 'SUCCESS':
+            _ERR('Cleaning older stack result: %s' % answer['result'])
+            quit_program(EXECUTION_ERROR)
+    except Exception as e:
+        _ERR('Problem in Cleaning older stack: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+
+    try:
+        ESS_CLIENT.start_deployment(DEPLOYMENT_ID)
+    except Exception as e:
+        _ERR('Problem in ESS client start_deployment: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    WORKER_WAITING_START = 'waiting_start'
+    WORKER_STARTED = 'started'
+    WORKER_CANCELLED = 'cancelled'
+    WORKER_FAILED = 'failed'
+    WORKER_KILLED = 'killed'
+    WORKER_END = 'finished'
+
+    try:
+        status = ESS_CLIENT.get_deployment_status(DEPLOYMENT_ID)
+    except Exception as e:
+        _ERR('Problem in ESS client get_deployment_status: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    offset = 0
+    timeout = float(user_config.max_time)
+    while status != WORKER_END:
+        try:
+            now = time.time()
+            time.sleep(10.0)
+            try:
+                status = ESS_CLIENT.get_deployment_status(DEPLOYMENT_ID)
+            except Exception as e:
+                _ERR('Problem in ESS client get_deployment_status: %s' % e)
+                quit_program(EXECUTION_ERROR)
+            try:
+                stdout = ESS_CLIENT.get_deployment_output(DEPLOYMENT_ID).splitlines()
+            except Exception as e:
+                _ERR('Problem in ESS client get_deployment_output: %s' % e)
+                quit_program(EXECUTION_ERROR)
+
+            for line in stdout[offset:]:
+                timeout = float(user_config.max_time)
+                if line != '':
+                    _INF('%s' % line)
+                    if 'Worker error' in line and 'file://' in line:
+                        for field in line.split():
+                            if field.startswith('file://'):
+                                error_file = field[12:-1]
+                                cmd = 'scp -i %s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@%s:/logs/execution_templates/%s* %s/ ' % (ESS_KEY, user_config.ess, error_file ,user_config.output_dir)
+                                _INF('Executing: %s' % cmd)
+                                stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                                if returncode:
+                                    _WRN(stderr_value)
+
+            offset = len(stdout)
+
+            if status in [WORKER_CANCELLED, WORKER_FAILED, WORKER_KILLED]:
+                _ERR('Installation status: %s' % status)
+                quit_program(EXECUTION_ERROR)
+
+            timeout -= time.time() - now
+            if timeout < float(0):
+                _ERR('Timeout waiting for installation process (%s seconds)' % user_config.max_time)
+                quit_program(TIMEOUT)
+
+        except KeyboardInterrupt:
+            _WRN('Execution stopped by user')
+            break
+
+    if user_config.vector_supplier not in ['AVG','HLR']:
+        _INF('Vector supplier is %s. Skip node configuration' % user_config.vector_supplier)
+        quit_program(SUCCESS)
+
+    # Configuration section
+
+    cmd = 'CBA_check_all_licenses_granted'
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+    if returncode:
+        max_tries = 5
+        while True:
+            _INF('Waiting 30 seconds')
+            time.sleep(30.0)
+            cmd = 'CBA_grant_licenses'
+            _INF('Executing: %s' % cmd)
+            stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+            if returncode:
+                max_tries -= 1
+                if max_tries:
+                    _WRN('Some licenses are still in NO granted state')
+                    continue
+                else:
+                    _ERR('Too much time waiting for all licenses in granted state')
+                    quit_program(EXECUTION_ERROR)
+
+            break
+
+    _INF('All licences are present and in granted state')
+    _INF('Start node configuration')
+    access = {'host':HOSTNAME, 'user':USER}
+    GENTRAF = hss_utils.node.gentraf.GenTraf(access)
+    channel = GENTRAF.get_channel()
+
+    try:
+        population_netconf_repo = INSTALLATION_HELPER.population_netconf_repo
+    except st_command.CommandFailure as e:
+        _ERR('%s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'CBA_run_configure -m --vector_supplier %s --output %s/population --netconf %s' % (user_config.vector_supplier,
+                                                                                             st_command.real_path(user_config.output_dir),
+                                                                                             population_netconf_repo)
+
+    _INF('Executing: %s' % cmd)
+    channel.write_line(cmd)
+    while (True):
+        try:
+            result = channel.expect([GENTRAF.get_sync_expression(),
+                                    '\n'])
+
+            if result == 0:
+                _INF('CBA_run_configure execution finished')
+                break
+
+            if result == 1:
+                _INF('  %s' % channel.stdout)
+
+        except pexpect.TIMEOUT, e:
+            continue
+
+        except pexpect.EOF, e:
+            _ERR('EOF received when executing CBA_run_configure')
+            quit_program(EXECUTION_ERROR)
+
+
+    cmd = 'CBA_create_backup AUTO -v'    
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+    if returncode:
+        error_info = 'Faulty with exit code %s' % returncode
+        for line in stderr_value.split('\n'):
+            position = line.find('stFramework_message ')
+            if  position != -1:
+                error_info = line[position + len('stFramework_message ') :]
+                _ERR('%s' % error_info)
+        quit_program(EXECUTION_ERROR)
+
+    quit_program(SUCCESS)
+
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawTextHelpFormatter,
+                        description=textwrap.dedent('''\
+                        vHSS install based on Rosetta information. Rosetta is mandatory
+                        This tool shall be executed in a traffic generator belonging to the same environment that VNF
+            '''),
+            epilog=textwrap.dedent(get_exit_status()))
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('--baseline', default=None,
+                        action='store', dest='baseline',
+                        help='Baseline name used for getting SW packages from rosetta')
+
+    scenario_params.add_argument('--vector-supplier', choices=['NONE','AVG','HLR','ROSETTA'],
+                        action='store', dest='vector_supplier', default='NONE',
+                        help='Configure the vHSS using the provided Vector supplier. If NONE configuration will be skipped')
+
+    scenario_params.add_argument('--nof-pls', type=int,
+                        action='store', dest='nof_pls',
+                        help='Number of PLs to be configured')
+
+    scenario_params.add_argument('--map-pm-jobs',
+                      action='store_true', default=False,
+                      help='Add post installation step for enabling Map PmJobs.',
+                      dest='map_pm_jobs')
+
+    scenario_params.add_argument('--snmp-target-addr',default=None,
+                        action='store', dest='snmp_target_addr',
+                        help='Snmp target IP to be used in Post-installation')
+
+    behaviour_params = parser.add_argument_group('Define behaviour ')
+    behaviour_params.add_argument('--ess',
+                      action='store', default=None,
+                      help='ESS IP. If not present use rosetta to find it.',
+                      dest='ess')
+
+    behaviour_params.add_argument('--rosetta-info',
+                      action='store_true', default=False,
+                      help='There is not an ESS so just find info from rosetta and store it in files.',
+                      dest='rosetta_info')
+
+    behaviour_params.add_argument('--skip-installation',
+                      action='store_true', default=False,
+                      help='DO not install, just prepare cfg files.',
+                      dest='skip_installation')
+
+    behaviour_params.add_argument('--delete',
+                      action='store_true', default=False,
+                      help='Delete the baseline in ESS.',
+                      dest='delete_baseline')
+
+    behaviour_params.add_argument('--max-time',
+                        default=5400, type=int, action='store', dest='max_time',
+                        help='Max time for installation process. By default is "%(default)s seconds"')
+
+    behaviour_params.add_argument('-o', '--output',
+                      action='store', default=None,
+                      help='Specify the output directory. Default %s' % CWD,
+                      dest='output_dir')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    if args.output_dir is not None and args.log_file is not None:
+        _ERR('Error: --log_file and -o can not be used at the same time' )
+        quit_program(ROSETTA_ERROR)
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_run_install_vHSS_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.output_dir is None:
+        args.output_dir = CWD
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(st_command.real_path(args.output_dir), 'CBA_run_install_vHSS_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    args.id = 'v%s' % args.baseline
+
+    return (args)
+
+
+if __name__ == '__main__':
+    CWD = os.getcwd()
+    signal.signal(signal.SIGINT, quit_gracefully)
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

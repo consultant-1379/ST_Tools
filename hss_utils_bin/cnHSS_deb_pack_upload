@@ -1,0 +1,190 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+
+import os
+import errno
+import sys
+import copy
+import hashlib
+import argparse
+import textwrap
+import string
+import subprocess
+import traceback
+import getpass
+import pexpect
+import socket
+import json
+import glob
+
+HOSTNAME = socket.gethostname()
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+CWD = os.getcwd()
+import hss_utils.st_command as st_command
+import hss_utils.node.gentraf
+import hss_utils.connection as connection
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+100: 'Implementation error'
+    }
+
+# Exit status
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+IMPLEMENTATION_ERROR = 100
+
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+
+def quit_program(exit_code):
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+ARMUSER=getpass.getuser()
+
+def get_arm_token():
+    config_file = os.path.expanduser(os.path.expandvars('~/.e3config'))
+    if not os.path.exists(config_file):
+        _ERR('config file "%s" not found '% config_file)
+        quit_program(NOT_FOUND)
+
+    with open(config_file, 'r') as conf_file:
+        data = json.load(conf_file)
+        try:
+            return data['arm_token']
+        except KeyError:
+            _ERR('"arm_token" not found in config file %s.' % config_file)
+            quit_program(NOT_FOUND)
+
+
+def upload(package):
+    _INF('')
+    _INF('Uploading:\t%s' % package)
+    _INF('')
+    cmd_list = []
+    cmd = 'ARMUSER=%s' % ARMUSER
+    cmd_list.append(cmd)
+
+    cmd = 'ARMTOKEN=%s' % get_arm_token()
+    cmd_list.append(cmd)
+
+    cmd = 'FILENAME=%s' % package
+    cmd_list.append(cmd)
+
+    cmd = "SHA1SUM=$(sha1sum $FILENAME | cut -f1 -d' ')"
+    cmd_list.append(cmd)
+
+    cmd = 'curl -X PUT "https://${ARMUSER}:${ARMTOKEN}@arm.lmera.ericsson.se/artifactory/proj-5gest-deb-debian-local/pool/xenial/tg/${FILENAME};deb.distribution=xenial;deb.component=tg;deb.architecture=all" --upload-file ${FILENAME} -H "X-Checksum-Sha1:${SHA1SUM}"'
+    cmd_list.append(cmd)
+
+    for cmd in cmd_list:
+        _INF('Executing:  "%s"' % ('ARMTOKEN=***************' if cmd.startswith('ARMTOKEN') else cmd))
+
+    stdout, stderr, returncode = st_command.execute_cmd(';'.join(cmd_list),stdout= True ,stderr=True, cwd=CWD)
+    if returncode:
+        _ERR('Error: %s' % cmd,stderr)
+
+    for line in stdout.splitlines():
+        _INF(line.strip())
+
+
+def main():
+
+    user_config = parse_command_line()
+    if user_config.PACKAGES[0] == 'all':
+        user_config.PACKAGES = glob.glob("*.deb")
+
+    for pack in user_config.PACKAGES:
+        if os.path.isfile(pack) == False:
+            _ERR('%s file not found' % pack)
+            quit_program(WRONG_PARAMETER)
+        upload(pack)
+
+    quit_program(SUCCESS)
+
+
+def parse_command_line():
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawTextHelpFormatter,
+                        description=textwrap.dedent('''\
+                            Upload to ARM a list of debian packages stored in the current working directory. 
+                            '''),
+            epilog=textwrap.dedent(get_exit_status()))
+
+    parser.add_argument('PACKAGES',nargs='+',
+                        help='''List of packages to be uploaded.
+If value is "all" the tool will upload all the files maching "./*.deb"''')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(cnHSS_deb_pack_upload_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'cnHSS_deb_pack_upload_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+
+    return (args)
+
+
+if __name__ == '__main__':
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        sys.exit(-1)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        sys.exit(-1)
+
+
+

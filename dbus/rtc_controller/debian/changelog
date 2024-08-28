@@ -1,0 +1,11 @@
+rtc-controller (3.2) UNRELEASED; urgency=medium
+
+  * HSS_LICENSE_CRC makro from Population data file
+
+ -- Serafin Alonso Alonso  <serafin.alonso@capgemini.com>  Thu, 27 Jan 2022 11:30:00 +0200
+
+rtc-controller (2.5) UNRELEASED; urgency=medium
+
+  * Initial release. Contributors: Mitxel Garcia (Closes: #XXXXXX)
+
+ -- CCSM Tools team <PDLCCSMTOO@pdl.internal.ericsson.com>  Mon, 05 Mar 2020 18:00:00 +0200

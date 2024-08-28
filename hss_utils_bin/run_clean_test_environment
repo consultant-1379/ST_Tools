@@ -1,0 +1,279 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+import socket
+import getpass
+
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.gentraf
+import hss_utils.rosetta
+import hss_utils.rosetta.services
+from hss_utils.st_command.gentraf import ALLOWED_TOOLS_TOBE_STOPPED
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+USERID = getpass.getuser()
+def set_userid(userid):
+    global USERID
+    USERID = userid
+
+HOSTNAME = socket.gethostname()
+def set_hostname(hostname):
+    global HOSTNAME
+    HOSTNAME = hostname
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+NODE=None
+
+def quit_program(exit_code):
+    global NODE
+
+    if NODE is not None:
+        NODE.release()
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+def main():
+
+    global NODE
+    user_config = parse_commandline()
+
+    if user_config.hosts is None:
+
+        _INF('Reading info from Rosetta for %s traffic generator' % HOSTNAME)
+        config = {'host':HOSTNAME, 'port':user_config.port,'user' : USERID,'password' : user_config.password}
+
+        if user_config.password is not None:
+            config.update({'password' : user_config.password})
+
+        try:
+            envs = hss_utils.rosetta.related_environments(HOSTNAME)
+            if not envs or envs[0] is None:
+                _ERR('Error: Rosetta return an empty list or None')
+                quit_program(EXECUTION_ERROR)
+        except Exception as e:
+                _ERR('Can not fetch Object "%s" from Rosetta (%s)' % (HOSTNAME,e))
+                quit_program(EXECUTION_ERROR)
+
+        st_config = hss_utils.rosetta.services.st_config_for(envs[0])
+        generators = st_config.generators
+        _INF('Cleaning processes on the traffic generators %s ' % generators)
+
+
+    else:
+        generators=user_config.hosts
+        _INF('Traffic generators passed as parameters %s ' % generators)
+
+    failed = False
+
+    for generator in generators:
+        config = {'host':generator, 'port':user_config.port,'user' : USERID,'password' : user_config.password}
+        try:
+            NODE = hss_utils.node.gentraf.GenTraf(config, allow_x11_forwarding = True)
+        except connection.Unauthorized, e:
+            _ERR('Error: %s' % str(e))
+            quit_program(AUTHENTICATION_ERROR)
+
+        except (connection.ConnectionTimeout, connection.ConnectionFailed), e:
+            _ERR('Error: %s' % str(e))
+            quit_program(CONNECTION_ERROR)
+
+        except Exception, e:
+            _ERR('Error: %s' % str(e))
+            quit_program(EXECUTION_ERROR)
+
+        _INF('Cleaning %s' % generator)
+
+        excluded_tools=[]
+        for tool in user_config.exclude:
+            try:
+                tool_pid = int(tool)
+            except ValueError:
+                excluded_tools += [tool]
+
+        for tool in ALLOWED_TOOLS_TOBE_STOPPED:
+            if tool in excluded_tools:
+                continue
+            cmd ='stop_st_tool --node %s %s %s' % (generator, tool, ('--exclude %s' % (' '.join(['%s' % os.getpid()] + user_config.exclude)) if tool == 'UserKnownHostsFile=/dev/null' else ''))
+            answer = NODE.run_command(cmd)
+            _DEB('\tAnswer cmd: %s ' % answer)
+            result = NODE.get_result_code()
+            _DEB('\tResult code cmd: %d ' % result)
+            if result == -1:
+                failed = True
+                _ERR('\tError connecting %s to clean the processes' % generator)
+                break
+            elif result == 0:
+                if tool == 'UserKnownHostsFile=/dev/null':
+                    _INF('\tssh conections closed')
+                else:
+                    _INF('\t%s killed' % tool)
+            elif result == 1:
+                if tool == 'UserKnownHostsFile=/dev/null':
+                    _INF('\tssh conections Not found')
+                else:
+                    _INF('\t%s Not found' % tool)
+            elif result == 2:
+                failed = True
+                if tool == 'UserKnownHostsFile=/dev/null':
+                    _ERR('\tClosing ssh conections problem')
+                else:
+                    _ERR('\tKilling %s problem' % tool)
+            else:
+                if tool == 'UserKnownHostsFile=/dev/null':
+                    _INF('\tUnknown result closing ssh conections')
+                else:
+                    _INF('\tUnknown result Killing %s' % tool)
+
+        NODE.release()
+
+
+    if failed:
+        quit_program(EXECUTION_ERROR)
+    else:
+        quit_program(SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description=textwrap.dedent('''\
+Kill all the ST Tools and stFramework command processes in the environment related to traffic generators'
+Tools to be killed:%s
+
+'''  %   ''.join([ '\n\t%s' % tool for tool in ALLOWED_TOOLS_TOBE_STOPPED ])),
+                        epilog=textwrap.dedent(st_command.get_exit_status()))
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('--hosts', nargs='+',
+                        default=None, action='store', dest='hosts',
+                        help='Hostnames or IP address of the traffic generators to clean. Default: The local hostname will be used for reading info from Rosetta')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh. Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default=USERID,
+                      help='User for ssh. Default: User connected right now %(default)s',
+                      dest='user')
+
+    access_params.add_argument('--password',
+                      action='store', default=None,
+                      help='Password used in ssh. Not used by default',
+                      dest='password')
+
+    behaviour_params = parser.add_argument_group('Define behaviour ')
+    behaviour_params.add_argument('--exclude',
+                        default=[], nargs='+',action='store',
+                        dest='exclude',
+                        help='Set a list of PIDs or tool names that shall not be killed')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(run_clean_test_environment_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'run_clean_test_environment_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+
+    set_userid(args.user)
+
+    return (args)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

@@ -1,0 +1,47 @@
+#!/usr/bin/env python
+#
+
+
+import argparse
+import textwrap
+import sys
+import hss_utils.st_command
+import hss_utils.st_command.cba
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            description=textwrap.dedent('''\
+                This command is part of HSS stFramework and it is executed via run_command_node application.
+
+                Restore a backup with given name in the CBA cluster referenced by NODE parameter
+                By default the command will wait for reload
+                Command output is Backup restore time and Reload time in seconds
+                '''),
+            epilog=textwrap.dedent(hss_utils.st_command.get_exit_status()),
+            parents=[hss_utils.st_command.default_cba_command_parser(), hss_utils.st_command.cba.CBA_restore_backup_parser()])
+
+    parser.parse_args()
+
+    return ([hss_utils.st_command.fix_args(arg) for arg in sys.argv[1:]])
+
+def main():
+    try:
+        args = parse_commandline()
+        cmd = 'run_command_node CBA_restore_backup %s' % ' '.join(args)
+        stdout_value, returncode = hss_utils.st_command.execute_cmd(cmd)
+        if len(stdout_value) > 0 and returncode == 0:
+            print stdout_value[:-1]
+        sys.exit(returncode)
+
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+    except Exception, e:
+        print 'Exception: %s' % e
+        sys.exit(100)
+
+
+if __name__ == '__main__':
+    main()

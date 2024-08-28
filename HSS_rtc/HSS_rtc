@@ -1,0 +1,1581 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+
+import os.path
+import time
+import shutil
+import hashlib
+import traceback
+import argparse
+import ntpath
+import signal
+import textwrap
+import json
+import copy
+import pprint
+import threading
+import thread
+import inspect
+import errno
+import getpass
+
+import hss_utils.dbus
+import hss_utils.node.gentraf
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import hss_utils.node.cloud
+import hss_utils.node.tsp
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+import HSS_rtc_lib
+from HSS_rtc_lib.shared import *
+import HSS_rtc_lib.shared as shared
+from HSS_rtc_lib.components import *
+from HSS_rtc_lib.components.phases import *
+from HSS_rtc_lib.components.checks import *
+from HSS_rtc_lib.components.execution import *
+from HSS_rtc_lib.components.console import *
+from HSS_rtc_lib.components.junit import *
+from HSS_rtc_lib.components.test_suite import *
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt
+    #raise KeyboardInterrupt, "Signal handler"
+
+class ExecutionNotAllowed(Exception):
+    def __init__(self, cause='unknown cause'):
+        self.__err = cause
+
+    def __str__(self):
+        return '%s' % self.__err
+
+ENV_CONFIG = None
+HOSTNAME = socket.gethostname()
+
+def get_env_data():
+    global ENV_CONFIG
+    if ENV_CONFIG is None:
+        _INF('Using rosetta for getting enviroment info')
+        env, config = hss_utils.rosetta.services.get_env_for_localhost()
+        _INF('Environment  : %s' % env)
+        ENV_CONFIG = config
+
+    return ENV_CONFIG
+
+
+class RemoteControl(threading.Thread):
+    def __init__(self, log_path, rtc_data, udp_port=5000):
+        threading.Thread.__init__(self)
+
+        self.__id = 'REMOTE_CONTROL'
+        self.__rtc_data = rtc_data
+        self.__udp_port = udp_port
+        self.__running = False
+        self.__udp_socket = None
+        self.__logfilename = os.path.join(log_path, '%s.log' % self.id.lower())
+
+        if not os.path.exists(log_path):
+            os.makedirs(log_path)
+
+        self.__logfile = open(self.__logfilename, "w")
+        self.answers = Queue.Queue()
+        self.__force_exit = False
+        self.__subcriptions = {}
+
+
+    def clean_subcriptions(self):
+        self.__subcriptions = {}
+
+    def subscribe(self, cmd, queue):
+        try:
+            self.__subcriptions[cmd] += [queue]
+        except KeyError:
+            self.__subcriptions.update({cmd:[queue]})
+
+    def find_subscriptors(self, cmd):
+        try:
+            return self.__subcriptions[cmd]
+        except KeyError:
+            return []
+
+    @property
+    def id(self):
+        return self.__id
+
+    @property
+    def rtc_data(self):
+        return self.__rtc_data
+
+    @property
+    def force_exit(self):
+        return self.__force_exit
+
+    def activate_force_exit(self):
+        self.__force_exit = True
+
+    @property
+    def udp_port(self):
+        return self.__udp_port
+
+    @property
+    def logfile(self):
+        return self.__logfile
+
+    def log_event(self, level, event_info, add_timestamp=False):
+        timestamp = ''
+        if add_timestamp:
+            timestamp = '%s: ' % datetime.now()
+        info = '%s%s' % (timestamp, event_info)
+        if self.logfile is not None:
+            try:
+                self.logfile.write('%s\n' % info)
+            except ValueError:
+                pass
+
+        if level == 'info':
+            _INF(event_info)
+        elif level == 'error':
+            _ERR(event_info)
+        elif level == 'warning':
+            _WRN(event_info)
+
+    def start_udp_server(self):
+        self.log_event('info', '%s starting UDP server at %s' % (self.id, self.__udp_port), True)
+
+        try:
+            self.__udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.__udp_socket.settimeout(5.0)
+            self.__udp_socket.bind(('0.0.0.0', self.__udp_port))
+            self.__running = True
+        except socket.error, e:
+            error_info = 'Problem opening remote control: %s' % str(e)
+            _ERR(error_info)
+            raise ExecutionNotAllowed(error_info)
+
+    def shutdown(self):
+        _INF('%s shutdown received' % self.__id)
+        if self.__running:
+        #if self.__udp_socket is not None:
+            self.__force_exit = True
+            if self.is_alive:
+                self.join(5.0)
+            self.__udp_socket.close()
+            self.log_event('info', '%s closing UDP server' % (self.id), True)
+            self.__udp_socket = None
+            self.__running = False
+
+    def read_udp_cmd(self):
+        try:
+            data, client = self.__udp_socket.recvfrom(4096)
+        except KeyboardInterrupt:
+            return
+        except socket.timeout:
+            return
+
+        data = data.strip()
+        try:
+            cmd = data.split()[0]
+        except IndexError:
+            answer = 'HSS_rtc command NOT VALID'
+            sent = self.__udp_socket.sendto(answer, client)
+            self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            return
+
+        param = []
+        if len(data.split()) > 1:
+            param = data.split()[1:]
+
+        self.log_event('info', '%s HSS_rtc command received: %s' % (self.id, data), True)
+
+        subcriptors = self.find_subscriptors(cmd)
+        if subcriptors:
+            for subcriptor in subcriptors:
+                answer = None
+                try:
+                    try:
+                        subcriptor.udp_messages.put_nowait((data, self.answers))
+                        answer = self.answers.get(True, timeout=30.0)
+                        sent = self.__udp_socket.sendto(answer, client)
+                        self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+                    except Queue.Empty:
+                        _WRN('%s No answer received from %s' % (self.id, subcriptor.id))
+                        pass
+
+                except Exception, e:
+                    run_error = '%s Problem executing "%s" in %s:  %s' % (self.id, data, subcriptor.id, str(e))
+                    _ERR(run_error)
+                    self.release(ExecutionRunError(run_error))
+
+        elif cmd == 'who_are_you':
+            answer = 'HSS_rtc'
+            sent = self.__udp_socket.sendto(answer, client)
+            self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+
+        elif cmd == 'show_summary':
+            if len(param) !=1:
+                answer = 'WRONG SYNTAX: show_summary <test_case_name>'
+                sent = self.__udp_socket.sendto(answer, client)
+                self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+                return
+
+            answer = self.rtc_data.TestSuite.get_summary(param[0])
+            sent = self.__udp_socket.sendto(answer, client)
+            self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            return
+
+
+        elif cmd == 'show_macro':
+            answer = self.rtc_data.show_macro()
+            sent = self.__udp_socket.sendto(answer, client)
+            self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            return
+
+
+        elif cmd == 'get':
+            if len(param) !=1:
+                answer = 'WRONG SYNTAX: get <var_name>'
+                sent = self.__udp_socket.sendto(answer, client)
+                self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+                return
+            elif param[0] =='report':
+                answer = str(self.rtc_data.TestSuite)
+                sent = self.__udp_socket.sendto(answer, client)
+                self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            elif param[0] =='status':
+                answer = '\nStatus:%s\n' %  ('Stopping' if self.rtc_data.exit_rtc else 'Running')
+                answer += 'User:%s\n' % self.rtc_data.user_config.owner
+                answer += 'Build:%s\n' % self.rtc_data.user_config.hss_build
+                answer += 'High Priority:%s\n' % self.rtc_data.user_config.high_priority
+                answer += 'Test Suite:%s\n' % self.rtc_data.TestSuite.name
+                answer += 'Phase: MANDATORY Executed %s (%s)\n' % (self.rtc_data.TestSuite.nof_mandatory_tcs_exec, self.rtc_data.TestSuite.nof_mandatory_tcs)
+                answer += 'Phase: OPTIONAL  Executed %s (%s)\n' % (self.rtc_data.TestSuite.nof_optional_tcs_exec, self.rtc_data.TestSuite.nof_optional_tcs)
+                answer += 'Prov_Result:%s\n' % self.rtc_data.test_suite_execution_status
+                answer += 'Root_Path:%s\n' % st_command.real_path(self.rtc_data.user_config.output_path_prefix)
+
+                sent = self.__udp_socket.sendto(answer, client)
+                self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            else:
+                answer='ERROR: %s NOT FOUND' % param[0]
+                sent = self.__udp_socket.sendto(answer, client)
+                self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+
+        elif cmd == 'set':
+            if len(param) !=2:
+                answer = 'WRONG SYNTAX: set <var_name> <value>'
+                sent = self.__udp_socket.sendto(answer, client)
+                self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+                return
+
+            if param[0] =='test_execution_status':
+                if param[1] not in ['SUCCESS','FAILED']:
+                    answer = 'Wrong value. Allowed values are: SUCCESS | FAILED'
+                else:
+                    self.rtc_data.set_test_suite_execution_status(param[1],force=True)
+                    answer = 'EXECUTED'
+                sent = self.__udp_socket.sendto(answer, client)
+                self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            elif param[0] =='hss_build':
+                self.rtc_data.user_config.hss_build = param[1]
+                answer = 'EXECUTED'
+                sent = self.__udp_socket.sendto(answer, client)
+                self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            elif param[0] =='high_priority':
+                self.rtc_data.user_config.high_priority = param[1] in ['True','true']
+                answer = 'EXECUTED'
+                sent = self.__udp_socket.sendto(answer, client)
+                self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            elif param[0] =='owner':
+                self.rtc_data.user_config.owner = param[1]
+                answer = 'EXECUTED'
+                sent = self.__udp_socket.sendto(answer, client)
+                self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            else:
+                answer='ERROR: %s NOT FOUND' % param[0]
+                sent = self.__udp_socket.sendto(answer, client)
+                self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+
+        elif cmd == 'quit':
+            answer = 'ORDERED'
+            sent = self.__udp_socket.sendto(answer, client)
+            self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            RTC.paused = False
+            self.rtc_data.exit_rtc = True
+            self.rtc_data.exit_test_case = False
+
+        elif cmd == 'continue_quit':
+            answer = 'ORDERED'
+            sent = self.__udp_socket.sendto(answer, client)
+            self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            RTC.paused = False
+            self.rtc_data.exit_test_case = True
+            self.rtc_data.exit_rtc = False
+            os.kill(os.getpid(), signal.SIGINT)
+
+        elif cmd == 'force_quit':
+            answer = 'ORDERED'
+            sent = self.__udp_socket.sendto(answer, client)
+            self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+            RTC.paused = False
+            self.rtc_data.exit_test_case = True
+            self.rtc_data.exit_rtc = True
+            os.kill(os.getpid(), signal.SIGINT)
+
+        elif cmd == 'resume':
+            RTC.paused = False
+            answer = 'EXECUTED'
+            sent = self.__udp_socket.sendto(answer, client)
+            self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+
+        else:
+            answer = 'Unknown HSS_rtc command: %s' % cmd
+            sent = self.__udp_socket.sendto(answer, client)
+            self.log_event('info', '%s %s bytes sent. Answer: %s' % (self.id, sent,answer), True)
+
+    def run(self):
+        while (self.__running):
+            if self.force_exit:
+                return
+            self.read_udp_cmd()
+
+        _INF('%s end of thread execution' % self.id)
+
+
+class RTC_Data(object):
+    def __init__(self, user_config):
+
+        self.__user_config = user_config
+        self.__BAT_instances = None
+        self.__faulty_latency_reports = None
+        self.__reference = {}
+        self.__references_created = []
+        self.__default_macro = {}
+        self.__macro = {}
+        self.__scenario_error_rate_monitor = None
+        self.__scenario_load_monitor = None
+        self.__exit_rtc = False
+        self.__exit_test_case = False
+        self.__remote_control = RemoteControl(user_config.output_path_prefix, self)
+        if user_config.cfg_file is None:
+            self.TestSuite = TestSuite('Not_defined')
+        else:
+            name = '%s_%s' % (os.path.basename(st_command.real_path(user_config.cfg_file)).split('.')[0], time.strftime("%Y%m%d-%H%M%S"))
+            self.TestSuite = TestSuite(name,report_path=user_config.output_path_prefix)
+
+        self.TestCase = None
+
+        self.create_macro()
+        self.__Consoles = []
+        self.__background_commands = []
+
+    @property
+    def id(self):
+        if self.TestCase is not None:
+            return self.TestCase.name
+
+    @property
+    def cfg(self):
+        if self.TestCase is not None:
+            return self.TestCase.json_file
+
+    @property
+    def config_data(self):
+        if self.TestCase is not None:
+            return self.TestCase.config_data
+
+    @property
+    def root_path(self):
+        if self.TestCase is not None:
+            return self.TestCase.root_path
+
+    @property
+    def remote_control(self):
+        return self.__remote_control
+
+    @property
+    def test_suite_execution_status(self):
+        return self.TestSuite.status
+
+    def set_test_suite_execution_status(self, status, force = False):
+        self.TestSuite.set_test_suite_execution_status(status, force)
+
+    @property
+    def exit_rtc(self):
+        return self.__exit_rtc
+
+    @exit_rtc.setter
+    def exit_rtc(self, value):
+        self.__exit_rtc = value
+
+    @property
+    def exit_test_case(self):
+        return self.__exit_test_case
+
+    @exit_test_case.setter
+    def exit_test_case(self, value):
+        self.__exit_test_case = value
+
+    @property
+    def user_config(self):
+        return self.__user_config
+
+    @property
+    def cabinet(self):
+        return self.user_config.cabinet
+
+    @property
+    def tc_path(self):
+        return self.TestCase.name
+
+    @property
+    def scenario_error_rate_monitor(self):
+        return self.__scenario_error_rate_monitor
+
+    @scenario_error_rate_monitor.setter
+    def scenario_error_rate_monitor(self, monitor):
+        self.__scenario_error_rate_monitor = monitor
+
+    @property
+    def scenario_load_monitor(self):
+        return self.__scenario_load_monitor
+
+    @scenario_load_monitor.setter
+    def scenario_load_monitor(self, monitor):
+        self.__scenario_load_monitor = monitor
+
+    def check_json_available(self):
+        if self.user_config.cfg_file is not None:
+            try:
+                with open(self.user_config.cfg_file) as fd:
+                    optional_found = False
+                    for line in fd.readlines():
+                        # Remove comments: assuming "//" and "#" as markers
+                        if '#' in line:
+                            line = line[:line.index('#')]
+                        if '//' in line:
+                            line = line[:line.index('//')]
+                        # Clean line and skip empty
+                        line = line.strip()
+                        if line == '':
+                            continue
+
+                        if 'OPTIONAL' in line:
+                            optional_found = True
+                            continue
+
+                        line = line.split(':')
+                        if len(line) == 1:
+                            cfg = line[0]
+                            macro_file = None
+                        elif len(line) == 2:
+                            cfg = line[0]
+                            macro_file = line[1]
+                        else:
+                            _ERR('Invalid syntax in cfg_file %s. It shall be json_file:macro_file' % self.user_config.cfg_file)
+                            quit_program(WRONG_PARAMETER)
+
+                        try:
+                            self.TestSuite.add_test_case(cfg,macro_file, mandatory=not optional_found)
+                        except TypeError as e:
+                            _ERR('%s' % str(e))
+                            raise ExecutionNotAllowed('%s' % str(e))
+
+            except IOError:
+                _ERR('cfg_file %s not found' % self.user_config.cfg_file)
+                quit_program(WRONG_PARAMETER)
+
+        else:
+            for cfg in self.user_config.CFG:
+                try:
+                    self.TestSuite.add_test_case(cfg,None, mandatory=True)
+                except TypeError as e:
+                    _ERR('%s' % str(e))
+                    raise ExecutionNotAllowed('%s' % str(e))
+
+
+
+        if  not self.TestSuite.nof_tcs:
+
+            _ERR('Configuration file is mandatory')
+            cmd = 'find $HOME/.local -name %s_test_case_template.json | grep HSS_rtc' % self.user_config.node_type
+            stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+
+            if len(stdout_value)> 0:
+                cfg = stdout_value.split('\n')[0]
+                _ERR('There is a template in: %s' % cfg)
+            else:
+                cmd = 'find /usr/local -name %s_test_case_template.json | grep HSS_rtc' % self.user_config.node_type
+                stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+
+                if len(stdout_value)> 0:
+                    cfg = stdout_value.split('\n')[0]
+                    _ERR('There is a template in: %s' % cfg)
+
+                else:
+                    cmd = 'find /usr -name %s_test_case_template.json | grep HSS_rtc' % self.user_config.node_type
+                    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+
+                    if len(stdout_value)> 0:
+                        cfg = stdout_value.split('\n')[0]
+                        _ERR('There is a template in: %s' % cfg)
+
+                    else:
+                        _ERR('Default json file template not found.')
+
+            quit_program(WRONG_PARAMETER)
+
+
+    def start_remote_control(self):
+        self.remote_control.start_udp_server()
+        self.remote_control.start()
+
+    def stop_remote_control(self):
+        self.remote_control.shutdown()
+
+    def add_to_macro(self, key, value):
+        try:
+            self.__macro[key] = value
+        except KeyError:
+            self.__macro.update({key:value})
+
+    def update_reference(self, data, identity, target_load):
+        self.__reference.update({identity:copy.deepcopy(data)})
+        self.__references_created.append(identity)
+        if target_load > 0:
+            try:
+                self.update_macro_value('#%s#' % identity,
+                                        '%s' % target_load,
+                                        default=True)
+                _INF('New macro added %s:%s' % (('#%s#' % identity), target_load))
+            except Exception ,e:
+                _WRN('Unable to update macro: %s' % str(e))
+
+    def delete_reference(self, identity):
+        try:
+            del self.__reference[identity]
+            _INF('Reference %s created before has been deleted' % identity)
+        except KeyError:
+            pass
+
+        try:
+            del self.__macro['#%s#' % identity]
+            _INF('Macro #%s# created before has been deleted' % identity)
+        except KeyError:
+            pass
+
+    def get_bat_instances_from_reference(self,identity):
+        try:
+            return copy.deepcopy(self.__reference[identity]['instances'])
+        except (KeyError, IndexError):
+            identity = st_command.real_path(identity)
+            if os.path.isfile(identity):
+                try:
+                    with open(identity) as json_data:
+                        data = json.load(json_data)
+                        try:
+                            return copy.deepcopy(data['instances'])
+                        except (KeyError, IndexError):
+                            return {}
+                except Exception, e:
+                        _WRN('Error parsing json %s file: %s' % (identity, str(e)))
+            return {}
+
+    def get_load_monitor_slots_from_reference(self,identity):
+        try:
+            return copy.deepcopy(self.__reference[identity]['slots'])
+        except (KeyError, IndexError):
+            identity = st_command.real_path(identity)
+            if os.path.isfile(identity):
+                try:
+                    with open(identity) as json_data:
+                        data = json.load(json_data)
+                        try:
+                            return copy.deepcopy(data['slots'])
+                        except (KeyError, IndexError):
+                            return []
+                except Exception, e:
+                        _WRN('Error parsing json %s file: %s' % (identity, str(e)))
+            return []
+
+    def check_reference(self):
+        if 'EXECUTION' not in self.user_config.phase:
+            return
+        try:
+            if not self.config_data['phases']['EXECUTION']['enable']:
+                return
+        except KeyError:
+            return
+        try:
+            if self.config_data['phases']['EXECUTION']['configuration']['monitor_load']['enable']:
+                if not isinstance(self.config_data['phases']['EXECUTION']['configuration']['monitor_load']['slots'],list):
+                    reference = self.config_data['phases']['EXECUTION']['configuration']['monitor_load']['slots']
+                    slots = self.get_load_monitor_slots_from_reference(reference)
+                    if not slots:
+                        reason = 'Monitor load slots %s not found' % reference
+                        raise ExecutionNotAllowed(reason)
+
+        except KeyError:
+            pass
+
+        try:
+            if not isinstance(self.config_data['phases']['EXECUTION']['instances'],dict):
+                reference = self.config_data['phases']['EXECUTION']['instances']
+                instances = self.get_bat_instances_from_reference(reference)
+                if not instances:
+                    reason = 'BAT instances configuration %s not found' % reference
+                    raise ExecutionNotAllowed(reason)
+
+        except KeyError:
+            pass
+
+        try:
+            for action in self.config_data['phases']['EXECUTION']['configuration']['action']:
+                if action['enable']and not isinstance(action['trigger']['load'],int):
+                    load = self.get_load_monitor_target_from_reference(action['trigger']['load'])
+                    if load == -1:
+                        reason = 'Action load trigger %s not found' % action['trigger']['load']
+                        raise ExecutionNotAllowed(reason)
+
+        except KeyError:
+            pass
+
+
+        try:
+            if self.config_data['phases']['EXECUTION']['configuration']['diaproxy_reports']['latency']['enable']:
+                target_load = self.config_data['phases']['EXECUTION']['configuration']['diaproxy_reports']['latency']['target_load']
+                if  not isinstance(target_load,int):
+                    load = self.get_load_monitor_target_from_reference(target_load)
+                    if load == -1:
+                        reason = 'Diaproxy reports latency target load %s not found' % target_load
+                        raise ExecutionNotAllowed(reason)
+
+        except KeyError:
+            pass
+
+
+    def get_load_monitor_target_from_reference(self,identity):
+        try:
+            return self.__default_macro[identity]
+        except (KeyError, IndexError):
+            identity = st_command.real_path(identity)
+            if os.path.isfile(identity):
+                try:
+                    with open(identity) as json_data:
+                        data = json.load(json_data)
+                        try:
+                            return copy.deepcopy(data['load'])
+                        except (KeyError, IndexError):
+                            return -1
+                except Exception, e:
+                        _WRN('Error parsing json %s file: %s' % (identity, str(e)))
+            return -1
+
+    def save_traffic_references(self):
+        for reference in self.__references_created:
+            ref_data = {}
+            ref_data.update({'instances':self.__reference[reference]['instances']})
+            ref_data.update({'slots':self.__reference[reference]['slots']})
+            ref_data.update({'load':self.get_load_monitor_target_from_reference('#%s#' % reference)})
+            with open(os.path.join(self.root_path,'ref_%s.json' % reference), 'w') as fp:
+                json.dump(ref_data, fp, indent=4, sort_keys=True)
+
+    @property
+    def macro(self):
+        return self.__macro
+
+    def create_macro(self):
+        if self.user_config.NODE:
+            self.add_to_macro('#NODE#',self.user_config.NODE)
+        self.add_to_macro('#USER#',self.user_config.user)
+        self.add_to_macro('#PORT#',self.user_config.port)
+        self.add_to_macro('#TIME_BETWEEN_BAT_INSTANCES#','0')
+
+        if self.user_config.extdb:
+            self.add_to_macro('#EXTDB#',self.user_config.extdb)
+        if self.user_config.extdb_backup != '':
+            self.add_to_macro('#EXTDB_BACKUP#',self.user_config.extdb_backup)
+        if self.user_config.hss_backup != '':
+            self.add_to_macro('#HSS_BACKUP#',self.user_config.hss_backup)
+        self.add_to_macro('#GENERATORS#','%s' % (' '.join(self.user_config.generators)))
+        self.add_to_macro('#NODE_TYPE#',self.user_config.node_type)
+        if self.user_config.scxb:
+            self.add_to_macro('#SCXB#',self.user_config.scxb)
+        self.add_to_macro('#TESTCASE_PATH#',self.user_config.root_path)
+        if self.user_config.node_controller:
+            self.add_to_macro('#NODE_CONTROLLER#',self.user_config.node_controller)
+        local_bat_bin = os.path.expandvars('$GIT_PATH/ST_BAT/build/BAT_HSSTraffic')
+        local_bat_cfg = os.path.expandvars('$GIT_PATH/ST_BAT/cfg')
+        self.add_to_macro('#LOCAL_BAT#','-b %s --set-bat-cfg-path %s' %(local_bat_bin, local_bat_cfg))
+
+        if self.user_config.macro_data:
+            for element in self.user_config.macro_data:
+                if len(element.split(':')) == 2:
+                    self.add_to_macro('#%s#' % element.split(':')[0],element.split(':')[1])
+
+        if self.user_config.macro_file:
+            _DEB('Adding Macro file %s' % self.user_config.macro_file)
+            self.add_macro_file([self.user_config.macro_file])
+
+        self.__default_macro = copy.deepcopy(self.__macro)
+        _DEB('Default Macros: %s' % self.__default_macro)
+
+    def update_macro_value(self, key, value, default=False):
+        try:
+            self.__macro[key] = value
+            if default:
+                self.__default_macro[key] = value
+        except KeyError:
+            pass
+
+    def get_macro_value(self, key):
+        return self.__macro.get(key,None)
+
+    def add_macro_file(self, macro_files):
+        for macro in macro_files:
+            try:
+                with open(macro) as fd:
+                    for line in fd.readlines():
+                        # Remove comments: assuming "//" and "#" as markers
+                        if '#' in line:
+                            line = line[:line.index('#')]
+                        # Clean line and skip empty
+                        line = line.strip()
+                        if line == '':
+                            continue
+                        if line.startswith('//'):
+                            continue
+                        # Get key/value pairs
+                        if len(line.split(':')) >= 2:
+                            self.add_to_macro('#%s#' % line.split(':')[0],os.path.expandvars(':'.join(line.split(':')[1:])))
+            except IOError:
+                _ERR('Macro file %s not found' % macro)
+                quit_program(WRONG_PARAMETER)
+
+ 
+    def save_macro_file(self, macro_files):
+        for macro in macro_files:
+            try:
+                shutil.copy(macro,self.TestCase.root_path)
+            except Exception, e:
+                _WRN('Problem storing Macro file %s in %s : %s' % (macro, self.TestCase.root_path, str(e)))
+
+
+
+    def macro_translator(self, text):
+        for key, value in self.__macro.iteritems():
+            try:
+                text = text.replace(key, value)
+            except TypeError as e:
+                _DEB('Wrong key %s : %s ' %(key,str(e)))
+
+        return text
+
+    def show_macro(self):
+        info = '\n%s macros\n\n' % ('%s test case' % self.id if self.id else 'Commom')
+        for key in sorted(self.macro):
+            info += '%-*s:  %s\n' %(20,key,self.macro[key])
+
+        return info
+
+    def initialize(self, test_case):
+        self.TestCase = test_case
+        self.__BAT_instances = []
+        self.__references_created = []
+        self.__scenario_error_rate_monitor = None
+        self.__scenario_load_monitor = None
+        self.__faulty_latency_reports = []
+        self.__exit_rtc = False
+        self.__exit_test_case = False
+        self.__macro = copy.deepcopy(self.__default_macro)
+        self.cabinet.close_connection(identity = 'main')
+        self.remote_control.clean_subcriptions()
+
+        self.check_reference()
+
+        if test_case.macro_files:
+            _INF('Macro files for testcase:%s ' % test_case.macro_files)
+            self.add_macro_file(test_case.macro_files)
+
+        test_case.name = self.macro_translator('%s' % test_case.name)
+        test_case.update_status('running',root_path=self.user_config.output_path_prefix,test_case_path=self.user_config.test_case_path)
+        self.add_to_macro('#TESTCASE_PATH#',self.root_path)
+        self.add_to_macro('#TESTCASE_NAME#',test_case.name)
+
+        if not os.path.exists(test_case.root_path):
+            os.makedirs(test_case.root_path)
+
+        if self.user_config.macro_file:
+            self.save_macro_file([self.user_config.macro_file])
+
+        if test_case.macro_files:
+            self.save_macro_file(test_case.macro_files)
+
+    def add_background_command(self, cmd):
+        self.__background_commands.append(cmd)
+
+
+    def init_consoles(self):
+        try:
+            console_enabled = self.config_data['monitor_consoles']['enable']
+            if not isinstance(console_enabled,bool):  
+                console_enabled = 'true' in self.macro_translator('%s' % console_enabled)
+        except KeyError:
+            console_enabled = False
+
+        if console_enabled:
+            try:
+                console_path = os.path.join(self.root_path,'CONSOLES')
+                os.makedirs(console_path)
+                for new_console in  self.config_data['monitor_consoles']['consoles']:
+                    host = self.macro_translator('%s' % new_console['host'])
+                    port = self.macro_translator('%s' % new_console['port'])
+                    console = Console(new_console['id'],host,port,console_path)
+                    console.start_handling()
+                    self.__Consoles.append(console)
+
+            except KeyError as e:
+                configuration_error = 'Missing key in Console configuration: %s ' % e
+                raise ExecutionConfigurationError(configuration_error)
+
+
+    def add_skipped_testcase(self, reason=''):
+        self.TestCase.update_status('skipped',message=reason)
+
+    def display_report(self):
+        print self.TestSuite
+
+    def create_report(self):
+        self.TestSuite.save_report()
+
+    def finish(self):
+        self.save_traffic_references()
+
+        self.__BAT_instances = []
+
+        for console in self.__Consoles:
+            console.shutdown()
+            if console.is_alive():
+                console.join(5.0)
+
+        self.__Consoles = []
+
+        for cmd in self.__background_commands:
+            if cmd.is_running:
+                _INF('Stopping background command: "%s"' % cmd.cmd)
+                cmd.stop()
+
+        self.__background_commands = []
+
+        finish_threads(skip=[self.remote_control.id])
+
+        if self.TestCase:
+
+            if self.TestCase.status == 'running':
+                self.TestCase.update_status('not finished', message='Abnormal temination')
+
+            if self.TestCase.status == 'not finished':
+                _WRN('%s verdict: NOT FINISHED' % self.TestCase.name)
+            elif self.TestCase.failure_messages:
+                _ERR('%s verdict: FAILED' % self.TestCase.name)
+            else :
+                _INF('%s verdict: SUCCESS' % self.TestCase.name)
+
+        _INF('')
+
+    @property
+    def faulty_latency_reports(self):
+        return self.__faulty_latency_reports
+
+    def add_faulty_latency_report(self, report):
+        self.__faulty_latency_reports.append(report)
+
+    @property
+    def BAT_instances(self):
+        return self.__BAT_instances
+
+    def add_BAT_instance(self,bat):
+        self.__BAT_instances.append(bat)
+
+    def add_faulty_step(self,faulty_step):
+        self.TestCase.summary.add_faulty_step(faulty_step)
+
+    def add_action_result(self,action_result):
+        self.TestCase.summary.add_action_result(action_result)
+
+    def add_action_info(self, action_id, message):
+        self.TestCase.summary.add_action_info(action_id, message)
+
+    def update_verdict(self, verdict, error_info='error info not available',repeat=False):
+        if not verdict:
+            self.TestCase.failure_messages = error_info
+            self.TestCase.repeat = repeat
+
+    @property
+    def epm_enabled(self):
+        return self.TestCase.epm_enabled
+
+    @property
+    def epm_samples(self):
+        return self.TestCase.epm_samples
+
+    @property
+    def epm(self):
+        return self.TestCase.epm
+
+    def update_epm(self, data):
+        self.TestCase.update_epm(data)
+
+    def get_last_epm(self,identity='EPM'):
+        return self.TestSuite.get_last_epm(identity)
+
+    @property
+    def nof_payloads(self):
+        return self.TestCase.nof_payloads
+
+    @nof_payloads.setter
+    def nof_payloads(self, value):
+        self.TestCase.nof_payloads = value
+
+class RTC_controller(object):
+    def __init__(self, user_config, rtc_data):
+
+        self.__user_config = user_config
+        self.__rtc_data = rtc_data
+        self.__paused = False
+
+    @property
+    def rtc_data(self):
+        return self.__rtc_data
+
+    @property
+    def user_config(self):
+        return self.__user_config
+
+    @property
+    def paused(self):
+        return self.__paused
+
+    @paused.setter
+    def paused(self, value):
+        assert(isinstance(value, bool))
+        self.__paused = value
+
+
+    def release(self):
+        self.rtc_data.remote_control.shutdown()
+        self.rtc_data.finish()
+
+    def run(self):
+
+        self.rtc_data.start_remote_control()
+
+        _INF('RTC execution start')
+        while True:
+            while self.__paused:
+                _INF('RTC in paused state')
+                time.sleep(5.0)
+
+            if self.rtc_data.exit_rtc:
+                _WRN('')
+                _WRN('RTC exit required by user/external tool or faulty test case')
+                _WRN('')
+                break
+
+            test_case = self.rtc_data.TestSuite.next_text_case()
+            if test_case is None:
+                break
+
+            try:
+                self.rtc_data.initialize(test_case)
+
+                _INF('')
+                _INF('Executing %s ' % test_case.name)
+                _INF('\tjson cfg        : %s ' % test_case.json_file)
+                _INF('\tmacro file      : %s' % ','.join(test_case.macro_files))
+                _INF('\troot_path       : %s' % test_case.root_path)
+                if test_case.nof_retries:
+                    _INF('\tnum of retries  : %s' % test_case.nof_retries)
+
+            except ExecutionNotAllowed, e:
+                _WRN('')
+                _WRN('Skipped testcase %s' % test_case.name)
+                _WRN('\tjson cfg   : %s ' % test_case.json_file)
+                _WRN('\tReason     : %s' % str(e))
+                _WRN('')
+                self.rtc_data.add_skipped_testcase(reason=str(e))
+                continue
+
+            if not os.path.exists(test_case.root_path):
+                os.makedirs(test_case.root_path)
+
+            try:
+                self.rtc_data.nof_payloads = -1
+                try:
+                    self.rtc_data.nof_payloads = len(NODE.payload)
+                except Exception as e: 
+                    _WRN('\tProblem reading number of payload: %s' % e)
+
+                _INF('\tnum of payloads : %s' % self.rtc_data.nof_payloads)
+
+                start = datetime.today() 
+                timestamp = start.strftime("%Y-%m-%dT%H:%M:%S")
+                try:
+                    timestamp = NODE.datetime
+                except Exception as e: 
+                    _WRN('\tProblem reading datetime: %s' % e)
+
+                self.rtc_data.add_to_macro('#TIMESTART#',timestamp)
+                _INF('\tDatetime        : %s' % timestamp)
+                _INF('')
+
+                self.rtc_data.init_consoles()
+
+                for phase in self.user_config.phase:
+                    if self.rtc_data.exit_test_case:
+                        info = 'Test case exit order has been received'
+                        _WRN(info)
+                        test_case.update_status('not finished', message=info)
+                        break
+                    try:
+                        if test_case.config_data['phases'][phase]['enable']:
+                            phase = eval('%s(test_case.config_data, self.user_config, self.rtc_data)' % phase)
+                            phase.run()
+                    except KeyError:
+                        continue
+                    except SkipPhase as e:
+                        _WRN('')
+                        _WRN('%s' % e)
+                        _WRN('')
+                        continue
+
+                test_case.update_status('finished')
+            except KeyboardInterrupt:
+                if self.rtc_data.exit_rtc:
+                    _WRN('Stopping test case %s and exiting from RTC' % self.rtc_data.id)
+                elif self.rtc_data.exit_test_case:
+		    _WRN('Stopping test case %s' % self.rtc_data.id)
+		else:
+                    print '\n\n[Press Enter to execute next test case or Ctrl-C to finish]'
+                    try:
+                        raw_input()
+                    except KeyboardInterrupt:
+                        self.rtc_data.exit_rtc = True
+
+                    _INF('Stopping test case %s ' % self.rtc_data.id)
+                test_case.update_status('not finished', message='Test case stopped by user')
+
+            except (ExecutionConfigurationError, ExecutionStartError, ExecutionRunError) as e:
+                _DEB('%s' % e)
+                test_case.update_status('not finished', message=str(e))
+
+            except BatError as e:
+                _DEB('%s' % e)
+                test_case.update_status('not finished', message=str(e),repeat=True)
+
+            except ExitRtc as e:
+                _WRN('')
+                _WRN('%s' % e)
+                _WRN('')
+                test_case.update_status('not finished')
+                if not test_case.shall_repeat:
+                    self.rtc_data.exit_rtc = True
+
+            except StopTestCaseOnFail as e:
+                _WRN('')
+                _WRN('%s' % e)
+                _WRN('')
+                test_case.update_status('not finished')
+
+            except Exception as e:
+                _ERR('')
+                _ERR('%s' % e)
+                _ERR('')
+                test_case.update_status('not finished')
+
+
+            cmd = 'cp %s %s/' % (test_case.json_file, test_case.root_path)
+            stdout, stderr, returncode = st_command.execute_cmd('%s' % cmd ,stderr = True)
+
+            if returncode:
+                _WRN('Problem moving json %s file: %s' % (test_case.json_file, stderr))
+
+            self.rtc_data.finish()
+
+            if self.user_config.pack:
+                cmd = 'cd %s;tar -czvf %s.tar.gz %s > /dev/null; rm -rf %s;cd -' % (self.user_config.output_path_prefix,
+                                                                                    test_case.name,test_case.name,
+                                                                                    test_case.name)
+                _INF('Executing "%s"' % cmd)
+                returncode = os.system(cmd)
+                if returncode:
+                    _WRN('Problem generating %s.tar.gz file: %s' % (self.rtc_data.root_path, returncode))
+
+            if test_case.shall_repeat:
+                self.rtc_data.TestSuite.repeat_test_case()
+
+            if self.user_config.dbus:
+                if self.rtc_data.TestSuite.next_test_case_is_optional or self.rtc_data.TestSuite.status != 'SUCCESS':
+                    hss_utils.dbus.emit('test_tool_ready_for_new_build',self.user_config.hss_build)
+                    self.__paused = True
+
+        self.rtc_data.stop_remote_control()
+        time.sleep(5)
+        _INF('Final verdict summary: ')
+        self.rtc_data.display_report()
+        self.rtc_data.create_report()
+
+
+def main():
+
+    global NODE
+    global RTC
+
+    user_config = parse_commandline()
+    set_build(user_config.hss_build)
+    set_dbus(user_config.dbus)
+
+    if user_config.node_type is None:
+        user_config.node_type = st_command.check_node_type(user_config.NODE,user_config.user)
+
+    try:
+        if user_config.node_type == 'CBA':
+            access_config = {'host':user_config.NODE, 'user':user_config.user}
+            NODE = hss_utils.node.cba.Cba(config = access_config)
+            user_config.cabinet = NODE
+            user_config.node_controller = user_config.NODE
+            set_node(NODE)
+
+        elif user_config.node_type == 'CLOUD':
+
+            access_config = {'host':user_config.NODE,'port':user_config.port, 'user':user_config.user}
+            if user_config.eccd_type == 'IBD':
+
+                if not user_config.ssh_key:
+                    user_config.ssh_key = os.path.join(hss_utils.st_command.real_path(hss_utils.node.cloud.IBD_CREDENTIAL_PATH),
+                                            'id_rsa_%s' % user_config.eccd_name)
+
+                    if not os.path.isfile(user_config.ssh_key):
+                        cmd = 'mkdir -p %s' % hss_utils.st_command.real_path(hss_utils.node.cloud.IBD_CREDENTIAL_PATH)
+                        stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                        if returncode:
+                            _ERR('Error executing "%s": %s' % (cmd, stderr_value))
+                            quit_program(hss_utils.st_command.EXECUTION_ERROR, stderr_value)
+
+                        try:
+                            file_content = hss_utils.rosetta.get_file_from_rosetta('credentials/%s/download_ssh_key_file/ ' % user_config.director_credential)
+                        except Exception as e:
+                            _ERR('Error: %s. The TG shall belong to a cloud environment that is well configured in Rosetta' % str(e))
+                            quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+                        with open(user_config.ssh_key,'w') as fd:
+                            fd.write(file_content)
+
+                        cmd = 'chmod 600 %s' % user_config.ssh_key
+                        stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                        if returncode:
+                            _ERR('Error executing "%s": %s' % (cmd, stderr_value))
+                            quit_program(hss_utils.st_command.EXECUTION_ERROR, stderr_value)
+
+
+                access_config.update({'credential_file':hss_utils.st_command.real_path(user_config.ssh_key)})
+                NODE = hss_utils.node.cloud.CloudIBD(config = access_config)
+
+            else:
+                if not user_config.kubeconfig:
+                    user_config.kubeconfig = os.path.join(hss_utils.st_command.real_path(hss_utils.node.cloud.ANS_CREDENTIAL_PATH),
+                                            '%s.conf' % user_config.eccd_name)
+
+                    if not os.path.isfile(user_config.kubeconfig):
+                        cmd = 'mkdir -p %s' % hss_utils.st_command.real_path(hss_utils.node.cloud.ANS_CREDENTIAL_PATH)
+                        stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                        if returncode:
+                            _ERR('Error executing "%s": %s' % (cmd, stderr_value))
+                            quit_program(hss_utils.st_command.EXECUTION_ERROR, stderr_value)
+
+                        try:
+                            file_content = hss_utils.rosetta.get_file_from_rosetta('eccds/%s/download_config_file/ ' % user_config.eccd_name)
+                        except Exception as e:
+                            _ERR('Error: %s. The TG shall belong to a cloud environment that is well configured in Rosetta' % str(e))
+                            quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+                        with open(user_config.kubeconfig,'w') as fd:
+                            fd.write(file_content)
+
+                access_config.update({'credential_file':hss_utils.st_command.real_path(user_config.kubeconfig)})
+                NODE = hss_utils.node.cloud.CloudANS(config = access_config)
+
+            user_config.cabinet = NODE
+            user_config.node_controller = user_config.NODE
+            set_node(NODE)
+
+        else:
+            cmd = 'run_command_node TSP_get_traffic_info -f --node %s -s controller --not_force_primary' % user_config.NODE
+            stdout, stderr, returncode = st_command.execute_cmd('%s' % cmd ,stderr = True)
+
+            for line in stdout.split('\n'):
+                if 'controller' in line:
+                    user_config.node_controller = line.split('=')[1]
+                    access_config = {'host':user_config.node_controller}
+                    NODE = hss_utils.node.tsp.Tsp(config = access_config)
+                    user_config.cabinet = NODE
+                    set_node(NODE)
+
+        if user_config.test_case_path:
+            user_config.root_path = user_config.test_case_path
+        else:
+            user_config.root_path = os.path.abspath(os.path.join(user_config.output_path_prefix,
+                                                            '<testcase_name>_%s' % time.strftime("%Y%m%d-%H%M%S")))
+        rtc_data = RTC_Data(user_config)
+
+        if user_config.list_macro:
+            print rtc_data.show_macro()
+            quit_program(SUCCESS)
+
+        rtc_data.check_json_available()
+
+        RTC = RTC_controller(user_config, rtc_data)
+        set_rtc(RTC)
+        RTC.run()
+
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+        quit_program(USER_CANCEL)
+
+    except connection.Unauthorized, e: 
+        _ERR('Error: %s' % str(e))
+        quit_program(AUTHENTICATION_ERROR)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed), e: 
+        _ERR('Error: %s' % str(e))
+        quit_program(CONNECTION_ERROR)
+
+    except ExecutionNotAllowed:
+        quit_program(EXECUTION_ERROR)
+
+    quit_program(SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='''Run a Test Case for HSS
+To enable the usage of Rosetta for getting enviroment info using the local hostname the --node parameter shall be omitted
+The following parameters can be skipped and they will be read automatically from Rosetta:
+        --node
+        --scxb
+        --extdb
+        --extdb_type
+        --generators
+
+                        ''',
+                        epilog=textwrap.dedent(get_exit_status())
+    )
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM IP address of the node. If ommitted Rosetta usage will be enabled',
+                        dest='NODE')
+
+    scenario_params.add_argument('--user',
+                        action='store', default='com-emergency',
+                        help='User to get connected to the node. Default value is "com-emergency" except for IBD cloud that is "eccd" if ommitted',
+                        dest='user')
+
+    scenario_params.add_argument('--port',
+                        action='store', default='22',
+                        help='Port to get connected to the node. Default value is "22"',
+                        dest='port')
+
+    scenario_params.add_argument('--ssh-key',
+                      action='store', default=None,
+                      help='Full path of the ssh id_rsa key file used for IBD access. If omitted local hostname will be used to find env in rosetta',
+                      dest='ssh_key')
+
+    scenario_params.add_argument('--kubeconfig',
+                      action='store', default=None,
+                      help='Full path of the configuration file to be set as KUBECONFIG. If omitted local hostname will be used to find env in rosetta',
+                      dest='kubeconfig')
+
+
+    scenario_params.add_argument('CFG',nargs='*',default=None,
+                        help='Configuration file (json format)')
+
+    scenario_params.add_argument('--cfg',
+                        action='store', default=None,
+                        help='File name that includes the list of configuration file (json format) and optionally a list of macro file',
+                        dest='cfg_file')
+
+    scenario_params.add_argument('--scxb',
+                        action='store', default=None,
+                        help='Mgmt IP of SCXB. Used for checking NBI alarms.',
+                        dest='scxb')
+
+    scenario_params.add_argument('--extdb',
+                        action='store', default=None,
+                        help='Host name of extdb. Mandatory when executed with --node',
+                        dest='extdb')
+
+    scenario_params.add_argument('--extdb_type',
+                        action='store', default=None,
+                        choices = ['GTLA', 'CUDB'],
+                        help='Extdb type. Mandatory when executed with --node',
+                        dest='extdb_type')
+
+    scenario_params.add_argument('--extdb-backup',
+                        action='store', default='',
+                        help='ExtDb backup to be restored',
+                        dest='extdb_backup')
+
+    scenario_params.add_argument('--hss-backup',
+                        action='store', default='',
+                        help='HSS backup to be restored',
+                        dest='hss_backup')
+
+    scenario_params.add_argument('-g','--generators',nargs='+',default=None,
+                        help='Traffic generators used for starting BAT instances. If omitted and executed with --node, it will use only the TG where executing.',
+                        dest='generators')
+
+    scenario_params.add_argument('--phase',nargs='+',default='ALL',
+                        choices = ['CLEAN', 'PRE', 'EXECUTION', 'POST', 'COLLECT', 'CHECK', 'ALL'],
+                        help='Test Case phase. Default value is ALL',
+                        dest='phase')
+
+    rtc_service_params = parser.add_argument_group('Parameters used for interworking with rtc service')
+
+    rtc_service_params.add_argument('--hss_build',
+                      action='store', default='Unknown',
+                      help='Set the HSS build to be displayed in report ',
+                      dest='hss_build')
+
+    rtc_service_params.add_argument('--owner',
+                      action='store', default=getpass.getuser(),
+                      help='Set the owner of the current execution. By default is "%(default)s" ',
+                      dest='owner')
+
+    rtc_service_params.add_argument('--high_priority',
+                      action='store_true', default=False,
+                      help='Set that the HSS build is a high priority.',
+                      dest='high_priority')
+
+    rtc_service_params.add_argument('--dbus',
+                      action='store_true', default=False,
+                      help='Use dbus signals to notify events.',
+                      dest='dbus')
+
+    behaviour_params = parser.add_argument_group('Tool behaviour configuration')
+    behaviour_params.add_argument('--disable_graph',
+                      action='store_true', default=False,
+                      help='Disabled all the graphics.',
+                      dest='disable_graph')
+    behaviour_params.add_argument('--pack',
+                      action='store_true', default=False,
+                      help='Create a tar file after every test case single execution',
+                      dest='pack')
+
+    behaviour_params.add_argument('-v', '--verbose',
+                      action='store_true', default=False,
+                      help='verbose. Store execution log command.',
+                      dest='verbose')
+
+    behaviour_params.add_argument('-a','--add_macro',nargs='+',default=None,
+                        help='Define user test case macro. Format key:value .Do not add # in key',
+                        dest='macro_data')
+
+    behaviour_params.add_argument('--macro_file',default=None,
+                        help='File including a list of common macros used for all the test cases',
+                        dest='macro_file')
+
+    behaviour_params.add_argument('-l', '--list_macro',
+                      action='store_true', default=False,
+                      help='List available test case macros created automatically for this test scenario',
+                      dest='list_macro')
+
+    behaviour_params.add_argument('--test_case_path',default=None,
+                        help='Force an specific test case path for all the test cases',
+                        dest='test_case_path')
+
+    logging=e3utils.log.add_logging_options(parser)
+    logging.add_argument('-o',
+                      action='store', default=None,
+                      help='Specify the output path prefix. Default %s' % shared.OUTPUT_PATH_DEFAULT,
+                      dest='output_path_prefix')
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(HSS_rtc_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.output_path_prefix is not None and args.log_file is not None:
+        _ERR('Error: --log_file and -o can not be used at the same time' )
+        quit_program(WRONG_PARAMETER)
+
+    if args.NODE is not None and args.extdb is None:
+        _ERR('Error: --extdb parameter is mandatory when executed with --node' )
+        quit_program(WRONG_PARAMETER)
+
+    if args.NODE is not None and args.extdb_type is None:
+        _ERR('Error: --extdb_type parameter is mandatory when executed with --node' )
+        quit_program(WRONG_PARAMETER)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.output_path_prefix is None:
+        args.output_path_prefix = shared.OUTPUT_PATH_DEFAULT
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(st_command.real_path(args.output_path_prefix), 'HSS_rtc_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG if args.e3utils_log_debug else e3utils.log.INFO)
+
+    if args.phase == 'ALL':
+        args.phase = ['CLEAN', 'PRE', 'EXECUTION', 'POST', 'COLLECT', 'CHECK']
+
+
+    if args.test_case_path:
+        args.test_case_path = st_command.real_path(args.test_case_path)
+        _WRN('Test case path has been forced to "%s" for all the test cases' % args.test_case_path)
+
+    if args.cfg_file is not None and args.CFG:
+        _ERR('Parameters CFG and --cfg can not be set simultaneously. Use only one')
+        quit_program(WRONG_PARAMETER)
+
+    args.node_type = None
+    if args.NODE is None:
+        try:
+            config = get_env_data()
+            if config.is_cloud:
+                args.node_type = 'CLOUD'
+                args.eccd_name = config.get_eccd_name()
+                args.eccd_type = config.raw['eccds'][0]['type']
+                if config.raw['eccds'][0]['type'] == 'IBD':
+                    args.NODE = config.get_eccd_cloud_vip(eccd=0)
+                    args.director_credential = config.get_director_credential()
+                    args.user = 'eccd'
+            else:
+                args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+                _INF('Node         : %s' % args.NODE)
+                if config.raw['cabinets'][0]['type'] in ['CBA','VNF']:
+                    args.node_type = 'CBA'
+                    if args.scxb is None:
+                        try:
+                            args.scxb = config.get_cabinet_scxb(cabinet=0)
+                            _INF('scxb         : %s' % args.scxb)
+                        except(hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, hss_utils.rosetta.InfoNotFound), e:
+                            _WRN('%s. Use command line parameters --scxb' % str(e))
+                else:
+                    args.node_type = 'TSP'
+
+            _INF('Node type    : %s' % args.node_type)
+
+            if args.generators is None:
+                args.generators = config.active_generators
+                _INF('Generators   : %s' % ' '.join(args.generators))
+            if not args.extdb:
+                for index, extdb in enumerate(config.raw['extdbs']):
+                    _DEB('Checking extdb for index=%s: %s' % (index, extdb))
+                    args.extdb = config.get_extdb_oam_ip(extdb=index,extdb_type=extdb['type'])
+                    if extdb['type'] in ['GTLA','vGTLA']:
+                        args.extdb_type = 'GTLA'
+                    else:
+                        args.extdb_type = extdb['type']
+                    _INF('%s         : %s' % (args.extdb_type, args.extdb))
+                    # Jira HSSSTT-269. When not extdb parameter, first will be used
+                    break
+
+            else: # extdb passed as parameter
+                  ## We have Rosetta info available and we check the parameter is OK
+                extdb_found = False
+                _DEB('EXTDBs info: %s' % config.raw['extdbs'])
+                for index, extdb in enumerate(config.raw['extdbs']):
+                    _DEB('Checking extdb for index=%s: %s' % (index, extdb))
+                    idx_extdb = config.get_extdb_oam_ip(extdb=index,extdb_type=extdb['type'])
+                    if args.extdb == idx_extdb:
+                        _DEB('extdb found: %s  : %s' % (idx_extdb, args.extdb))
+                        if extdb['type'] in ['GTLA','vGTLA']:
+                            args.extdb_type = 'GTLA'
+                        else:
+                            args.extdb_type = extdb['type']
+                        extdb_found = True
+                        break
+                    else:
+                        _DEB('extdb found %s is not the parameter ' % idx_extdb)
+
+                if extdb_found:
+                    _INF('%s         : %s' % (args.extdb_type, args.extdb))
+                else:
+                    _ERR('IP %s passed in parameter extdb not found in the environment' % args.extdb)
+                    quit_program(WRONG_PARAMETER)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, hss_utils.rosetta.InfoNotFound), e:
+            _ERR('Error: %s. Use command line parameters --node and/or --scxb and/or -g and/or --extdb' % str(e))
+            quit_program(ROSETTA_ERROR)
+
+    else:
+        if args.generators is None:
+            _WRN('Generators not passed by parameter. Using by default the current TG: %s' % HOSTNAME)
+            args.generators = []
+            args.generators.append(HOSTNAME)
+            _INF('Generators   : %s' % ' '.join(args.generators))
+        else: 
+            _INF('Generators   : %s' % ' '.join(args.generators))
+
+        ## We assume Not Rosetta available and extdb and extdb_type are passed by parameter
+        _INF('%s         : %s' % (args.extdb_type, args.extdb))
+
+
+    return args
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(EXECUTION_ERROR)
+
+    except KeyError, e:
+        _ERR('Key %s error. There could be a problem with json file syntax.' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        quit_program(EXECUTION_ERROR)
+
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(SUCCESS)

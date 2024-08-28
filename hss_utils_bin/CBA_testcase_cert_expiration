@@ -1,0 +1,794 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt("Signal handler")
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services as rosetta_services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+NODE=None
+user_config={}
+
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def check_processors_date(date_check=None):
+    global NODE
+
+    processors = NODE.all_processors
+    for processor in processors:
+        if date_check is None:
+            date_proc = NODE.processor_date(processor, full_date=True)
+            _INF('Date for %s is %s' % (processor, date_proc))
+        else:
+            timeout = float(180)
+            while True:
+                now = time.time()
+                date_proc = NODE.processor_date(processor)
+                if date_proc == date_check:
+                    _INF('Date %s for %s is correct ' % (date_proc, processor))
+                    break
+                NODE.sync_processor_ntp_restart(processor)
+                time.sleep(float(10))
+                timeout -= time.time() - now
+                if timeout < 0:
+                    _ERR('ERROR: Date %s for %s is not the expected one: %s ' % (date_proc, processor, date_check))
+                    break
+                _DEB('Date %s for %s is not the expected one: %s. Trying again ... ' % (date_proc, processor, date_check))
+
+
+def check_applog_file_msg_date(date_check,log_file):
+    global NODE
+
+    num_msg_date_right = 0
+    num_msg_date_wrong = 0
+    applog_dir = NODE.applogs_path
+    NODE.run_command('cd %s' % NODE.applogs_path)
+    cmd = 'awk \'{print $2}\' %s | tail -n 10' % log_file
+    dates_to_check = NODE.run_command(cmd)
+    for date_log_file in dates_to_check:
+        date_file = date_log_file.replace('-','')
+        if date_check in date_file:
+            _DEB('Date %s for file %s is correct ' % (date_file, log_file))
+            num_msg_date_right += 1
+        else:
+            _WRN('WARNING: Date %s for file %s is not the expected one: %s ' % (date_file, log_file, date_check))
+            num_msg_date_wrong += 1
+
+    if num_msg_date_wrong:
+        TC.send_test_case_info('Wrong dates detected for applog file %s. Correct=%d   Wrong=%d' % (log_file, num_msg_date_right, num_msg_date_wrong))
+    else:
+        TC.send_test_case_info('All dates are correct for applog file %s. Correct=%d ' % (log_file, num_msg_date_right))
+
+def check_applogs_files_date(date_check):
+    global NODE
+
+    applog_dir = NODE.applogs_path
+    list_name_file = ' '
+    NODE.run_command('cd %s' % NODE.applogs_path)
+    cmd = 'ls -t *log'
+    logs_to_check = NODE.run_command(cmd)
+    if 'No such file or directory' in logs_to_check:
+        _WRN('WARNING: No applogs files found: %s ' % logs_to_check)
+        TC.send_test_case_info('APP logs files not generated')
+        return
+
+    for log_file in logs_to_check:
+        name_file = log_file.split('2')[0]
+        if name_file in list_name_file:
+            _DEB('A previous file like file %s has already been checked' % log_file)
+        else:
+            list_name_file = list_name_file + ' %s' % name_file
+            date_file = log_file.split('_')[-2]
+            if date_check in date_file:
+                TC.send_test_case_info('Correct date for applog file %s ' % log_file)
+                _INF('Date %s for file %s is correct ' % (date_file, log_file))
+                check_applog_file_msg_date(date_check,log_file)
+            else:
+                _WRN('WARNING: Date %s for file %s is not the expected one: %s ' % (date_file, log_file, date_check))
+
+
+def check_counter_files_date(date_check):
+    global NODE
+
+    pmf_counter_files_dir = '/storage/no-backup/com-apr9010443/PerformanceManagementReportFiles'
+    NODE.run_command('cd %s' % pmf_counter_files_dir)
+    # Removing possible XML files in the directory
+    cmd = 'rm -rt *xml'
+    NODE.run_command(cmd)
+    cmd = 'ls -rt *xml.gz | tail -n 2'
+    files_to_check = NODE.run_command(cmd)
+
+    for pmf_file in files_to_check:
+        if 'No such file or directory' in files_to_check:
+            _WRN('WARNING: No counter files found: %s ' % files_to_check)
+            TC.send_test_case_info('PMF counter files not generated')
+            return
+        cmd = 'gunzip %s' % pmf_file
+        NODE.run_command(cmd)
+        date_file = pmf_file.split('.')[0].replace('A','')
+        if date_check in date_file:
+            TC.send_test_case_info('Correct date for counter file %s' % pmf_file)
+            _INF('Date %s for file %s is correct ' % (date_file, pmf_file))
+        else:
+            _WRN('WARNING: Date %s for file %s is not the expected one: %s ' % (date_file, pmf_file, date_check))
+
+    cmd = 'ls -rt *xml'
+    check_pmf_counters = 0
+    files_to_check = NODE.run_command(cmd)
+    for pmf_file in files_to_check:
+        cmd = 'grep beginTime %s' % pmf_file
+        beginTime_lines = NODE.run_command(cmd)
+        for beginTime in beginTime_lines:
+            dateTime = beginTime.split('"')[1].replace('-','')
+            if date_check in dateTime:
+                _INF('Begin Date %s for file %s is correct ' % (date_file, pmf_file))
+            else:
+                _ERR('ERROR: Begin Date %s for file %s is not the expected one: %s ' % (dateTime, pmf_file, date_check))
+                check_pmf_counters +=1
+
+        cmd = 'grep endTime %s' % pmf_file
+        endTime_lines = NODE.run_command(cmd)
+        for endTime in endTime_lines:
+            if 'duration' in endTime:
+                dateTime = endTime.split('"')[3].replace('-','')
+            else:
+                dateTime = endTime.split('"')[1].replace('-','')
+            if date_check in dateTime:
+                _DEB('End Time %s for file %s is correct ' % (dateTime, pmf_file))
+            else:
+                _ERR('ERROR: End Time %s for file %s is not the expected one: %s ' % (dateTime, pmf_file, date_check))
+                check_pmf_counters +=1
+
+    if check_pmf_counters:
+        _DEB('Sending TC info de error dates in counter files')
+        TC.send_test_case_info('Error dates found up to in %d times in the PMF counter files checked' % check_pmf_counters)
+    else:
+        _DEB('Sending TC info de correct dates in counter files')
+        TC.send_test_case_info('Correct dates in all the PMF counter files checked')
+
+
+def create_datacollector_file():
+    global TC
+    global user_config
+    _INF('Creating config file for Data CollectorHealth Check')
+    filename_out = 'config'
+    fout = open(filename_out, 'w')
+    line = 'cluster.port=1022\n'
+    fout.write(line)
+    line = 'cluster.user=root\n'
+    fout.write(line)
+    line = 'cluster.password=rootroot\n'
+    fout.write(line)
+    line = 'oam.vip=%s\n' % user_config.NODE
+    fout.write(line)
+    line = 'oam.port=122\n'
+    fout.write(line)
+    line = 'oam.user=com-emergency\n'
+    fout.write(line)
+    line = 'oam.password=com-emergency\n'
+    fout.write(line)
+    fout.close()
+    cmd = 'mkdir -p /cluster/DataCollectionHss'
+    output = TC.run_node_command(cmd,full_answer=True)
+    TC.upload(filename_out,'/cluster/DataCollectionHss')
+
+
+def exec_data_collector_check():
+    global TC
+    global NODE
+    _INF('Executing Data CollectorHealth Check')
+    # We have to update config file
+    datacollector_config='/cluster/DataCollectionHss/config'
+    datacollector_dir = '/storage/no-backup/nbi_root/health_check'
+    create_config_file = False
+
+    if NODE.file_exist(datacollector_config):
+        cmd = 'mv %s %s.ORI' % (datacollector_config, datacollector_config)
+        output = TC.run_node_command(cmd,full_answer=True)
+        cmd = 'cp %s.ORI %s' % (datacollector_config, datacollector_config)
+        output = TC.run_node_command(cmd,full_answer=True)
+        cmd = 'sed -i \'s/cluster.password=*/cluster.password=rootroot/\' %s' % datacollector_config
+        output = TC.run_node_command(cmd,full_answer=True)
+        cmd = 'grep oam-user %s' % datacollector_config
+        output = TC.run_node_command(cmd,full_answer=True)
+        if 'com-emergency' in output:
+            cmd = 'sed -i \'s/oam.password=*/oam.password=com-emergency/\' %s' % datacollector_config
+            output = TC.run_node_command(cmd,full_answer=True)
+        else:
+            cmd = 'sed -i \'s/oam.password=*/oam.password=hsstest/\' %s' % datacollector_config
+            output = TC.run_node_command(cmd,full_answer=True)
+    else: # We create a config file by default
+        create_config_file = True
+        create_datacollector_file()
+
+    _INF('Executing command DataCollectionHss ... It may take several minutes')
+    cmd = 'echo -e "\n\n\n" | DataCollectionHss '
+    output = TC.run_node_command(cmd, timeout=600, full_answer=True)
+
+    total_verdict = False
+    total_verdict_check = None
+    for line in output.splitlines():
+        if 'Environment variables' in line:
+             check_collector_verdict=line
+        if 'SW Versions' in line:
+             check_collector_verdict=line
+        if 'vDicos and Database Solution Cluster State' in line:
+             check_collector_verdict=line
+        if 'Check PCAP files' in line:
+             check_collector_verdict=line
+        if 'Check old large files' in line:
+             check_collector_verdict=line
+        if 'HSS Memory Usage' in line:
+             check_collector_verdict=line
+        if 'Features licenses list status' in line:
+             check_collector_verdict=line
+        if 'Latest time nodes were booted' in line:
+             check_collector_verdict=line
+        if 'Internal Cluster Communication' in line:
+             check_collector_verdict=line
+        if 'External HTTP Connections to UDM' in line:
+             check_collector_verdict=line
+        if 'External Database LDAP Connections' in line:
+             check_collector_verdict=line
+        if 'EVIP status' in line:
+             check_collector_verdict=line
+        if 'HSS DISK Usage' in line:
+             check_collector_verdict=line
+        if 'HSS Idle CPU Load' in line:
+             check_collector_verdict=line
+        if 'Core dump fingerprints' in line:
+             check_collector_verdict=line
+        if 'Controller status' in line:
+             check_collector_verdict=line
+        if 'HSS Backups Info' in line:
+             check_collector_verdict=line
+        if 'Health Check status' in line:
+             check_collector_verdict=line
+        if 'Total Verdict' in line:
+             check_collector_verdict=line
+             total_verdict = True
+        if 'FM Alarms' in line:
+             check_collector_verdict=line
+        if 'Verdict:' in line:
+             check_message = '%s \t %s' % (check_collector_verdict, line)
+             _INF(check_message)
+             if total_verdict:
+                 total_verdict_check = line.split(':')[1]
+
+    _INF('Total verdict is %s' % total_verdict_check)
+    timestamp = datetime.now()
+    if total_verdict_check is None:
+        TC.send_test_case_info('%s: Error when executing the DataCollector script' % timestamp.strftime('%Y-%m-%dT%H:%M:%S'))
+        _ERR(' Error when executing the DataCollector script')
+    else:
+        TC.send_test_case_info('%s: DataCollector Total Verdict is: %s' % (timestamp.strftime('%Y-%m-%dT%H:%M:%S'), total_verdict_check))
+        if 'ERROR' in total_verdict_check or 'FAIL' in total_verdict_check:
+            _WRN(' DataCollector Total Verdict is: %s' % total_verdict_check)
+            _WRN(' Please review the total output of the DataCollector execution')
+        else:
+            _INF(' DataCollector Total Verdict is: %s' % total_verdict_check)
+
+    cmd = 'ls -lrt /cluster/DataCollectionHss/DataCollectionHssReport*| tail -n 2'
+    output = TC.run_node_command(cmd,full_answer=True)
+    for line in output.splitlines():
+        file_name = line.split()[-1]
+        _INF(' Downloading file %s ' % file_name)
+        TC.download('%s' % file_name, './')
+
+    cmd = 'cd %s; ls -lrt | tail -n 2' % datacollector_dir
+    output = TC.run_node_command(cmd,full_answer=True)
+    for line in output.splitlines():
+        file_name = line.split()[-1]
+        _INF(' Downloading file %s ' % file_name)
+        TC.download('%s/%s' % (datacollector_dir,file_name), './')
+    _INF(' DataCollector files downloaded')
+
+    # We restore the original config file after executing the DataCollector
+    if create_config_file:
+        cmd = 'rm %s' % datacollector_config
+        output = TC.run_node_command(cmd,full_answer=True)
+    else:
+        cmd = 'mv %s.ORI %s' % (datacollector_config, datacollector_config)
+        output = TC.run_node_command(cmd,full_answer=True)
+
+
+def check_tls_connection_port(ip_node, tls_port, input_file, cert_dir):
+    global NODE
+
+    tls_protocol = NODE.get_tls_protocol()
+    cmd = 'openssl s_client -connect %s:%s -quiet -%s -bugs -cert %s/gtserver-cert.pem -key %s/gtserver-key.pem -CAfile %s/ca-cert.pem  -verify_return_error -verify 3 <%s' % (ip_node, tls_port, tls_protocol, cert_dir, cert_dir, cert_dir, input_file)
+    _DEB('Executing cmd:\n%s' % cmd)
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        _ERR('Error executing cmd:\n%s' % cmd)
+        _INF('Output cmd:\n%s' % stdout_value)
+        _INF('Error Output cmd:\n%s' % stderr_value)
+    return returncode
+
+
+
+def check_tls_connection(ip_node, tls_con, cert_dir):
+    global NODE
+
+    tls_port = NODE.get_tls_port(tls_con)
+    if tls_con == 'netconf':
+        cmd = 'echo -e "<rpc>\n<close-session/>\n</rpc>\n]]>]]>" > input_cmd'
+    else:
+        cmd = 'echo -e "exit\n" > input_cmd'
+    st_command.execute_cmd(cmd)
+    input_file='input_cmd'
+    _INF('Checking TLS %s connection to node %s through port %s' % (tls_con, ip_node, tls_port))
+    returncode = check_tls_connection_port(ip_node,tls_port,input_file, cert_dir)
+    cmd = 'rm %s' % input_file
+    st_command.execute_cmd(cmd)
+    return returncode
+
+
+def check_tls_connections_result(ip_node, cert_dir, expected_result):
+    if expected_result is 'SUCCESS':
+        expected_code = 0
+    else:
+        expected_code = 1
+
+    _INF('Checking TLS connectivity to HSS-FE NETCONF and CLI. Expected result: %s' % expected_result)
+    returncode = check_tls_connection(ip_node, 'netconf', cert_dir)
+    timestamp = datetime.now()
+    if returncode:
+        if returncode == expected_code:
+            TC.send_test_case_info('%s: TLS connectivity to NETCONF FAILED as expected.' % timestamp.strftime('%Y-%m-%dT%H:%M:%S'))
+            _INF('TLS connectivity to NETCONF FAILED as expected.')
+        else:
+            TC.send_test_case_info('%s: ERROR: TLS connectivity to NETCONF FAILED but expected SUCCESS.' % timestamp.strftime('%Y-%m-%dT%H:%M:%S'))
+            _ERR('TLS connectivity to NETCONF FAILED but expected SUCCESS.')
+    else:
+        if returncode == expected_code:
+            TC.send_test_case_info('%s: TLS connectivity to NETCONF SUCCESSFUL as expected.'  % timestamp.strftime('%Y-%m-%dT%H:%M:%S'))
+            _INF('TLS connectivity to NETCONF SUCCESSFUL as expected.')
+        else:
+            TC.send_test_case_info('%s: ERROR: TLS connectivity to NETCONF SUCCESSFUL but expected FAIL.' % timestamp.strftime('%Y-%m-%dT%H:%M:%S'))
+            _ERR('TLS connectivity to NETCONF SUCCESSFUL but expected FAIL.')
+
+    returncode = check_tls_connection(ip_node, 'cli', cert_dir)
+    if returncode:
+        if returncode == expected_code:
+            TC.send_test_case_info('%s: TLS connectivity to CLI FAILED as expected.' % timestamp.strftime('%Y-%m-%dT%H:%M:%S'))
+            _INF('TLS connectivity to CLI FAILED as expected.')
+        else:
+            TC.send_test_case_info('%s: ERROR: TLS connectivity to CLI FAILED but expected SUCCESS.' % timestamp.strftime('%Y-%m-%dT%H:%M:%S'))
+            _ERR('TLS connectivity to CLI FAILED but expected SUCCESS.')
+    else:
+        if returncode == expected_code:
+            TC.send_test_case_info('%s: TLS connectivity to CLI SUCCESSFUL as expected.' % timestamp.strftime('%Y-%m-%dT%H:%M:%S'))
+            _INF('TLS connectivity to CLI SUCCESSFUL as expected.')
+        else:
+            TC.send_test_case_info('%s: ERROR: TLS connectivity to CLI SUCCESSFUL but expected FAIL.'  % timestamp.strftime('%Y-%m-%dT%H:%M:%S'))
+            _ERR('TLS connectivity to CLI SUCCESSFUL but expected FAIL.')
+
+
+def main():
+    global TC
+    global NODE
+    global user_config
+
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+
+        if user_config.ntp_server is None:
+            error_info = 'Mandatory parameter NTP Server not passed in the command.'
+            _ERR(error_info)
+            quit_program(st_command.WRONG_PARAMETER, error_info)
+
+        TC.connect_to_node()
+        NODE = hss_utils.node.cba.Cba(config = access_config)
+
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        state=TC.controller_state('SC-1')
+        sc_standby = 'SC-1' if 'STANDBY' in state else 'SC-2'
+
+        _INF('Processors status')
+        TC.display_processors_state()
+
+        check_processors_date()
+        TC.start_alarm_monitoring()
+
+        # Checking the TLS connection before changing the date
+        if user_config.tls_con:
+            check_tls_connections_result(user_config.NODE, user_config.cert_dir, 'SUCCESS')
+
+        if user_config.update_ntp:
+            _INF('Updating HSS configuration with new NTP server %s' % user_config.ntp_server)
+            cmd = 'CBA_update_ntp_servers_node --node %s --user %s --port %s --ntp-servers %s %s --debug --internal-debug' % (user_config.NODE,
+					user_config.user, user_config.port, user_config.ntp_server, '-s' if user_config.stand_alone else '')
+            (output,returncode) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+            if returncode:
+                error_info = 'Error %d when executing command %s ' % (returncode,cmd)
+                _ERR(error_info)
+                quit_program(st_command.EXECUTION_ERROR, error_info)
+
+        if user_config.new_date is None and user_config.new_time is None:
+            _INF('Not new date and time to update the NTP server and syncronize HSS.')
+        else:
+            if user_config.new_date is None:
+                 param_new_date = ''
+                 new_date = ''
+            else:
+                 param_new_date = '--new-date %s ' % user_config.new_date
+                 new_date = user_config.new_date
+                 _INF('New date %s to update the NTP server and syncronize HSS.' % user_config.new_date)
+
+            if user_config.new_time is None:
+                 param_new_time = ''
+                 new_time = ''
+            else:
+                 param_new_time = '--new-time %s ' % user_config.new_time
+                 new_time = user_config.new_time
+                 _INF('New time %s to update the NTP server and syncronize HSS.' % user_config.new_time)
+
+            cmd = 'ntp_server_set_time --ntp %s --ntp-user %s --ntp-port %s --ntp-pwd %s %s %s' % (user_config.ntp_server,
+						user_config.ntp_user, user_config.ntp_port,
+                                                user_config.ntp_pwd, param_new_date, param_new_time)
+            stdout, stderr, returncode = TC.run_stFramework_command(cmd, check_result = False)
+            if returncode:
+                error_info = 'Error when executing command ntp_server_set_time'
+                _ERR(error_info)
+                quit_program(st_command.EXECUTION_ERROR, stderr)
+            _INF('NTP server set with the new date and time.')
+
+            cmd = 'CBA_sync_ntp_server --node %s --user %s --port %s --ntp-server %s' % (user_config.NODE,
+					user_config.user, user_config.port, user_config.ntp_server)
+            stdout, stderr, returncode = TC.run_stFramework_command(cmd, check_result = False)
+            if returncode:
+                error_info = 'Error when executing command %s ' % cmd
+                _ERR(error_info)
+                quit_program(st_command.EXECUTION_ERROR, stderr)
+            _INF('HSS environment syncronized with NTP server with the new date and time.')
+            TC.send_test_case_info('HSS environment syncronized with NTP server with a new date %s and new time %s ' % (new_date, new_time))
+
+        time.sleep(float(10))
+        cmd = 'ntp_server_get_time --ntp %s' % user_config.ntp_server
+        (output,returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=False)
+        if returncode:
+            error_info = 'Error %d when executing command %s ' % (returncode,cmd)
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+        new_date = output.split(' ')[0]
+        _INF('Checking the date for all the HSS nodes with NTP server date %s ' % new_date)
+        check_processors_date(new_date)
+
+        _INF('Waiting %s seconds for next action' % user_config.wait_time)
+        time.sleep(float(user_config.wait_time))
+        _INF('Executing HSS-FE Data Collection checks')
+        exec_data_collector_check()
+
+        # Checking the TLS connection after changing the date
+        if user_config.tls_con and user_config.new_date is not None:
+            check_tls_connections_result(user_config.NODE, user_config.cert_dir, 'FAIL')
+
+        if user_config.license_file:
+            if not os.path.isfile(user_config.license_file):
+                error_info = 'License file %s not found' % user_config.license_file
+                _ERR(error_info)
+                quit_program(st_command.WRONGPARAMETER, error_info)
+
+            _INF('Checking  Administrative State alarms before installing new License file')
+            TC.clean_alarm_filters()
+            alarm_filters = [{'specificProblem':'HSS, Administrative State, Shutting Down in ISM/SDA'},
+                             {'specificProblem':'HSS, Administrative State, Shutting Down in ESM'}]
+
+            TC.add_alarm_filters(alarm_filters)
+            TC.display_alarm_filter()
+            time.sleep(float(1200))
+            max_wait_alarms = 2600
+            _INF('Waiting up to %s seconds for alarms to be cleared' % max_wait_alarms)
+            if not TC.wait_for_expected_alarms(max_wait_alarms):
+                info = 'Some expected alarms have not been received'
+                TC.send_test_case_info(info)
+                TC.first_error = info
+            else:
+                _INF('All the alarms expected were raised and cleared.')
+
+            TC.clean_alarm_filters()
+            alarm_filters = [{'specificProblem':'HSS, Licensing, License Expired in ESM'},
+                             {'specificProblem':'HSS, Licensing, License Expired in ISM'},
+                             {'specificProblem':'HSS, Licensing, License Expired in AVG'}]
+
+            TC.add_alarm_filters(alarm_filters)
+            TC.display_alarm_filter()
+
+            # Functions to install new license file
+            _INF('Installing new licenses from file %s' % user_config.license_file)
+            NODE.upload(user_config.license_file, '/cluster/')
+            NODE.update_licenses(os.path.basename(user_config.license_file))
+
+            max_wait_alarms = 360
+            _INF('Waiting up to %s seconds for the new alarms to be cleared' % max_wait_alarms)
+            if not TC.wait_for_expected_alarms(max_wait_alarms):
+                info = 'Some expected alarms have not been received'
+                TC.send_test_case_info(info)
+                TC.first_error = info
+            else:
+                _INF('All the alarms expected were raised and cleared.')
+
+            _INF('Unlocking traffic modules if they are Locked')
+            n_modules_unlocked = NODE.unlock_traffic_modules()
+            if n_modules_unlocked:
+                if n_modules_unlocked == 1:
+                    _INF('Only one of the traffic modules has been unlocked successfully')
+                else:
+                    _INF('Both traffic modules have been unlocked successfully')
+            else:
+                _INF('Both traffic modules were not Locked. Nothing done')
+
+            TC.clean_alarm_filters()
+            alarm_filters = [{'specificProblem':'HSS, Administrative State, Manually Locking in ESM'},
+                             {'specificProblem':'HSS, Administrative State, Manually Locking in ISM/SDA'}]
+            TC.add_alarm_filters(alarm_filters)
+            TC.display_alarm_filter()
+
+            max_wait_alarms = 360
+            _INF('Waiting up to %s seconds for the new alarms to be cleared' % max_wait_alarms)
+            if not TC.wait_for_expected_alarms(max_wait_alarms):
+                info = 'Some expected alarms have not been received'
+                TC.send_test_case_info(info)
+                TC.first_error = info
+            else:
+                _INF('All the alarms expected were raised and cleared.')
+
+        _INF('Checking the date for PMjob counter files')
+        check_counter_files_date(new_date)
+        _INF('Checking the date for applog files')
+        check_applogs_files_date(new_date)
+
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError as e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, hss_utils.rosetta.InfoNotFound) as e:
+        error_info = 'Error: %s. Use command line parameter -V' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.ROSETTA_ERROR,error_info)
+
+    except (hss_utils.rosetta.ActionFailure) as e:
+        error_info = 'Error when executing E3cloud action: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Change date of the HSS environment to test certificates expiration',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('NODE access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    ntp_params = parser.add_argument_group('NTP access options ')
+    ntp_params.add_argument('--ntp',
+                        action='store', default=None,
+                        help='Mandatory. Hostname or IP address of the NTP Server used to sync date with HSS environment.',
+                        dest='ntp_server')
+
+    ntp_params.add_argument('--ntp-port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='ntp_port')
+
+    ntp_params.add_argument('--ntp-user',
+                      action='store', default='hss_st',
+                      help='User for ssh.  Default: User %(default)s',
+                      dest='ntp_user')
+
+    ntp_params.add_argument('--ntp-pwd',
+                      action='store', default='hss_st',
+                      help='User for ssh.  Default value is "%(default)s"',
+                      dest='ntp_pwd')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('--update-ntp',
+                        action='store_true', default=False,
+                        help='Update the HSS environment with new ntp server passed as parameter. By default is "%(default)s"',
+                        dest='update_ntp')
+
+    scenario_params.add_argument('-d','--new-date',
+                        action='store', default=None,
+                        help='Parameter to set a new  date on the NTP server with format "yyyymmdd"',
+                        dest='new_date')
+
+    scenario_params.add_argument('-t','--new-time',
+                      action='store', default=None,
+                      help='Parameter to set a new time on the NTP server with format "HH:MM:SS"',
+                      dest='new_time')
+
+    scenario_params.add_argument('--tls-con',
+                      action='store_true', default=False,
+                      help='To check the TLS connectivty when TLS certificates were created. By default is "%(default)s"',
+                      dest='tls_con')
+
+    scenario_params.add_argument('--cert-dir',
+                      action='store', default='/opt/hss',
+                      help='Full path directory where the TLS certificates have been created. By default is "%(default)s"',
+                      dest='cert_dir')
+
+    scenario_params.add_argument('-w', '--wait_time',
+                      default=300, type=int, action='store', dest='wait_time',
+                      help='Waiting time for next action. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                      default=600, type=int, action='store', dest='wait_scenario_stable',
+                      help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('--update-licenses',
+                      action='store', default=None,
+                      help='Full path of file including the licenses to install',
+                      dest='license_file')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_cert_expiration_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_cert_expiration_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        if sys.version_info[0] == 2:
+            _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+        else:
+            _DEB('** Binary MD5: %s' % hashlib.md5(str.encode(myself.read())).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        env, config = rosetta_services.get_env_for_localhost()
+        _INF('Environment  : %s' % env)
+        args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+        _INF('Node         :%s' % args.NODE)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)

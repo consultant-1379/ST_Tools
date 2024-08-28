@@ -1,0 +1,713 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services as rosetta_services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+NODE=None
+
+env_name=''
+type_vnf=''
+list_vms_names=[]
+user_config={}
+
+def quit_program(exit_code,message=''):
+    global TC
+    global NODE
+    if NODE:
+        NODE.release()
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def check_evip_cdiam ():
+    # Check distribution of eVIP elements for Telco environments
+    _INF('Multi compute (Telco) environment: Showing eVIP elements distribution:')
+    cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s --ip' % (user_config.NODE,
+			                              user_config.user, user_config.port)
+    TC.run_stFramework_command(cmd, check_result = True)
+
+    # Check Diameter connections distribution for Telco environments
+    _INF('Multi compute (Telco) environment: Checking Diameter connections distribution')
+    cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE, user_config.user, user_config.port)
+    (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+    if output_code:
+        error_info = 'Error when executing command CBA_check_diacc_dump_json'
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+def exec_scaling_health_check():
+    _INF('Executing Scaling Health Check')
+    cmd = '\"/cluster/storage/system/config/hss/scaling/hssScalingHC.sh -c ABD\"'
+    cba_cmd = 'CBA_run_command --node %s --user %s --port %s %s' % (user_config.NODE,user_config.user,user_config.port, cmd)
+    _DEB('command:%s' % cba_cmd)
+
+    (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+    if 'Need to be executed from cliss active SC' in output:
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+
+    if output_code:
+        _WRN( '\n Error when executing hssScalingHC.sh script:\n%s' % output_err)
+    _INF(' Scaling Health Check result:\n%s' % output)
+
+
+def check_stack_status (stack_name):
+    pod_name = env_name.split('-')[0]
+    vnf_name = env_name.split('-')[1]
+    stack_info = rosetta_services.get_vnf_stack_info (pod_name, vnf_name, stack_name)
+    stack_info_params = rosetta_services.get_vnf_stack_info_params (stack_info)
+    _INF('STACK INFO:\n %s ' % stack_info_params)
+    for line in stack_info_params.splitlines():
+         if 'stack_status_reason' in line:
+             error_reason=line
+         if 'stack_status' in line and 'FAILED' in line:
+             return False
+    return True
+
+def scale_out_openstack (stack_name, n_pls):
+    global list_vms_names
+    _INF('Scaling OUT (adding) %d  PLs ...' % n_pls)
+
+    pod_name = env_name.split('-')[0]
+    vnf_name = env_name.split('-')[1]
+    if check_stack_status(stack_name):
+        n_vm_scaled = 0
+        for vm in list_vms_names:
+            if "scaled" in vm:
+                n_vm_scaled +=1
+        total_scaled_pls = n_vm_scaled + n_pls
+        _INF('Updating Stack to %d max number of scaled VMS'  % total_scaled_pls)
+        scale_msg = rosetta_services.vnf_scale_out (pod_name, vnf_name, stack_name, total_scaled_pls)
+
+        if 'expected success update' in scale_msg:
+            _INF('Scaling OUT action executed OK:\n %s ' % scale_msg)
+        else:
+            _ERR('Scaling OUT action ERROR:\n %s ' % scale_msg)
+            error_info = 'ERROR in action "update_existing_deploy" '
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+    else:
+        error_info = 'STACK status is not OK for Scaling OUT operations'
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+def monitor_scale_out (stack_name, n_pls):
+    global NODE
+    if not check_stack_status(stack_name):
+        error_info = 'STACK status is not OK. Scaling OUT operation has failed.'
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    init_time = time.time()
+    timeout = float(user_config.max_time)
+    list_pls = NODE.payload
+    _INF('The system has %d PLs:%s'  % (len(list_pls), list_pls))
+    new_num_pls = len(list_pls) + n_pls
+    _INF('After the scaling process, the system will have %d PLs'  % new_num_pls)
+    _INF('Monitoring the new PLs scaled OUT. It will take several minutes ...')
+    # Waiting for the new PLs to be configured in the system
+    time.sleep(float(120))
+    while  True:
+        now = time.time()
+        time.sleep(float(10))
+        list_pls = NODE.payload
+        #_INF('New list of PLs :%s'  % list_pls)
+        #_INF('New number of PLs :%s'  % len(list_pls))
+        if len(list_pls) == new_num_pls:
+            break
+        timeout -= time.time() - now
+        if timeout < 0:
+            error_info = 'Error: Timeout waiting for Scaling OUT process'
+            _ERR(error_info)
+            quit_program(st_command.TIMEOUT, error_info)
+
+    _INF('New PLS added to the system. Current list of PLs:\n%s'  % list_pls)
+    while  True:
+        now = time.time()
+        time.sleep(float(3))
+        pl_name = None
+        all_pls_OK = True
+        answer = NODE.scalable_payloads_cliss()
+        answer = NODE.check_scaling_cliss()
+        for line in answer.splitlines():
+            if 'PL-' in line:
+                pl_name = line.split('=')[1]
+            if 'SC-' in line:
+                pl_name = None
+            if 'instantiationState' in line:
+                if pl_name is not None:
+                    _DEB('%s: %s' % (pl_name, line))
+                    if 'INSTANTIATED' not in line:
+                        all_pls_OK = False
+            if 'operationalState' in line:
+                if pl_name is not None:
+                    _DEB('%s: %s' % (pl_name, line))
+                    if 'ENABLED' not in line:
+                        all_pls_OK = False
+                    else:
+                        list_pls.remove(pl_name)
+
+        if all_pls_OK and len(list_pls)==0:
+            break
+        timeout -= time.time() - now
+        if timeout < 0:
+            error_info = 'Error: Timeout waiting for Scaling OUT process'
+            _ERR(error_info)
+            quit_program(st_command.TIMEOUT, error_info)
+
+    scaling_time = now - init_time
+    _INF('Instantiation Status:\n%s'  % answer)
+
+    return scaling_time
+
+def display_scalable_payloads ():
+    global NODE
+    list_pls = []
+    answer = NODE.scalable_payloads_cliss()
+    for line in answer.splitlines():
+        if 'ComputeResourceRole' in line:
+            pl_name = (line.split('=')[-1]).replace('"', '')
+            list_pls.append(pl_name)
+        if 'scalability' in line:
+            info = '\t%s' % line
+    if 'SCALABLE' not in info:
+        _WRN('Scalability for Payloads is not SCALABLE:\n%s'  % info)
+    pl_info = '\tList of PLs: %s\n%s' % ('  '.join(list_pls), info)
+    _INF('Scalable Payload Info:\n%s\n'  % pl_info)
+    return list_pls
+
+
+def get_vms_scaled_in (pod_name, vnf_name):
+    list_pls_scaled = []
+    total_scaled_number = 0
+    hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+    for vm_data in hss_vnf_data:
+        if 'scaled_out' in vm_data['name']:
+            total_scaled_number += 1
+        if vm_data['status'] == 'SHUTOFF':
+            list_pls_scaled.append(vm_data['name'])
+    return total_scaled_number, list_pls_scaled
+
+
+def scale_in_openstack (stack_name, n_pls):
+    _INF('Scaling IN %d PLs from Openstack ...' % n_pls)
+    pod_name = env_name.split('-')[0]
+    vnf_name = env_name.split('-')[1]
+    num_shutoff = 0
+    timeout = float(300)
+    started = time.time()
+    while (num_shutoff < n_pls):
+        now = time.time()
+        time.sleep(float(10))
+        num_total_pls,list_pls_scaled = get_vms_scaled_in(pod_name, vnf_name)
+        _INF('There are %d PLs scaled and the ones in status SHUTOFF are %s ' % (num_total_pls,list_pls_scaled))
+        num_shutoff = len(list_pls_scaled)
+        timeout -= time.time() - now
+        if timeout < float(0):
+            break
+
+    max_num = num_total_pls - n_pls
+    if (max_num < 0):
+        _ERR('Scaling IN %d payloads is not possible as only %d are SHUTOFF' % (n_pls, num_shutoff))
+        error_info = 'ERROR: You try to scale IN more payloads than available in the environment'
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    if (num_shutoff < max_num):
+        _ERR('Scaling IN %d payloads FAILED as only %d are SHUTOFF and %d are expected' % (n_pls, num_shutoff, max_num))
+        error_info = 'ERROR: Only %d payloads are SHUTOFF when there should be %d' % (num_shutoff, max_num)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    str_idx = ''
+    num_shutoff -=1
+    while (num_shutoff >0 ):
+        pl_name = list_pls_scaled[num_shutoff]
+        idx_pl = pl_name.split('-')[1]
+        if (num_shutoff == 1):
+            str_idx = str_idx + idx_pl
+        else:
+            str_idx = str_idx + idx_pl + ','
+        num_shutoff -=1
+    _INF('Scaling IN action for indexes: %s ' % str_idx)
+    scale_msg = rosetta_services.vnf_scale_in (pod_name, vnf_name, stack_name, max_num,str_idx)
+    if 'expected success update' in scale_msg:
+        _INF('Scaling IN action executed OK:\n %s ' % scale_msg)
+    else:
+        _ERR('Scaling IN action ERROR:\n %s ' % scale_msg)
+        error_info = 'ERROR in action "update_existing_deploy" '
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+def monitor_update_stack (stack_name):
+    _INF('Monitoring Scaling operations from Openstack ...')
+    pod_name = env_name.split('-')[0]
+    vnf_name = env_name.split('-')[1]
+
+    init_time = time.time()
+    timeout = float(user_config.max_time)
+    while  True:
+        now = time.time()
+        time.sleep(float(3))
+        scaling_completed = False
+        answer = rosetta_services.vnf_stack_event_list (pod_name, vnf_name, stack_name)
+        _DEB('List of events:\n %s ' % answer)
+        for line in answer.splitlines():
+            if 'UPDATE COMPLETE' in line and 'Stack UPDATE completed sucessfully' in line:
+                scaling_completed = True
+
+        if scaling_completed:
+            break
+        timeout -= time.time() - now
+        if timeout < 0:
+            error_info = 'Error: Timeout waiting for Scaling process'
+            _ERR(error_info)
+            quit_program(st_command.TIMEOUT, error_info)
+
+    scaling_time = now - init_time
+    _INF('Scaling operations completed. List of Events:\n%s'  % answer)
+
+    return scaling_time
+
+
+def scale_in (n_pls):
+    global NODE
+    list_pls = []
+    list_pls_to_remove = []
+    _INF('Scaling IN (removing) %d  PLs ...' % n_pls)
+    answer = NODE.scalable_payloads_cliss()
+    _INF('Scalable payloads :\n%s' % answer)
+    for line in answer.splitlines():
+        if 'ComputeResourceRole' in line:
+            pl_name = (line.split('=')[-1]).replace('"', '')
+            if (pl_name != 'PL-3' and pl_name != 'PL-4'):
+                list_pls.append(pl_name)
+    _INF(' PLs candidates to be removed:%s' % list_pls)
+
+   # Pickup the last PLs from the list
+    list_pls_to_remove = list_pls[-n_pls:]
+    if list_pls_to_remove:
+        _INF('Scaling IN (removing) the following  PLs:%s' % list_pls_to_remove)
+
+        #Internal HSS-FE Scale IN
+        NODE.scale_in_payloads_cliss(list_pls_to_remove)
+
+        #Monitor the PLs to remove are not longer as computeResourceRole
+        scaling_lasted = monitor_scale_in(list_pls_to_remove)
+        timestamp = datetime.now()
+        action = 'Scale IN'
+        _INF('%s operation lasted %s secs ' % (action, str(scaling_lasted)))
+        TC.send_test_case_info('%-*s %-*s completed at %s   Action time (sec) %.2f' % (15,action,
+                                                                                      6,vnf_stack_name,
+                                                                                      timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                                      float(scaling_lasted)))
+    else:
+        error_info = 'No PLS defined in the system to perform the Scaling IN (removing). Only PL-3 and PL-4 defined.'
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+def monitor_scale_in (payloads_removed):
+    global NODE
+    init_time = time.time()
+    timeout = float(user_config.max_time)
+    _INF('Waiting for scaling IN operations ...')
+    while  True:
+        now = time.time()
+        time.sleep(float(3))
+        pl_name = None
+        list_pls = []
+        all_pls_OK = True
+        all_pls_removed = True
+        answer = NODE.check_scaling_cliss()
+        for line in answer.splitlines():
+            if 'PL-' in line:
+                pl_name = (line.split('=')[-1]).replace('"', '')
+                list_pls.append(pl_name)
+            if 'SC-' in line:
+                pl_name = None
+            if 'instantiationState' in line:
+                if pl_name is not None:
+                    _DEB('%s: %s' % (pl_name, line))
+                    if 'INSTANTIATED' not in line:
+                        all_pls_OK = False
+                        _INF('NOK :%s'  % line)
+            if 'operationalState' in line:
+                if pl_name is not None:
+                    _DEB('%s: %s' % (pl_name, line))
+                    if 'ENABLED' not in line:
+                        all_pls_OK = False
+                        _INF('NOK :%s'  % line)
+        if all_pls_OK:
+            for pl_name in payloads_removed:
+                if pl_name in list_pls:
+                    all_pls_removed = False
+
+        if all_pls_OK and all_pls_removed:
+            break
+        timeout -= time.time() - now
+        if timeout < 0:
+            error_info = 'Error: Timeout waiting for Scaling IN process'
+            _ERR(error_info)
+            quit_program(st_command.TIMEOUT, error_info)
+
+    scaling_time = now - init_time
+    _INF('Scale IN completed. Instantiation Status:\n%s'  % answer)
+
+    return scaling_time
+
+
+def main():
+    global TC
+    global NODE
+    global env_name
+    global user_config
+    global type_vnf
+    global list_vms_names
+
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+        NODE = hss_utils.node.cba.Cba(config = access_config)
+
+        env, config = rosetta_services.get_env_for_localhost()
+        env_type = config.get_cabinet_type()
+        env_name = config.get_cabinet_name()
+        if (env_type != "VNF"):
+            error_info = 'Error: Environment %s is NOT VIRTUAL. Scaling operations only applies to Virtual Environments' % env_name
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+        _INF('Environment %s' % env_name)
+        pod_name = env_name.split('-')[0]
+        vnf_name = env_name.split('-')[1]
+
+        rosetta_services.vnf_apis_rosetta()
+        hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+        vnf_data = rosetta_services.get_vnf_info (pod_name, vnf_name)
+        list_vms = rosetta_services.get_hss_vnf_vms (hss_vnf_data)
+        type_vnf = rosetta_services.get_hss_vnf_type (hss_vnf_data,list_vms)
+
+        if 'Telco' in type_vnf:
+            _INF('Environment %s is virtual and Telco. Scaling PL Virtual Machines with Openstack commands' % env)
+        else:
+            error_info = 'Error: Environment %s is NOT Telco. Scaling operations only applies to Telco Virtual Environments' % env_name
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+        vnf_stack_name = rosetta_services.get_vnf_stack (pod_name, vnf_name)
+        if vnf_stack_name is None:
+            error_info = 'Error: Stack Name not found for the environment %s' % env_name
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+        else:
+            _INF('Stack name: %s ' % vnf_stack_name)
+
+        TC.connect_to_node()
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        state=TC.controller_state('SC-1')
+        sc_standby = 'SC-1' if 'STANDBY' in state else 'SC-2'
+
+        _INF('Processors status')
+        TC.display_processors_state()
+        TC.start_alarm_monitoring()
+        TC.alarm_monitor.max_time_for_reconnection = user_config.max_time
+
+        _INF('Showing information for %s environment %s' % (type_vnf, env_name))
+        show_params = ['status','ha-policy','hypervisor_id','hypervisor','flavor']
+        _INF('\n%s\n' % rosetta_services.display_hss_vnf_info(hss_vnf_data, list_vms, show_params))
+
+        vm_hypervisor_pre = {}
+        for key, vm in list_vms.items():
+            list_vms_names.append(vm)
+            vm_info = rosetta_services.get_hss_vnf_info_params(hss_vnf_data, vm, ['hypervisor'])
+            vm_hypervisor_pre[vm] = vm_info.split()[1]
+
+        # Step 3,4: Check distribution of eVIP elements for Telco environments
+        # Step 5: Check Diameter connections distribution for Telco environments
+        check_evip_cdiam()
+
+        # Step 6: SCALING OUT new PLs for the system
+        # Step 1 Scaling: Create Initial Backup
+        if user_config.backup:
+            backup_name='B4_SCALING_%s_%s_PLS' % (user_config.scaling_type,user_config.n_scaling)
+            TC.create_backup(backup_name)
+
+        _INF('Showing Payload scalable status before Scaling')
+        display_scalable_payloads()
+
+        if user_config.scaling_type == 'OUT':
+            # Step 2 Scaling: Scaling OUT operation in Openstack
+            scale_out_openstack(vnf_stack_name, user_config.n_scaling)
+            _INF('Monitoring the stack update- Not implemented. Waiting for a minute')
+            time.sleep(float(60))
+            ##monitor_update_stack(vnf_stack_name)
+
+            # Step 3 Scaling: Scaling OUT operation in CLISS
+            _INF('Monitoring the scaling OUT operation progress ...')
+            scaling_lasted = monitor_scale_out(vnf_stack_name,user_config.n_scaling)
+            timestamp = datetime.now()
+            action = 'Scale OUT'
+            _INF('%s operation lasted %s secs ' % (action, str(scaling_lasted)))
+            TC.send_test_case_info('%-*s %-*s completed at %s   Action time (sec) %.2f' % (15,action,
+                                                                                      6,vnf_stack_name,
+                                                                                      timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                                      float(scaling_lasted)))
+        else:
+            # Step 10: SCALING IN the PLs have been scaled out previously
+            scale_in(user_config.n_scaling)
+            scale_in_openstack (vnf_stack_name, user_config.n_scaling)
+
+            # Pending to implement by Santi
+            _INF('Monitoring the stack update- Not implemented. Waiting for a minute')
+            time.sleep(float(60))
+            ##monitor_update_stack(vnf_stack_name)
+            if not check_stack_status(vnf_stack_name):
+                error_info = 'STACK status is not OK. Scaling IN operation has failed.'
+                quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+        _INF('Showing Payload scalable status after Scaling')
+        new_list_pls = display_scalable_payloads()
+
+        # Step 4 Scaling: Scaling OUT operation
+        exec_scaling_health_check()
+
+        # Step 5 Scaling: Create Final Backup
+        if user_config.backup:
+            backup_name='AFTER_SCALING_%s_%s_PLS' % (user_config.scaling_type,user_config.n_scaling)
+            TC.create_backup(backup_name)
+
+        # Step 7: Check the location of the VM's and the compute nodes after Scaling
+        hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+        list_vms = rosetta_services.get_hss_vnf_vms (hss_vnf_data)
+        _INF('Showing information for %s environment %s after scaling %s' % (type_vnf, env_name, user_config.scaling_type))
+        show_params = ['status','ha-policy','hypervisor_id','hypervisor','flavor']
+        _INF('\n%s\n' % rosetta_services.display_hss_vnf_info(hss_vnf_data, list_vms, show_params))
+        # Step 7: Check distribution of eVIP elements for Telco environments
+        # Step 8: Check Diameter connections distribution for Telco environments
+        check_evip_cdiam()
+
+        # Step 9: Check number of connections established towards the External Database
+        _INF('Checking EXTDB connections for %s' % new_list_pls)
+        for pl_name in new_list_pls:
+            TC.wait_for_all_ExtDb_connections_up(pl_name, user_config.max_time)
+
+
+        # Check alarms both in CEE and HSS-FE
+        # Waiting to system clear the alarms after scaling operations
+        time.sleep(float(30))
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError as e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, hss_utils.rosetta.InfoNotFound) as e: 
+        error_info = 'Error: %s. Use command line parameter -V' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.ROSETTA_ERROR,error_info)
+
+    except (hss_utils.rosetta.ActionFailure) as e:
+        error_info = 'Error when executing E3cloud action: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Execute a scale out and scale in for a number of virtual machines',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('--type',default='OUT',
+                        action='store', dest='scaling_type',
+                        choices = ['OUT', 'IN'],
+                        help='Select type of Scaling to perform. By default is "%(default)s"')
+
+    scenario_params.add_argument('--backup',
+                      action='store_true', default=False,
+                      help='Create backup before and after the scaling operation.',
+                      dest='backup')
+
+    scenario_params.add_argument('-t', '--time',
+                    default=60, type=int, action='store', dest='wait_time',
+                    help='Waiting time for action. By default is "%(default)s"')
+
+    scenario_params.add_argument('--max_time',
+                    default=600, type=int, action='store', dest='max_time',
+                    help='Max time waiting for scaling operations. By default is "%(default)s"')
+
+    scenario_params.add_argument('--n_scale',
+                    default=1, type=int, action='store', dest='n_scaling',
+                    help='Number of VMs to scale in and out. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                    default=600, type=int, action='store', dest='wait_scenario_stable',
+                    help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                    action='store_true', default=False,
+                    help='Allow the usage without HSS_rtc.',
+                    dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_vnf_scale_VM_PL_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_vnf_scale_VM_PL_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        env, config = rosetta_services.get_env_for_localhost()
+        _INF('Environment  : %s' % env)
+        args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+        _INF('Node         :%s' % args.NODE)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

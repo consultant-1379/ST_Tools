@@ -1,0 +1,89 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Tool to build .rosetta_client files for any user
+"""
+
+import os
+import sys
+import json
+import getpass
+from optparse import OptionParser
+
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+OUTPUT_FILE = '~/.rosetta_client'
+PRODUCTION_URL = 'http://rosetta.seli.gic.ericsson.se/api'
+API_URL = 'http://rosetta.seli.gic.ericsson.se/api'
+DEFAULT_NDO = 'hss'
+DEFAULT_USER = getpass.getuser()
+
+
+def main():
+    user_options, arguments = parse_arguments()
+    try:
+        key = get_auth_key(user_options.prod_url,
+                           user_options.username,
+                           getpass.getpass('Enter Windows password: '))
+    except Exception, e:
+        print 'Error requesting key: %s' % e
+        sys.exit(-1)
+    print 'Key requested'
+    with os.fdopen(os.open(user_options.output, os.O_WRONLY | os.O_CREAT, 0o600), 'w') as out:
+        json.dump({
+            'auth-token': key,
+            'api-url': user_options.url,
+            'default-ndo': user_options.ndo
+        }, 
+                  fp=out,
+                  indent=4)
+    print 'File saved'
+
+
+def parse_arguments():
+    parser = OptionParser(usage='usage: %prog [options]')
+    parser.add_option('-u', '--url',
+                      action='store', default=API_URL,
+                      help='Rosetta URL to use by clients',
+                      dest='url')
+    parser.add_option('-p', '--production-url',
+                      action='store', default=PRODUCTION_URL,
+                      help='Rosetta URL to send auth requests',
+                      dest='prod_url')
+    parser.add_option('-n', '--ndo',
+                      action='store', default=DEFAULT_NDO,
+                      help='Default NDO for requests',
+                      dest='ndo')
+    parser.add_option('-o', '--output',
+                      action='store', default=OUTPUT_FILE,
+                      help='File output to store credentials',
+                      dest='output')
+    parser.add_option('--username',
+                      action='store', default=DEFAULT_USER,
+                      help='Username that request key',
+                      dest='username')
+
+    options, args = parser.parse_args()
+    options.output = os.path.expandvars(os.path.expanduser(options.output))
+    return options, args
+
+
+def get_auth_key(api_url, user, password):
+    if api_url.endswith('/'):
+        api_url = apir_url[:-1]
+    post_url = '%s/api-token-auth/' % api_url
+    result = requests.post(post_url, json={
+        "username": user,
+        "password": password
+        }, timeout=20)
+    result = json.loads(result.content)
+    if 'non_field_errors' in result.keys():
+        raise Exception(result['non_field_errors'])
+    return result['token']
+
+if __name__ == '__main__':
+    main()
+    sys.exit(0)

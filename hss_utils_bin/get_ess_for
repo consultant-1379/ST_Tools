@@ -1,0 +1,30 @@
+#!/usr/bin/env python
+#
+
+import sys
+import hss_utils.rosetta
+import hss_utils.rosetta.services
+import random
+
+VNF_ESS=['150.132.187.22','150.132.187.23']
+try:
+    envs = [hss_utils.rosetta.get_environment(sys.argv[1])]
+    if not envs:
+        sys.exit(-1)
+    st_config = hss_utils.rosetta.services.st_config_for(envs[0])
+    if st_config.raw['cabinets']:
+        if st_config.raw['cabinets'][0]['type'] == 'CBA':
+            print st_config.raw['ess'][0]['mgmt'][0]
+        else:
+            try:
+                print st_config.raw['ess'][0]['mgmt'][0]
+            except:
+                print random.choice(VNF_ESS)
+
+        sys.exit(0)
+except Exception as e:
+    print '%s' % e
+    pass
+    
+sys.exit(-1)
+

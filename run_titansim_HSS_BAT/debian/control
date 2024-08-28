@@ -1,0 +1,12 @@
+Source: hss-st-runtitansim
+Section: python
+Priority: optional
+Maintainer: <mitxel.garcia@ericsson.com>
+Build-Depends: debhelper (>= 7),
+Standards-Version: 3.9.2
+
+Package: hss-st-runtitansim 
+Architecture: all
+Section: python
+Depends: python, ${misc:Depends}, ${python:Depends}
+Description: Configure and control the HSS TitanSim application

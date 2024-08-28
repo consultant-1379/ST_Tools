@@ -1,0 +1,265 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import pexpect
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+import copy
+import json
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+NODE=None
+def quit_program(exit_code,message=''):
+
+    if NODE is not None:
+        NODE.release()
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+
+def remove_dia_container_peer_node(container, dia_peer_node, skip_clean):
+
+    peer_conns = NODE.get_dia_container_peer_node_conns(container, dia_peer_node, disconnect=False)
+    if len(peer_conns) == 0:
+        if skip_clean:
+            _INF('Peer node %s would be removed. No connections defined.' % dia_peer_node)
+        else:
+            _INF('Removing peer node %s. No connections defined.' % dia_peer_node)
+            NODE.remove_dia_peer_node(container, dia_peer_node, disconnect=False)
+        return
+
+    # Checking there are no connections with linkStatus UP
+    for peer_conn in peer_conns:
+        peer_conn_info = NODE.get_dia_container_peer_node_conn_info(container, dia_peer_node, peer_conn, info=['linkStatus'], disconnect=False)
+        if 'Up' in peer_conn_info['linkStatus']:
+            _WRN('Peer node %s NOT removed. At least a connection with linkStatus Up.' % dia_peer_node)
+            return
+
+    if skip_clean:
+        _INF('Peer node %s would be removed. No connections with linkStatus Up.' % dia_peer_node)
+    else:
+        _INF('Removing peer node %s. No connections with linkStatus Up.' % dia_peer_node)
+        NODE.remove_dia_peer_node(container, dia_peer_node, disconnect=False)
+
+    return
+
+
+
+def main():
+    global NODE
+
+    user_config = parse_commandline()
+    try:
+        access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+        NODE = hss_utils.node.cba.Cba(config = access_config)
+
+        containers = []
+        if user_config.container == 'ALL':
+            containers = ['ISMSDA','ESM']
+        else:
+            containers = [user_config.container]
+
+        node_filter = user_config.node_filter
+
+        NODE.start_CBACliss(access_config['host'], identity = 'cliss_hssadministrator')
+        for container in containers:
+            _INF('Cleaning peer nodes for container %s' % container)
+            dia_peers = NODE.get_dia_container_peer_nodes(container, str_filter=node_filter, disconnect=False)
+
+            if dia_peers:
+                for dia_peer in dia_peers:
+                    if user_config.force:
+                        remove_dia_container_peer_node (container, dia_peer, user_config.skip_clean)
+                    else: # Peer removed only if isDynamic is true
+                        isDynamic_info = NODE.get_dia_container_peer_node_info(container, dia_peer, info=['isDynamic'], disconnect=False)
+                        if 'true' in isDynamic_info['isDynamic']:
+                            remove_dia_container_peer_node (container, dia_peer, user_config.skip_clean)
+                        else:
+                            _INF('Peer node %s NOT removed. Parameter isDynamic is false.' % dia_peer)
+            else:
+                _INF('Not peer nodes found that match the conditions.')
+
+    except connection.Unauthorized, e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed), e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF), e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except st_command.CommandFailure, e:
+        error_info = '%s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info.split('\n')[0])
+
+    except ValueError, e:
+        error_info = '%s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info.split('\n')[0])
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+        quit_program(st_command.SUCCESS)
+
+    quit_program(st_command.SUCCESS)
+
+
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Clean Diameter peer node connections in a CBA platform to clean alarms.',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('--stack-container',
+                        default='ALL', action='store',
+                        choices = ['ISMSDA', 'ESM', 'ALL'],
+                        help='StackContainer of the Diamenter to clean. Allowed values ISMSDA | ESM | ALL. By default is ALL',
+                        dest='container')
+
+    scenario_params.add_argument('--force',
+                      action='store_true', default=False,
+                      help='Also clean peer nodes with the parameter isDynamic set to false',
+                      dest='force')
+
+    scenario_params.add_argument('--filter',
+                      action='store', default=None,
+                      help='Substring included in the peer node description used as filter',
+                      dest='node_filter')
+
+    scenario_params.add_argument('--skip-clean',
+                      action='store_true', default=False,
+                      help='Do NOT remove the peer nodes, so the user can check before the ones would be deleted',
+                      dest='skip_clean')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_clean_DIA_peer_nodes_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_clean_DIA_peer_nodes_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

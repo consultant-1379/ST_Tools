@@ -1,0 +1,63 @@
+
+**********************************
+ ALLOWED COMMANDS FOR LOADPLOTTER
+**********************************
+
+        getstatus
+
+        getconfig
+
+        addconnection <list of param:=value>		Allowed params
+
+       							Name
+       							DestHostIP
+       							DestHostIO2 | ProcFilter [ ,ProcFilter ]
+       							Platform
+       							[ Port ]
+        						[ CBA_UserId ]
+      							[ CBA_Password ]
+       							[ RefreshTime ]
+       							[ GraphScanSize ]
+       							[ MeasureTime ]
+       							[ RegulatedloadType ]
+       							[ LoadTotalPlot ]
+     
+
+        getconnection
+        
+        getconnectionindex <name_of_connection>
+
+        getload <con_index> <load_type>	               Allowed value for load_type
+        
+                                                       TOTAL      in TSP and CBA
+                                                       TRAFFIC    Only in TSP
+                                                       SYSTEM     Only in TSP
+                                                       OAM        Only in TSP
+                                                       
+                                                       all		  all values will be sent
+                                                       No value   The RegulatedloadType will be used
+
+        change <config_parameter:=value>
+
+                config_parameter:       LogMask         value summing what to log
+
+    							Log type          Binary Value
+    							Errors            0000 0001 (1)
+    							Warnings          0000 0010 (2)
+    							Connections       0000 0100 (4)
+    							Events            0000 1000 (8)
+    							Info              0001 0000 (16)
+    							Debug             0010 0000 (32)
+    							Log all           0011 1111 (63)
+
+                config_parameter:       LogMode         value:  0       FILE_MODE
+                                                                1       STDOUT_MODE
+                                                                2       MIXED_MODE
+                                                                
+                config_parameter:       KeepGraphicAfterExecution 	true
+                							false
+   
+                                                               
+      exit
+
+  

@@ -1,0 +1,5 @@
+ldif-builder (1.0) UNRELEASED; urgency=medium
+
+  * Initial release. (Closes: #XXXXXX)
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Wed, 07 Aug 2019 14:49:04 +0200

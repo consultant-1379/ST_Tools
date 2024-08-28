@@ -1,0 +1,75 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+__version__ = '2.5'
+__author__ = 'Mitxel Garcia'
+__email__ = 'mitxel.garcia@ericsson.com'
+
+import sys
+import copy
+import glob
+import json
+import atexit
+import signal
+import shutil
+import os.path
+import argparse
+import time
+
+import e3utils
+import hss_utils.dbus.services
+import controller.service
+import hss_utils.dbus
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+_SERVICE_ = None
+
+
+def main(args=None):
+    global _SERVICE_
+    user_config = parse_commandline()
+    signal.signal(signal.SIGTERM, quit)
+
+    _SERVICE_ = controller.service.Handler()
+    _INF('RTC execution controller service running... waiting for requests')
+    try:
+        while _SERVICE_.running:
+            time.sleep(5.0)
+    except KeyboardInterrupt:
+        _WRN('User wants to close...')
+        quit()
+
+def parse_commandline():
+    '''Parse and check command line'''
+    parser = argparse.ArgumentParser(
+            description='RTC execution controller')
+    parser.add_argument('--version', action='version', version=__version__)
+
+    logging=e3utils.log.add_logging_options(parser)
+    args = parser.parse_args()
+    if args.log_file is not None:
+        log_file = args.log_file
+        args.log_file = None
+
+    e3utils.log.setup_logging_options(args)
+    if log_file is not None:
+        e3utils.log.add_file_logging(log_file, level=e3utils.log.DEBUG if  args.e3utils_log_debug else e3utils.log.INFO)
+
+    return args
+
+@atexit.register
+def quit(signum=None, frame=None):
+    '''Terminate running process, restore config and bye'''
+    _DEB('Closing RTC execution controller service...')
+    if _SERVICE_ is not None:
+        _SERVICE_.stop()
+
+if __name__ == '__main__':
+    main()
+    sys.exit(0)
+

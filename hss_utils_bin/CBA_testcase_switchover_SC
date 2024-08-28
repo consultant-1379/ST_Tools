@@ -1,0 +1,381 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+
+TC=None
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def main():
+
+    global TC
+    user_config = parse_commandline()
+
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+        TC.connect_to_node()
+
+        _INF('Controllers status')
+        TC.display_controllers_state()
+
+        hostname, ip = TC.node.get_primary_sc()
+        _INF('Primary controller is %s' % hostname)
+        standby = 'SC-1' if hostname == 'SC-2' else 'SC-2'
+
+        _INF('Start Alarm monitor')
+        TC.start_alarm_monitoring()
+
+        _INF('Preparing alarm filters for %s' % hostname)
+        TC.clean_alarm_filters()
+        alarm_filters = [{'source':'safApp=OpenSAF,SaAmfSI.safSi='},
+                         {'source':'safApp=ERIC-CoreMW,SaAmfSI.safSi='}]
+        TC.add_alarm_filters(alarm_filters)
+        TC.display_alarm_filter()
+
+
+        _INF('Controllers DRBD status')
+        TC.display_controllers_drbd_state()
+
+        _INF('Restarting the ACTIVE controller %s' % hostname)
+        TC.cmw_reboot_sc(hostname)
+
+        drbd_switchover_begin = time.time()
+        timestamp = datetime.now()
+        TC.release_node()
+        time.sleep(float(30))
+
+        _INF('Connecting to the HSS environment via OAMP VIP')
+        TC.connect_to_node()
+
+        cli_port=TC.node.cli_port
+        _INF('Checking CLISS connection from the Traffic Generator to %s through port %s' % (user_config.NODE, cli_port))
+        cmd = 'TG_run_cliss_command "show ManagedElement=vHSS-VNF06,SystemFunctions=1,BrM=1,BrmBackupManager=SYSTEM_DATA" --oam-ip %s --port %s -v' % (user_config.NODE, cli_port)
+        (output,returncode) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+        if returncode:
+            error_info = 'Error %d when executing command %s ' % (returncode,cmd)
+            _ERR(error_info)
+            _ERR('ERROR when connecting to CLISS')
+        else:
+            _INF('Connection to CLISS successful')
+
+        _INF('Controllers status after restarting ACTIVE SC')
+        TC.display_controllers_state()
+        if 'DISABLED' not in TC.controller_state(hostname):
+            error_info = '%s should be DISABLED' % hostname
+            _ERR('FAILED    %s' % error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+        else:
+            _INF('Controller status for %s is DISABLED as expected' % hostname)
+
+        if 'ACTIVE' not in TC.controller_state(standby):
+            error_info = '%s should be ACTIVE' % standby
+            _ERR('FAILED    %s' % error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+        else:
+            _INF('Controller status for %s is ACTIVE as expected' % standby)
+
+
+        _INF('Waiting to Controllers DRBD status connected')
+        while True:
+            answer = TC.controller_drbd_state()
+            if "Connecting" in answer:
+                time.sleep(float(1))
+            else:
+                break
+
+        drbd_switchover_end = time.time()
+        switchover_time = drbd_switchover_end - drbd_switchover_begin
+        action = 'drbd_switchover'
+        TC.send_test_case_info('%-*s %-*s executed at %s   Action time (sec) %.2f' % (15,action,
+                                                                                         6,hostname,
+                                                                                         timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                                         float(switchover_time)))
+        _INF('Switchover time %s seconds' % switchover_time)
+
+        _INF('Waiting up to %s seconds for alarms to be cleared' % user_config.max_time)
+        if not TC.wait_for_expected_alarms(user_config.max_time):
+            info = 'Some expected alarms have not been received'
+            if not user_config.skip_missing_alarms:
+                quit_program(st_command.EXECUTION_ERROR,message=info)
+            else:
+                TC.first_error = info
+
+        time.sleep(float(2))
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+
+        hostname, ip = TC.node.get_primary_sc()
+        standby = 'SC-1' if hostname == 'SC-2' else 'SC-2'
+
+        _INF('REPEATING ACTIONS FOR STANDBY SYSTEM CONTROLLER %s' % standby)
+        _INF('Primary controller is %s' % hostname)
+        _INF('Preparing alarm filters for %s' % hostname)
+        TC.clean_alarm_filters()
+        alarm_filters = [{'source':'safApp=OpenSAF,SaAmfSI.safSi='},
+                         {'source':'safApp=ERIC-CoreMW,SaAmfSI.safSi='}]
+        TC.add_alarm_filters(alarm_filters)
+        TC.display_alarm_filter()
+
+        _INF('Controllers status')
+        TC.display_controllers_state()
+
+        _INF('Controllers DRBD status')
+        TC.display_controllers_drbd_state()
+
+        _INF('Restarting the STANDBY controller %s' % standby)
+        TC.cmw_reboot_sc(standby,{'Rebooting node':''})
+
+        drbd_switchover_begin = time.time()
+        timestamp = datetime.now()
+        #TC.release_node()
+        time.sleep(float(20))
+
+        _INF('Controllers status after restart')
+        TC.display_controllers_state()
+        if 'DISABLED' not in TC.controller_state(standby):
+            error_info = '%s should be DISABLED' % standby
+            _ERR('FAILED    %s' % error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+        else:
+            _INF('Controller status for %s is DISABLED as expected' % standby)
+
+        if 'ACTIVE' not in TC.controller_state(hostname):
+            error_info = '%s should be ACTIVE' % hostname
+            _ERR('FAILED    %s' % error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+        else:
+            _INF('Controller status for %s is ACTIVE as expected' % hostname)
+
+        _INF('Waiting to Controllers DRBD status connected')
+        while True:
+            answer = TC.controller_drbd_state()
+            if "Connecting" in answer:
+                time.sleep(float(1))
+            else:
+                break
+        drbd_switchover_end = time.time()
+        switchover_time = drbd_switchover_end - drbd_switchover_begin
+        TC.send_test_case_info('%-*s %-*s executed at %s   Action time (sec) %.2f' % (15,action,
+                                                                                         6,standby,
+                                                                                         timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                                         float(switchover_time)))
+        _INF('Switchover time %s seconds' % switchover_time)
+
+        _INF('Waiting up to %s seconds for alarms to be cleared' % user_config.max_time)
+        if not TC.wait_for_expected_alarms(user_config.max_time):
+            info = 'Some expected alarms have not been received'
+            if not user_config.skip_missing_alarms:
+                quit_program(st_command.EXECUTION_ERROR,message=info)
+            else:
+                TC.first_error = info
+
+        time.sleep(float(2))
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+
+    except connection.Unauthorized, e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed), e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF), e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError, e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError, e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Restart the active SC and check the switchover',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('--max_time',
+                        default=180, type=int, action='store', dest='max_time',
+                        help='Max time waiting for alarms. By default is "%(default)s"')
+
+    scenario_params.add_argument('--skip-missing-alarms',
+                      action='store_true', default=False,
+                      help='Do not stop execution when there are missing expected alarms.',
+                      dest='skip_missing_alarms')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_switchover_SC_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_switchover_SC_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    #return (args)
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(st_command.SUCCESS)
+
+
+

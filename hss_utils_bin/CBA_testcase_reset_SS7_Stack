@@ -1,0 +1,248 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt("Signal handler")
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def main():
+    global TC
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+
+        TC.connect_to_node()
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        _INF('Processors status')
+        TC.display_processors_state()
+        TC.start_alarm_monitoring()
+
+        #TC.find_diameter_connection_up()
+        #TC.display_diameter_connection_up()
+
+        #_INF('Preparing alarm filters')
+        #TC.create_alarms_filter_diameter_connection_up(stacks = ['ESM'])
+        #TC.display_alarm_filter()
+
+        action = 'SS7 Stack Reset'
+        timestamp = datetime.now()
+        cmd = 'CBA_SS7_stack_reset --node %s --user %s --port %s -v' % (user_config.NODE,
+                                                                        user_config.user,
+                                                                        user_config.port)
+        reset_begin = time.time()
+        TC.run_stFramework_command(cmd, check_result = True)
+        reset_end = time.time()
+        TC.send_test_case_info('%-*s executed at %s   Action time (sec) %2.2f' % (30,action,
+                                                        timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                        float(reset_end - reset_begin)))
+
+        _INF('Waiting up to %s seconds for alarms to be cleared' % user_config.wait_time)
+        time.sleep(float(user_config.wait_time))
+        #if not TC.wait_for_expected_alarms(user_config.wait_time):
+            #info = 'Expected alarm has not been received'
+            #quit_program(st_command.EXECUTION_ERROR,message=info)
+
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError as e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Reset SS7 stack in a CBA cluster checking that all the alarms are triggered and cleared',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-t', '--time',
+                        default=60, type=int, action='store', dest='wait_time',
+                        help='Waiting time for action. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_reset_SS7_Stack_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_reset_SS7_Stack_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        if sys.version_info[0] == 2:
+            _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+        else:
+            _DEB('** Binary MD5: %s' % hashlib.md5(str.encode(myself.read())).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable) as e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

@@ -1,0 +1,498 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt("Signal handler")
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def compare_associations(lines, new_assoc_id, old_assoc_id):
+
+# Jira HSSTT-230. Avoid index out of index when pattern do not match in the line to analyze
+    new_assoc = False
+    old_assoc = False
+    for line in lines.split('\n'):
+        if '|' in line:
+            line0 = line.split('|')[0]
+            line0 = line0.strip()
+            line1 = line.split('|')[1]
+            line1 = line1.strip()
+            value0 = 0
+            value1 = 0
+            list_assoc0 = ''
+            list_assoc1 = ''
+            if 'Associations:' in line:
+                if 'Total Number of Associations:' in line:
+                    new_assoc = False
+                    old_assoc = False
+
+                    if 'Total Number of Associations:' in line0:
+                        value0 = int(line0.split(':')[1])
+                    if 'Total Number of Associations:' in line1:
+                        value1 = int(line1.split(':')[1])
+                    if value1 == value0+1:
+                        _INF('\tA new Association has been created:   Number Assoc. before=%s   Number Assoc. after=%s' % (value0,value1))
+                        new_assoc = True
+                    else:
+                        if value1 == value0-1:
+                            _INF('\tAn Old Association has been removed:   Number Assoc. before=%d   Number Assoc. after=%d' % (value0,value1))
+                            old_assoc = True
+                        else:
+                            _ERR('\tCheck Total Number of Associations NOK:   Number Assoc. before=%d   Number Assoc. after=%d' % (value0,value1))
+                else:
+                    if 'Associations:' in line0:
+                        list_assoc0 = line0.split(':')[1]
+                    if 'Associations:' in line1:
+                        list_assoc1 = line1.split(':')[1]
+                    if list_assoc0.count(",") > 0: # list of Associations with more than 1 element
+                        if old_assoc:
+                            for assoc in list_assoc0.split():
+                                if assoc == str(old_assoc_id)+',':
+                                    assoc = ' '+str(old_assoc_id)+','
+                                    if assoc not in list_assoc1:
+                                        _INF('\tOld Association %s has been removed from the new list:   Old list=%s   New list=%s' % (old_assoc_id, list_assoc0, list_assoc1))
+                                    else:
+                                        _ERR('\tOld Association %s has NOT been removed in the new list:   Old list=%s   New list=%s' % (old_assoc_id, list_assoc0, list_assoc1))
+                                else:
+                                    if assoc not in list_assoc1:
+                                        _ERR('\tAssociation %s has been removed from the new list:   Old list=%s   New list=%s' % (assoc, list_assoc0, list_assoc1))
+
+                        if new_assoc:
+                            if str(new_assoc_id) in list_assoc1:
+                                _INF('\tNew Association %d is in the new list:   Old list=%s   New list=%s' % (new_assoc_id, list_assoc0, list_assoc1))
+                            else:
+                                _ERR('\tNew Association %d is NOT in the new list:   Old list=%s   New list=%s' % (new_assoc_id, list_assoc0, list_assoc1))
+
+                    else: # Only the old value in the first list
+                        value0 = int(line0.split(':')[1])
+                        if list_assoc1.count(",") > 0: # Second list of Associations with more than 1 element
+                            if old_assoc:
+                                assoc = ' '+str(old_assoc_id)+','
+                                if value0 == old_assoc_id:
+                                    if assoc not in list_assoc1:
+                                        _INF('\tOld Association %s has been removed from the new list:   Old list=%s   New list=%s' % (old_assoc_id, list_assoc0, list_assoc1))
+                                    else:
+                                        _ERR('\tOld Association %s has NOT been removed in the new list:   Old list=%s   New list=%s' % (old_assoc_id, list_assoc0, list_assoc1))
+                                else:
+                                    _ERR('\tAssociation %s has been removed from the new list:   Old list=%s   New list=%s' % (assoc, list_assoc0, list_assoc1))
+                                    if assoc not in list_assoc1:
+                                        _ERR('\tAssociation %s has been removed from the new list:   Old list=%s   New list=%s' % (assoc, list_assoc0, list_assoc1))
+
+                            if new_assoc:
+                                if str(new_assoc_id) in list_assoc1:
+                                    _INF('\tNew Association %d is in the new list:   Old list=%s   New list=%s' % (new_assoc_id, list_assoc0, list_assoc1))
+                                else:
+                                    _ERR('\tNew Association %d is NOT in the new list:   Old list=%s   New list=%s' % (new_assoc_id, list_assoc0, list_assoc1))
+
+                        else: # Second list of Associations with just the new element
+                            value1 = int(line1.split(':')[1])
+                            if value1 >= value0+1:
+                                _INF('\tCheck "Associations:" OK. New association is greater than the Old one:   Value before=%d   Value after=%d' % (value0,value1))
+                            else:
+                                _ERR('\tCheck "Associations:" NOK. New association is NOT greater than the Old one:   Value before=%d   Value after=%d' % (value0,value1))
+
+            if 'Established associations:' in line:
+                if 'Established associations:' in line0:
+                    value0 = int(line0.split(':')[1])
+                if 'Established associations:' in line1:
+                    value1 = int(line1.split(':')[1])
+                if new_assoc:
+                    if value1 == value0+1:
+                        _INF('\tCheck "Established associations:" with new Association OK:   Value before=%d   Value after=%d' % (value0,value1))
+                    else:
+                        _WRN('\tCheck "Established associations:" with new Association NOK:   Value before=%d   Value after=%d' % (value0,value1))
+
+                if old_assoc:
+                    if value1 == value0-1:
+                        _INF('\tCheck "Established associations:" with removed Association OK:   Value before=%d   Value after=%d' % (value0,value1))
+                    else:
+                        _WRN('\tCheck "Established associations:" with removed Association NOK:   Value before=%d   Value after=%d' % (value0,value1))
+
+            if 'Active established associations:' in line:
+                if 'Active established associations:' in line0:
+                    value0 = int(line0.split(':')[1])
+                if 'Active established associations:' in line1:
+                    value1 = int(line1.split(':')[1])
+                if value1 == value0+1:
+                    _INF('\tCheck "Active established associations:" OK:   Value before=%d   Value after=%d' % (value0,value1))
+                else:
+                    _ERR('\tCheck "Active established associations:" NOK:   Value before=%d   Value after=%d' % (value0,value1))
+
+            if 'Aborted associations:' in line:
+                if 'Aborted associations:' in line0:
+                    value0 = int(line0.split(':')[1])
+                if 'Aborted associations:' in line1:
+                    value1 = int(line1.split(':')[1])
+                if value1 == value0+1:
+                    _INF('\tCheck "Aborted associations:" OK:   Value before=%d   Value after=%d' % (value0,value1))
+                else:
+                    _ERR('\tCheck "Aborted associations:" NOK:   Value before=%d   Value after=%d' % (value0,value1))
+
+            if 'Association ID=' in line:
+                if 'Association ID=' in line0:
+                    value0 = int(line0.split('=')[1])
+                if 'Association ID=' in line1:
+                    value1 = int(line1.split('=')[1])
+                if value1 >= value0+1:
+                    _INF('\tCheck "Association ID" OK:   Value before=%d   Value after=%d' % (value0,value1))
+                else:
+                    _ERR('\tCheck "Association ID" NOK:   Value before=%d   Value after=%d' % (value0,value1))
+
+            if 'Initial Association ID:' in line:
+                if 'Initial Association ID:' in line0:
+                    value0 = int(line0.split(':')[1])
+                if 'Initial Association ID:' in line1:
+                    value1 = int(line1.split(':')[1])
+                if value1 >= value0+1:
+                    _INF('\tCheck "Initial Association ID" OK:   Value before=%d   Value after=%d' % (value0,value1))
+                else:
+                    _ERR('\tCheck "Initial Association ID" NOK:   Value before=%d   Value after=%d' % (value0,value1))
+
+
+def compare_association_sctp_files (sctp_file1, sctp_file2):
+
+    new_assoc_id = 0
+    old_assoc_id = 0
+
+    cmd = 'diff -y --suppress-common-lines %s %s ' % (sctp_file1, sctp_file2)
+    (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    for line in output.split('\n'):
+        if '>' in line:
+            line1 = line.split('>')[1]
+            if 'Association ID=' in line1:
+                new_assoc_id = int(line1.split('=')[1])
+                _INF('\tNew Association created: %s' % new_assoc_id)
+
+        if '<' in line:
+            line0 = line.split('<')[0]
+            if 'Association ID=' in line0:
+                old_assoc_id = int(line0.split('=')[1])
+                _INF('\tOld Association removed: %d ' % old_assoc_id)
+
+    compare_associations(output, new_assoc_id, old_assoc_id)
+
+
+def get_association_sctp_file (sctp_file):
+
+    _INF('Searching for an ID Association in SCTP configuration from the file %s' % sctp_file)
+    assoc_info = {}
+    assoc_id_found = False
+
+    try:
+        with open(sctp_file, 'r') as fd:
+            sctp_conf = fd.readlines()
+    except Exception as e:
+        error_info = 'Error parsing %s file: %s' % (sctp_file, str(e))
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    for line in sctp_conf:
+        if "FEID:" in line:
+            current_iid = line.split()[1]
+            assoc_info['FEID'] = current_iid
+        if "Association ID=" in line:
+            current_assoc = line.split()[1]
+            current_assoc = current_assoc.split('=')[1]
+            assoc_id_found = True
+        if "Local Port:" in line:
+            current_port = line.split()[2]
+            if current_port == "2905" and assoc_id_found:
+                assoc_info ['AssocID'] = current_assoc
+                _INF('\tAssociation MAP found in FEID=%s with ID=%s' % (assoc_info['FEID'], assoc_info['AssocID']))
+                break
+            else:
+                assoc_id_found = False
+
+    return assoc_info
+
+
+def main():
+    global TC
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+
+        TC.connect_to_node()
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        _INF('Processors status')
+        TC.display_processors_state()
+
+        _INF('MAP processes running')
+        cmd = 'CBA_find_process -p HSS_EsmMapProviderProc --node %s --user %s --port %s' % (user_config.NODE, 
+                                                                                            user_config.user,
+                                                                                            user_config.port)
+        TC.run_stFramework_command(cmd, check_result = True)
+        cmd = 'CBA_find_process -p HSS_MapProviderProc --node %s --user %s --port %s' % (user_config.NODE,
+                                                                                         user_config.user,
+                                                                                         user_config.port)
+        TC.run_stFramework_command(cmd, check_result = True)
+
+        TC.start_alarm_monitoring()
+
+        if not os.path.exists(user_config.output_dir):
+            os.makedirs(user_config.output_dir)
+
+        sctp_initial_file = user_config.output_dir+'/SCTP_configuration_pre.txt'
+        _INF('Saving current SCTP configuration in file %s' % sctp_initial_file)
+        cmd = 'CBA_SS7_SCTP_info -v --node %s --user %s --port %s >%s' % (user_config.NODE,
+                                                                       user_config.user,
+                                                                       user_config.port,
+                                                                       sctp_initial_file)
+        TC.run_stFramework_command(cmd, check_result = True)
+
+
+        assoc = get_association_sctp_file (sctp_initial_file)
+        if assoc:
+            _INF('Releasing MAP Association ID %s for instance ID %s' % (assoc['FEID'], assoc['AssocID']))
+        else:
+            info = 'MAP Association ID has not been found in the current configuration'
+            quit_program(st_command.EXECUTION_ERROR,message=info)
+
+        action = 'SS7 SCTP Release Association'
+        timestamp = datetime.now()
+        cmd = 'CBA_SS7_SCTP_release_association --node %s --user %s --port %s --inst_id %s --assoc_id %s' % (user_config.NODE,
+       user_config.user,
+       user_config.port,
+       assoc['FEID'],
+       assoc['AssocID'])
+
+        begin_release = time.time()
+        TC.run_stFramework_command(cmd, check_result = True)
+        end_release = time.time()
+        TC.send_test_case_info('%-*s executed at %s   Action time (sec) %2.2f' % (30,action,
+                                                        timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                        float(end_release - begin_release)))
+
+
+
+        _INF('Waiting up to %s seconds for alarms to be cleared' % user_config.wait_time)
+        time.sleep(float(user_config.wait_time))
+
+        sctp_final_file = user_config.output_dir+'/SCTP_configuration_post.txt'
+        _INF('Saving new SCTP configuration in file %s' % sctp_final_file)
+        cmd = 'CBA_SS7_SCTP_info -v --node %s --user %s --port %s >%s' % (user_config.NODE,
+                                                                       user_config.user,
+                                                                       user_config.port,
+                                                                       sctp_final_file)
+        TC.run_stFramework_command(cmd, check_result = True)
+
+        assoc = get_association_sctp_file (sctp_final_file)
+
+
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+        _INF('Comparing SCTP configuration before and after releasing Association')
+        sctp_file1_filtered = user_config.output_dir+'/SCTP_configuration_pre_filtered.txt'
+        cmd = 'grep ssociation %s | grep -v Statistics | grep -v "has been restart" >%s' % (sctp_initial_file, sctp_file1_filtered)
+        (output1,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+
+        sctp_file2_filtered = user_config.output_dir+'/SCTP_configuration_post_filtered.txt'
+        cmd = 'grep ssociation %s | grep -v Statistics | grep -v "has been restart" >%s' % (sctp_final_file, sctp_file2_filtered)
+        (output2,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        compare_association_sctp_files(sctp_file1_filtered, sctp_file2_filtered)
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError as e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Release a SS7 Association in a CBA cluster checking that all the alarms are triggered and cleared',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-o', '--output',
+                      action='store', default=CWD,
+                      help='Specify the output directory. Default %s' % CWD,
+                      dest='output_dir')
+
+    scenario_params.add_argument('-t', '--time',
+                        default=60, type=int, action='store', dest='wait_time',
+                        help='Waiting time for action. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_release_SS7_Association%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_release_SS7_Association%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        if sys.version_info[0] == 2:
+            _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+        else:
+            _DEB('** Binary MD5: %s' % hashlib.md5(str.encode(myself.read())).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable) as e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

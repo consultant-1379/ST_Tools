@@ -1,0 +1,456 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+def quit_program(exit_code,message=''):
+    global TC
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def compare_same_bound_info(processor,bound_status_1,bound_status_2):
+
+   for key in sorted(bound_status_1[processor]):
+       if bound_status_1[processor][key] != bound_status_2[processor][key]:
+           _WRN('Bounding information is not the same.')
+           _WRN('In %s the information about %s is not the same:\nvalue expected=%s\nvalue obtained=%s' % (processor, key, bound_status_1[processor][key], bound_status_2[processor][key]))
+           return False
+
+   _INF('Bounding information is as expected.')
+   return True
+
+
+
+def check_initial_bound_info(processor,bound_status):
+   for key in sorted(bound_status[processor]):
+       if key == 'Active_Slave':
+           if 'eth5' not in bound_status[processor][key]:
+               _ERR('The Currently Active Slave is not eth5 as expected.')
+               _ERR('In %s the information about %s is not as expected:value obtained=%s' % (processor, key, bound_status[processor][key]))
+               return False
+
+       if key == 'Slave1_status':
+           if 'up' not in bound_status[processor][key]:
+               _ERR('The MII Status for the Slave is not UP as expected.')
+               _ERR('In %s the information about %s is not as expected:value obtained=%s' % (processor, key, bound_status[processor][key]))
+               return False
+           if 'up' not in bound_status[processor][key]:
+               _ERR('The MII Status for the Slave has not changed to down as expected.')
+               _ERR('In %s the information about %s is not as expected:value obtained=%s' % (processor, key, bound_status[processor][key]))
+               return False
+
+   _INF('Initial bounding information is correct as expected.')
+   return True
+
+
+def compare_bound_info(processor,bound_status_1,bound_status_2):
+
+   for key in sorted(bound_status_1[processor]):
+       if key == 'Active_Slave':
+           if bound_status_1[processor][key] == bound_status_2[processor][key]:
+               _ERR('The Currently Active Slave has not changed as expected.')
+               _ERR('In %s the information about %s is not as expected:value obtained=%s' % (processor, key, bound_status_2[processor][key]))
+               return False
+
+       if key == 'Slave1_status':
+           if bound_status_1[processor][key] == bound_status_2[processor][key]:
+               _ERR('The MII Status for the Slave has not changed as expected.')
+               _ERR('In %s the information about %s is not as expected:value obtained=%s' % (processor, key, bound_status_2[processor][key]))
+               return False
+           if "down" not in bound_status_2[processor][key]:
+               _ERR('The MII Status for the Slave has not changed to down as expected.')
+               _ERR('In %s the information about %s is not as expected:value obtained=%s' % (processor, key, bound_status_2[processor][key]))
+               return False
+
+       if key == 'Slave2_status':
+           if "down" in bound_status_2[processor][key]:
+               _ERR('The MII Status for the Slave is down as expected.')
+               _ERR('In %s the information about %s is not as expected:value obtained=%s' % (processor, key, bound_status_2[processor][key]))
+               return False
+
+   _INF('Bounding information is as expected.')
+   return True
+
+
+def save_bound_info (bound_info):
+
+    proc_bound_info = {}
+
+    active_eth = bound_info[0].split()[3]
+    status = bound_info[0].split()[6]
+    proc_bound_info ['Active_Slave'] = active_eth
+    proc_bound_info ['Active_Slave_status'] = status
+
+    slave1_eth = bound_info[1].split()[2]
+    status = bound_info[1].split()[5]
+    proc_bound_info ['Slave1'] = slave1_eth
+    proc_bound_info ['Slave1_status'] = status
+
+    slave2_eth = bound_info[2].split()[2]
+    status = bound_info[2].split()[5]
+    proc_bound_info ['Slave2'] = slave2_eth
+    proc_bound_info ['Slave2_status'] = status
+    #print proc_bound_info
+
+    return proc_bound_info
+
+
+def get_bound_info (processor):
+
+    cmd = 'cat /proc/net/bonding/bond0|egrep "Active|Interface|Status"'
+    #answer = TC.run_processor_command(cmd, processor, full_answer=True)
+    answer = TC.run_processor_command(cmd, processor)
+    
+    if len(answer):
+        new_answer = []
+        for i in range(len(answer)):
+            if 'No such file or directory' in answer[i]:
+                error_info='Bounding not defined: %s' % answer
+                _ERR(error_info)
+                quit_program(st_command.EXECUTION_ERROR,error_info)
+            if 'MII Status' in answer[i]:
+                continue
+            else:
+                line = answer[i] + ' ' + answer[i+1]
+                new_answer.append(line)
+    else:
+        error_info='Error executing %s' % cmd
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    bound_info = '\n'.join(new_answer)
+    _INF('Bonding interfaces status for processor %s:\n%s' % (processor, bound_info))
+
+    return save_bound_info(new_answer)
+
+def main():
+    global TC
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+
+        TC.connect_to_node()
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        _INF('Processors status')
+        TC.display_processors_state()
+
+
+        allowed_processors = TC.all_processors
+        processors = []
+        if  user_config.processors is None:
+            processors = allowed_processors
+        else:
+            for processor in user_config.processors:
+                if processor not in allowed_processors:
+                    error_info = 'Processor %s not valid. Allowed values are: %s' % (processor, ' '.join(allowed_processors))
+                    _ERR(error_info)
+                    quit_program(st_command.WRONG_PARAMETER,error_info)
+
+            processors = user_config.processors
+
+        _INF('Start Alarm monitor')
+        TC.start_alarm_monitoring()
+        _INF('Preparing alarm filters')
+        TC.clean_alarm_filters()
+
+        alarm_filters = []
+        for processor in processors:
+            source_filter='HostName=%s' % processor
+            alarm_filters += [{'source':source_filter,'additionalText':'Bonding degraded on bond0 (link down on eth5)'}]
+
+        TC.add_alarm_filters(alarm_filters)
+        TC.display_alarm_filter()
+
+        bound_status_pre = {}
+        for processor in processors:
+            if TC.processor_state(processor) == 'LOCKED':
+                _WRN('Test for %s will be skipped. Processor is LOCKED' % processor)
+                continue
+
+            bound_status_pre[processor] = get_bound_info(processor)
+            #print bound_status_pre
+            if not check_initial_bound_info(processor,bound_status_pre):
+                error_info = 'Initial bouncing interfaces status is not as expected for processor %s' % processor
+                _ERR(error_info)
+                quit_program(st_command.EXECUTION_ERROR,error_info)
+
+
+        for processor in processors:
+            if TC.processor_state(processor) == 'LOCKED':
+                _WRN('Test for %s will be skipped. Processor is LOCKED' % processor)
+                continue
+
+            _INF('Deactivating active interface %s in processor %s' % (bound_status_pre[processor]['Active_Slave'], processor))
+            cmd = '/sbin/ifconfig %s down' % bound_status_pre[processor]['Active_Slave']
+            TC.run_processor_command(cmd, processor)
+
+        #_INF('Waiting %s seconds for next action' % user_config.wait_time)
+        time.sleep(float(3))
+
+        _INF('Checking new bounding interfaces status after deactivating the active one')
+        bound_status_deact = {}
+        for processor in processors:
+            if TC.processor_state(processor) == 'LOCKED':
+                _WRN('Test for %s will be skipped. Processor is LOCKED' % processor)
+                continue
+
+            bound_status_deact[processor] = get_bound_info(processor)
+            ##print bound_status_deact
+            if not compare_bound_info(processor,bound_status_pre,bound_status_deact):
+                error_info = 'Bouncing interfaces status not expected for processor %s' % processor
+                _ERR(error_info)
+
+
+        _INF('Waiting %s seconds for next action' % user_config.wait_time)
+        time.sleep(float(user_config.wait_time))
+
+        for processor in processors:
+            if TC.processor_state(processor) == 'LOCKED':
+                _WRN('Test for %s will be skipped. Processor is LOCKED' % processor)
+                continue
+
+            _INF('Activating interface %s in processor %s' % (bound_status_pre[processor]['Active_Slave'], processor))
+            cmd = '/sbin/ifconfig %s up' % bound_status_pre[processor]['Active_Slave']
+            TC.run_processor_command(cmd, processor)
+
+        #_INF('Waiting %s seconds for next action' % user_config.wait_time)
+        time.sleep(float(3))
+
+
+        _INF('Checking new bounding interfaces status after reactivating the interface')
+        bound_status_act = {}
+        for processor in processors:
+            if TC.processor_state(processor) == 'LOCKED':
+                _WRN('Test for %s will be skipped. Processor is LOCKED' % processor)
+                continue
+
+            bound_status_act [processor]= get_bound_info(processor)
+            ##print bound_status_act
+            if not compare_same_bound_info(processor,bound_status_pre,bound_status_act):
+                quit_program(st_command.EXECUTION_ERROR,message=info)
+
+
+        _INF('Waiting %s seconds for next action' % user_config.wait_time)
+        time.sleep(float(user_config.wait_time))
+
+        _INF('Waiting up to %s seconds for alarms to be cleared' % user_config.max_time)
+        if not TC.wait_for_expected_alarms(user_config.max_time):
+            info = 'Some expected alarms have not been received'
+            if not user_config.skip_missing_alarms:
+                quit_program(st_command.EXECUTION_ERROR,message=info)
+            else:
+                TC.first_error = info
+
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+            quit_program(st_command.SUCCESS)
+
+
+    except connection.Unauthorized, e: 
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed), e: 
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF), e: 
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError, e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError, e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Check Redundancy of the bounded interface',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-p', '--processors', nargs='+',
+                        default=None, action='store', dest='processors',
+                        help='List of processors to be used. By default, all the processors.')
+
+    scenario_params.add_argument('--max_time',
+                        default=180, type=int, action='store', dest='max_time',
+                        help='Max time waiting for alarms. By default is "%(default)s"')
+
+    scenario_params.add_argument('--skip-missing-alarms',
+                      action='store_true', default=False,
+                      help='Do not stop execution when there are missing expected alarms.',
+                      dest='skip_missing_alarms')
+
+    scenario_params.add_argument('-t', '--time',
+                        default=60, type=int, action='store', dest='wait_time',
+                        help='Waiting time for action. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_Redundancy_bonding_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_Redundancy_bonding_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

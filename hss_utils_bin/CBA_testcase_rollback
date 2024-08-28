@@ -1,0 +1,415 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import pexpect
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+import copy
+import json
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+rollback_init=''
+rollback_begin=''
+
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+def check_rollback_action(action_message):
+    global rollback_init
+    global rollback_begin
+    action = 'Rollback'
+    if 'Restore backup' in action_message and 'in progress' in action_message:
+        rollback_init = datetime.now()
+        rollback_begin = time.time()
+
+    elif 'Phase ROLLBACK lasted in TOTAL' in action_message:
+        rollback_end = time.time()
+        rollback_secs = rollback_end - rollback_begin
+        TC.send_test_case_info('%-*s   Executed at %s   Action time (sec) %.2f' % (15,action,
+                                                                                rollback_init.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                                float(rollback_secs)))
+
+
+def run_upgrade_tool(config, resume=False):
+    try:
+        cmd = 'cd /cluster/storage/Hss_Upgrade_Tool'
+        _INF('Executing %s' % cmd)
+        TC.run_node_command(cmd)
+    except (connection.ConnectionTimeout, connection.ConnectionFailed), e:
+        if resume:
+            _WRN('Connection closed by remote host. Reconnection to SC needed')
+            TC.close_connection()
+            return True
+        else:
+            error_info = 'Error: %s' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF), e:
+        if resume:
+            _WRN('Connection closed by remote host. Reconnection to SC needed')
+            TC.close_connection()
+            return True
+        else:
+            error_info = 'Error: %s' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    cmd = './HssUpgradeTool --upgradePhase ROLLBACK %s' % (' --resume' if resume else '')
+    _INF('Executing %s' % cmd)
+    TC.channel.write_line('%s' % cmd)
+    executing = True
+    received_unknown_option = False
+    while (executing):
+        try:
+            result = TC.channel.expect([TC.sync_expression,
+                                            '\(OK, Exit\)\??:\r\n',
+                                            'Type OK and press enter when finish or type Exit and press enter to stop the automatic tool',
+                                            'If you wish to continue, type OK and press Enter',
+                                            'Type OK and press enter when it is done and you want to continue',
+                                            'If yes type restore, if not type skip: \(skip\/restore\)',
+                                            'The system is going down for reboot',
+                                            '-- FAILED --',
+                                            'Incorrect answer provided',
+                                            'Step failed',
+                                            'Execution stopped',
+                                            '\r\n'],
+                                            timeout=1.0 )
+
+            if result == 0:
+                executing = False
+                _INF('HssUpgradeTool execution finished')
+
+            elif result in [1,2,3,4]:
+                _INF('%s' % TC.channel.stdout)
+                TC.channel.write_line('OK')
+
+            elif result == 5:
+                _INF('%s' % TC.channel.stdout)
+                TC.channel.write_line('restore')
+
+            elif result == 6:
+                _INF('%s' % TC.channel.stdout)
+                _INF('Reconnection to SC needed')
+                TC.close_connection()
+                return True
+
+            elif result in [7,8,9,10]:
+                error_info = 'HssUpgradeTool execution FAILED'
+                _ERR(error_info)
+                get_HssUpgradeTool_log()
+                TC.close_connection()
+                quit_program(st_command.EXECUTION_ERROR, error_info)
+
+            else:
+                _INF('%s' % TC.channel.stdout)
+                action_message = TC.channel.stdout
+                check_rollback_action(action_message)
+                if 'Unknown option: pwd' in TC.channel.stdout:
+                    received_unknown_option = True
+
+        except pexpect.TIMEOUT, e:
+            continue
+
+        except pexpect.EOF, e:
+            _WRN('Connection closed by remote host. Reconnection to SC needed')
+            TC.close_connection()
+            return True
+
+        except KeyboardInterrupt:
+            TC.channel.write_line('\x03')
+            TC.close_connection()
+            error_info = 'HssUpgradeTool stopped by user'
+            _WRN(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+
+    # reconnection not needed
+    return False
+
+
+def get_HssUpgradeTool_log():
+    if TC is None:
+        _WRN('Unable to get HssUpgradeTool logs')
+        return
+
+    TC.download('/cluster/storage/Hss_Upgrade_Tool/*.log', './')
+
+def acces_config_to_ACTIVE(user_config):
+    access_config = {'host':user_config.NODE,
+                      'port':user_config.port,
+                      'user':user_config.user}
+
+
+    node = hss_utils.node.cba.Cba(config = access_config)
+    host, ip = node.get_primary_sc()
+    access_config['host'] = ip
+    node.release()
+
+    return access_config
+
+def main():
+    global TC
+    global rollback_init
+    global rollback_begin
+    user_config = parse_commandline()
+    access_config = acces_config_to_ACTIVE(user_config)
+    if not access_config:
+        error_info = 'Problem selecting the active SC'
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+        TC.connect_to_node()
+        hss_version = TC.node.get_envdata('HSS_VERSION')
+        if hss_version is None:
+            error_info = 'HSS version not found'
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR,error_info)
+
+        _INF('HSS version  :%s' % hss_version)
+
+        _INF('upload %s' % user_config.CONFIG_FILE)
+        if user_config.user != 'root':
+            _DEB('User is not root. Creating connection with root privileges.')
+            cmd = 'mkdir -p /tmp/upload/ ; chmod 777 /tmp/upload/'
+            _INF('Executing %s' % cmd)
+            TC.run_node_command(cmd)
+            TC.upload(user_config.CONFIG_FILE, '/tmp/upload/')
+            cmd = 'cp /tmp/upload/* /cluster/storage/Hss_Upgrade_Tool/config/'
+            _INF('Executing %s' % cmd)
+            TC.run_node_command(cmd)
+        else:
+            TC.upload(user_config.CONFIG_FILE, '/cluster/storage/Hss_Upgrade_Tool/config/')
+
+
+        resume = False
+        while True:
+            if run_upgrade_tool(user_config, resume=resume):
+                max_tries = 3
+                while True:
+                    time.sleep(120)
+                    TC.reconnect(1800)
+                    access_config = acces_config_to_ACTIVE(user_config)
+                    if access_config:
+                        break
+                    else:
+                        TC.close_connection()
+                        max_tries -= 1
+                        if max_tries == 0:
+                            error_info = 'Problem selecting the active SC after a reconnection'
+                            _ERR(error_info)
+                            quit_program(st_command.EXECUTION_ERROR,error_info)
+
+                time.sleep(user_config.wait_for_resume)
+                TC.change_connection_to_node(access_config)
+                resume = True
+            else:
+                break
+
+
+        get_HssUpgradeTool_log()
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+
+    except IOError, e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except connection.Unauthorized, e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed), e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF), e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError, e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError, e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except test_cases.ClissError, e:
+        error_info = '%s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawTextHelpFormatter,
+                        description=textwrap.dedent('Execute a rollback with the HssUpgradeTool in a CBA platform'),
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='''OAM  IP address of the node. 
+If ommitted local hostname will be used to find env in rosetta
+''',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('CONFIG_FILE',
+                                 help='Full path where specific config.properties file is stored')
+
+    scenario_params.add_argument('--wait-for-resume',
+                        default=60, type=int, action='store', dest='wait_for_resume',
+                        help='Sleep time waiting after reconnecting and continue with the Upgrade. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_rollback_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if not args.log_file:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_rollback_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if not args.NODE:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         : %s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

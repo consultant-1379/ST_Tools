@@ -1,0 +1,5 @@
+rtc-build-handler (2.3) UNRELEASED; urgency=medium
+
+  * Initial release. Contributors: Mitxel Garcia (Closes: #XXXXXX)
+
+ -- CCSM Tools team <PDLCCSMTOO@pdl.internal.ericsson.com>  Mon, 05 Mar 2020 18:00:00 +0200

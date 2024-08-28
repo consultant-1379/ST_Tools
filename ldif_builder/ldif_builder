@@ -1,0 +1,522 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import copy
+import hashlib
+import argparse
+import threading
+
+import logging
+_DEB = logging.debug
+_WRN = logging.warning
+_INF = logging.info
+
+
+def _ERR(*args, **kwargs):
+    logging.error(*args, **kwargs)
+    sys.stderr.write('ERROR: %s\n' % args[0])
+    sys.stderr.flush()
+
+
+import ldaphelper as _ldap
+if not _ldap.LDAP_AVAIL:
+    _WRN('Ldap features will be disabled!')
+
+try:
+    import ldifgen
+except ImportError:
+    _ERR('Cannot find "ldifgen" library for python!')
+    sys.exit(-1)
+
+_SUPPORTED_VERSIONS_=[]
+def __supported_versions__():
+    global _SUPPORTED_VERSIONS_
+    version_list = ''
+    try:
+        _SUPPORTED_VERSIONS_ = ldifgen.SUPPORTED_VERSIONS
+        for ver in ldifgen.SUPPORTED_VERSIONS:
+            _DEB('Added supported ldifgen version: %s' % ver)
+            version_list += '%s\n' % ver
+        return version_list
+    except:
+        _WRN('Unable to get supported versions from ldifgen')
+        return 'ldifgen does not provide version info\n'
+
+# This value it's used only in logging messages
+STEP_NAME = ''
+
+class LdifProvisioner(object):
+    def new_sink(self):
+        raise NotImplementedError()
+
+    def close(self):
+        pass
+
+
+class LdapOut(LdifProvisioner):
+    class LdapSink(object):
+        def __init__(self, ldap_handler, use_delete=False):
+            self.__ldap = ldap_handler
+            self.__delete = use_delete
+
+        def send(self, ldif):
+            if self.__delete:
+                self.__ldap.delete(ldif)
+            else:
+                self.__ldap.add(ldif)
+
+        def close(self):
+            self.__ldap.close()
+
+
+    def __init__(self, url, user_dn, passwd,
+                 use_ldap2=False, auto_modify=True, stop_on_error=False,
+                 ldap_delete=False):
+        self.__url = url
+        self.__user_dn = user_dn
+        self.__passwd = passwd
+        self.__use_ldap2 = use_ldap2
+        self.__auto_modify = auto_modify
+        self.__stop_on_error = stop_on_error
+        self.__ldap_delete = ldap_delete
+
+
+    def new_sink(self):
+        _INF('Create LDAP connection to %s' % self.__url)
+        ldap = _ldap.LdapConnection(self.__url,
+                                    self.__use_ldap2,
+                                    self.__auto_modify,
+                                    self.__stop_on_error)
+        try:
+            ldap.open(self.__user_dn, self.__passwd)
+        except _ldap.LdapError, e:
+            _ERR('Unable to connect: %s' % e)
+            sys.exit(-1)
+
+        return self.LdapSink(ldap, self.__ldap_delete)
+
+
+class StdOut(LdifProvisioner):
+    class StdoutSink(object):
+        def send(self, ldif):
+            print ldif[:-1]
+
+        def close(self):
+            pass
+
+    def new_sink(self):
+        return self.StdoutSink()
+
+
+class FileOut(LdifProvisioner):
+    class FileSink(object):
+        def __init__(self, fd):
+            self.__fd = fd
+
+        def send(self, ldif):
+            self.__fd.write(ldif)
+
+        def close(self):
+            pass
+
+    def __init__(self, filename):
+        _DEB('Dumping ldif into %s' % filename)
+        self.__fd = open(filename, 'w')
+
+    def new_sink(self):
+        return self.FileSink(self.__fd)
+
+    def close(self):
+        self.__fd.close()
+
+
+def main():
+    global STEP_NAME
+
+    user_config = parse_command_line()
+    data_config = parse_data_files(user_config.DATA_FILE)
+
+    # Setup logging
+    STEP_NAME = user_config.log_step
+    if STEP_NAME != '':
+        _DEB('Building ldif file for step "%s"' % STEP_NAME)
+    if _ldap.LDAP_AVAIL:
+        mod_name = data_config.get('LDIF_TYPE', 'unkType')
+        obj_type = data_config.get('OBJECT_TYPE', 'unkObject')
+        ldap_log_prefix = '%s%s.%s_' % (user_config.log_ldap_prefix,
+                                        mod_name,
+                                        obj_type)
+        _ldap.set_ldap_log_prefix(ldap_log_prefix, 
+                                  logging.DEBUG if user_config.verbose else logging.ERROR)
+	
+        _INF('Logging LDAP oprations to "%s"' % _ldap.LOGGING_FILE)
+
+    # Delete is only available at command line
+    data_config['DELETE'] = str(user_config.delete)
+
+    # Populate config from command line
+    user_overwrites = {}
+    if user_config.count is not None:
+        user_overwrites['COUNT'] = str(user_config.count)
+    if user_config.first is not None:
+        user_overwrites['FIRST'] = str(user_config.first)
+    if user_config.root_dn is not None:
+        user_overwrites['ROOT_DN'] = user_config.root_dn
+    if _ldap.LDAP_AVAIL:
+        if user_config.binddn is not None:
+            user_overwrites['USER_DN'] = user_config.binddn
+        if user_config.passwd is not None:
+            user_overwrites['PASSWD'] = user_config.passwd
+    data_config.update(user_overwrites)
+
+    if user_config.brief:
+        show_brief(data_config)
+
+    count = __get_int_value(data_config, 'COUNT')
+    first = __get_int_value(data_config, 'FIRST', default=0)
+    delete = data_config['DELETE'] == 'True'
+
+    # Build factory and output consumer
+    factory_config = (data_config, delete)
+    if user_config.LDIF_OUTPUT == 'stdout':
+        out = StdOut()
+        use_threads = 1
+    elif user_config.LDIF_OUTPUT.startswith('file://'):
+        out = FileOut(user_config.LDIF_OUTPUT[7:])
+        use_threads = 1
+    elif user_config.LDIF_OUTPUT.startswith('ldap://') or user_config.LDIF_OUTPUT.startswith('ldaps://'):
+        out = LdapOut(user_config.LDIF_OUTPUT,
+                      data_config['USER_DN'],
+                      data_config['PASSWD'],
+                      user_config.ldap2,
+                      user_config.automodify,
+                      user_config.stop,
+                      delete)
+        use_threads = user_config.threads
+    else:
+        _ERR('Unrecognized output: %s' % user_config.LDIF_OUTPUT)
+        sys.exit(-1)
+
+    thread_pool = TaskScheduler(use_threads,
+                                first, count,
+                                factory_config, out,
+                                job=build_ldif_file)
+    if STEP_NAME != '':
+        _DEB('Start population for step "%s"' % STEP_NAME)
+
+    thread_pool.start()
+    thread_pool.join()
+
+    if STEP_NAME != '':
+        _DEB('Population terminated for step "%s"' % STEP_NAME)
+
+    out.close()
+    sys.exit(0)
+
+        
+def parse_command_line():
+    parser = argparse.ArgumentParser(
+        description='Populate LDAP server with autogenerated LDIF data'
+    )
+    parser.add_argument('LDIF_OUTPUT',
+                        help='Output to send generated ldif file')
+    parser.add_argument('DATA_FILE', nargs='+',
+                        help='List of data files with info about desired ldif')
+    obj_params = parser.add_argument_group('Object iteration configuration')
+    obj_params.add_argument('-c', '--count', default=None,
+                            action='store', type=int, dest='count',
+                            help='Number of elements to generate')
+    obj_params.add_argument('-f', '--first', default=None,
+                            action='store', type=int, dest='first',
+                            help='First element index to build')
+    objcfg_params = parser.add_argument_group('Ldif objects configuration')
+    objcfg_params.add_argument('--delete', default=False,
+                               action='store_true', dest='delete',
+                               help='Delete subscribers instead of create new')
+    objcfg_params.add_argument('-r', '--root-dn', default=None,
+                               action='store', dest='root_dn',
+                               help='Set ROOT DN')
+    objcfg_params.add_argument('-e', '--ensure-version', default=None,
+                               action='store', dest='ldifgen_version',
+                               help='Check ldifgen library version before generation')
+    if _ldap.LDAP_AVAIL:
+        ldap_params = parser.add_argument_group('LDAP server configuration')
+        ldap_params.add_argument('-2', '--ldap2', default=False,
+                                 action='store_true', dest='ldap2',
+                                 help='Use LDAPv2 protocol instead of LDAPv3')
+        ldap_params.add_argument('-D', default=None,
+                                 action='store', dest='binddn',
+                                 help='bind DN')
+        ldap_params.add_argument('-w', default=None,
+                                 action='store', dest='passwd',
+                                 help='bind password for simple authentication')
+        ldap_params.add_argument('--log-ldap-prefix', default='',
+                                 action='store', dest='log_ldap_prefix',
+                                 help='Set LDAP logging file prefix')
+        ldap_params.add_argument('-M', '--disable-automodify', default=True,
+                                 action='store_false', dest='automodify',
+                                 help='Disable ldap_modify on ldap_add')
+        
+    program_params = parser.add_argument_group('Program behaviour options')
+    program_params.add_argument('-s', '--show-brief', default=False,
+                                action='store_true', dest='brief',
+                                help='Show a little brief about population')
+    program_params.add_argument('--max-threads', type=int, default=10,
+                                action='store', dest='threads',
+                                help='Use more than one thread')
+    program_params.add_argument('--log-prefix', default='',
+                                action='store', dest='log_prefix',
+                                help='Set logging file prefix')
+    program_params.add_argument('--log-step', default='',
+                                action='store', dest='log_step',
+                                help='Set logging step name')
+    program_params.add_argument('--stop-on-error', default=False,
+                                action='store_true', dest='stop',
+                                help='Stop population if some error occurrs')
+    program_params.add_argument('--get-versions', action='version',
+                                version=__supported_versions__(),
+                                help='Get supported versions from ldifgen library')
+    program_params.add_argument('--verbose', default=False,
+                                action='store_true', dest='verbose',
+                                help='Adding debug messages to log file')
+    args = parser.parse_args()
+
+    # Basic checks
+
+    if args.LDIF_OUTPUT == 'stdout' and _ldap.LDAP_AVAIL:
+        if args.ldap2:
+            _WRN('Ignore "LDAPv2" request because LDAP is not used')
+        if args.binddn:
+            _WRN('Ignore bind DN for LDAP auth because LDAP is not used')
+        if args.passwd:
+            _WRN('Ignore passwd for LDAP auth because LDAP is not used')
+
+    if args.LDIF_OUTPUT.startswith('ldap://') and not _ldap.LDAP_AVAIL:
+        _ERR('python-ldap library is required to connect to ldap servers')
+        sys.exit(-1)
+
+    for data_file in args.DATA_FILE:
+        if not os.path.isfile(data_file):
+            _ERR('File not found: %s' % data_file)
+            sys.exit(-1)
+
+    if args.ldifgen_version is not None:
+        if args.ldifgen_version not in _SUPPORTED_VERSIONS_:
+            _ERR('User request version "%s" but is not supported by installed ldifgen' % args.ldifgen_version)
+            sys.exit(-1)
+
+    return args
+
+
+def parse_data_files(files_list):
+    '''Parse a set of data files and return one dict.'''
+    config = {}
+    for filename in files_list:
+        config.update(parse_data_file(filename))
+    return config
+
+
+def parse_data_file(filename):
+    '''Quick'n'dirty data files parser.'''
+    _DEB('Load data file: %s' % filename)
+    config = {}
+    with open(filename, 'r') as fd:
+        for line in fd.readlines():
+            # Remove comments: assuming "//" and "#" as markers
+            if '#' in line:
+                line = line[:line.index('#')]
+            if '//' in line:
+                line = line[:line.index('//')]
+            # Clean line and skip empty
+            line = line.strip()
+            if line == '':
+                continue
+            # Get key/value pairs
+            line = line.split()
+            try:
+                if len(line[1:]) > 1:
+                    # List of values detected
+                    config[line[0]] = line[1:]
+                else:
+                    config[line[0]] = line[1]
+            except IndexError:
+                _WRN('Unable to parse "%s", ignored.' % ' '.join(line))
+    return config
+
+
+def show_brief(pop_config):
+    '''Pretty print of dict.'''
+    def print_variable(varname, value):
+        spaces = max(1, 20 - len(varname))
+        print '%s%s%s' % (varname, ' '*spaces, value)
+    print ' Ldif generation variables'
+    print '==========================='
+    keys = pop_config.keys()
+    keys.sort()
+    for key in keys:
+        print_variable(key, pop_config[key])
+    print '\n[Press Intro to continue or Ctrl-C to quit]'
+    try:
+        raw_input()
+    except KeyboardInterrupt:
+        print '\nCancelled!'
+        sys.exit(-1)
+
+
+def __get_int_value(options, value, default=1):
+    try:
+        return int(options.get(value, default))
+    except:
+        _ERR('%s variable has a non-integer value: %s' % (value,
+                                                          options[value]))
+        sys.exit(-1)
+
+
+class Factory(object):
+    '''This class wraps ldifgen factory.'''
+    def __init__(self, pop_config, delete):
+        self.__cfg = pop_config
+        self.__method__ = self.__delete_obj__ if delete else self.__new_obj__
+
+    def __delete_obj__(self, ldif_builder):
+        return ldif_builder.delete()
+
+    def __new_obj__(self, ldif_builder):
+        return ldif_builder.new()
+
+    def build_id(self, object_index):
+        self.__cfg['OBJECT_INDEX'] = str(object_index)
+        obj = '%s.%s' % (self.__cfg['LDIF_TYPE'],
+                         self.__cfg['OBJECT_TYPE'])
+        _DEB('Building object #%s as %s' % (object_index, obj))
+        try:
+            return self.__method__(ldifgen.factory(obj, **self.__cfg))
+        except Exception, e:
+            _ERR('lidfgen library cannot build "%s"' % obj)
+            _ERR('Additional info: %s' % str(e))
+            sys.exit(-1)
+
+
+class TaskScheduler(object):
+    '''Thread pool of producer -> consumers.'''
+    class _Worker(threading.Thread):
+        def __init__(self, first, count, pop_config, pop_delete, consumer, job, th_num):
+            threading.Thread.__init__(self)
+            self.__first = first
+            self.__count = count
+            self.__producer = Factory(copy.copy(pop_config), pop_delete)
+            self.__consumer = consumer
+            self.__job = job
+            self.__thread_id = th_num
+
+        def run(self):
+            _DEB('Started thread #%s for object %s to %s' % (
+                self.__thread_id,
+                self.__first, self.__first + self.__count))
+            try:
+                self.__job(self.__first, self.__count,
+                           self.__producer, self.__consumer)
+            except JobError, e:
+                _WRN('Thread #%s error: %s' % (self.__thread_id, str(e)))
+            _DEB('Closing thread #%s' % self.__thread_id)
+            self.__consumer.close()
+
+
+    def __init__(self, threads_count,
+                 first_element, count_elements,
+                 producer_config, consumer, job):
+        self.__threads_count = threads_count
+        self.__first = first_element
+        self.__count = count_elements
+        self.__producer_config = producer_config
+        self.__consumer = consumer
+        self.__job = job
+
+        self.__pool = self.__create_threads__()
+
+    def __create_threads__(self):
+        pool = []
+        task_config = self.__distribute_problem__()
+        th_id = 1
+        for config in task_config:
+            if config[1] > 0:
+                pool.append(self._Worker(*config,
+                                         pop_config=self.__producer_config[0],
+                                         pop_delete=self.__producer_config[1],
+                                         consumer=self.__consumer.new_sink(),
+                                         job=self.__job,
+                                         th_num=th_id))
+                th_id += 1
+        return pool
+
+    def __distribute_problem__(self):
+        objs_per_thread = int(self.__count / self.__threads_count)
+        task_config = []
+        remain = self.__count - (objs_per_thread * self.__threads_count)
+        first = self.__first
+        for thread in range(self.__threads_count):
+            remainder = min(remain, 1)
+            remain -= remainder
+            task_config.append((first, objs_per_thread + remainder))
+            first += (objs_per_thread + remainder)
+        return task_config
+
+    def start(self):
+        for th in self.__pool:
+            th.start()
+
+    def join(self):
+        for th in self.__pool:
+            th.join()
+
+
+class JobError(Exception):
+    def __init__(self, element_id, details):
+        self.__id = element_id
+        self.__details = details
+    def __str__(self):
+        return 'Error with object #%s (%s)' % (
+            self.__id,
+            self.__details)
+
+
+def build_ldif_file(first, count, factory, out):
+    '''LDIF generation job'''
+    for sub_id in range(count):
+        try:
+            ldif = factory.build_id(first + sub_id)
+        except Exception, e:
+            _ERR('Cannot build ldif object #%s' % sub_id)
+            raise JobError(sub_id, str(e))
+        try:
+            out.send(ldif)
+        except Exception, e:
+            _ERR('Send failed: %s' % str(e))
+            raise JobError(sub_id, str(e))
+
+
+if __name__ == '__main__':
+    # Setup logging
+    # At this point it's mandatory to get --log-prefix option
+    # so the only solution is a quick'n'dirty check
+    log_level = (logging.DEBUG if '--verbose' in sys.argv else logging.INFO)
+    PREFIX = ''
+    if '--log-prefix' in sys.argv:
+        try:
+            PREFIX = sys.argv[sys.argv.index('--log-prefix') + 1]
+        except:
+            _WRN('Cannot get LOG_PREFIX from command line!')
+    LOG_FILE = '%sldif_builder_PID%s.log' % (PREFIX, os.getpid())
+    LOG_DIR = os.path.dirname(LOG_FILE)
+    if LOG_DIR != '':
+        if not os.path.exists(LOG_DIR):
+            os.makedirs(LOG_DIR)
+    logging.basicConfig(filename=LOG_FILE, level=log_level)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _INF('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _INF('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    main()

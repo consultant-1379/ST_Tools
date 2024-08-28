@@ -1,0 +1,640 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services as rosetta_services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+env_name=''
+type_vnf=''
+list_vms=''
+user_config={}
+
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def compare_changes_vm_hypervisor (hypervisor_rebooted, vm_hypervisor_pre, vm_hypervisor_post):
+    _INF('Checking PRE configuration: %s ' %  vm_hypervisor_pre)
+    _INF('Checking POST configuration: %s ' %  vm_hypervisor_post)
+    _INF('Hypervisor rebooted: %s ' %  hypervisor_rebooted)
+    evacuation = False
+    hypervisor_orig = ''
+    vm_pl_name = ''
+    if 'Telco' in type_vnf:
+        _INF('Checking configuration after reboot for a Telco environment')
+        for key_pre,val_pre in vm_hypervisor_pre.items():
+            for key_post,val_post in vm_hypervisor_post.items():
+                if key_pre == key_post:
+                    if 'sc_' in key_pre:
+                        if 'TelcoPersist' in type_vnf:
+                        # Telco with External Persistent storage(SC is managed-on-host): SC's will remain in the same compute
+                            if val_pre == val_post:
+                                _INF('OK: VM "%s" has same hypervisor "%s" after reboot' % (key_pre, vm_hypervisor_post[key_post]))
+                            else:
+                                _ERR('VM "%s" has a new hypervisor after reboot: Before: "%s"   After: "%s"' % (key_pre, val_pre, vm_hypervisor_post[key_post]))
+                        else:
+                        # Telco without External Persistent storage(SC is ha-offline): SC's will move to another compute
+                            if val_pre == hypervisor_rebooted:
+                            # SC was affected by the hypervisor reboot
+                                if val_pre == vm_hypervisor_post[key_post]:
+                                    _ERR('VM "%s" has same hypervisor "%s" after reboot' % (key_pre, val_pre))
+                                else:
+                                    _INF('OK: VM "%s" has a new hypervisor after reboot: Before: "%s"   After: "%s"' % (key_pre, val_pre, val_post))
+                            else: # SC was not affected by the hypervisor reboot
+                                if val_pre == val_post:
+                                    _INF('OK: VM "%s" has same hypervisor "%s" after reboot' % (key_pre, val_pre))
+                                else:
+                                    _ERR('VM "%s" has a new hypervisor after reboot: Before: "%s"   After: "%s"' % (key_pre, val_pre, val_post))
+                    else:
+                    # Telco Environment : PL's always move to another compute
+                        if val_pre == hypervisor_rebooted:
+                            # PL was affected by the hypervisor reboot
+                            if val_pre == val_post:
+                                _ERR('VM "%s" has same hypervisor "%s" after reboot' % (key_pre, val_pre))
+                            else:
+                                _INF('OK: VM "%s" has a new hypervisor after reboot: Before: "%s"   After: "%s"' % (key_pre, val_pre, val_post))
+                        else: # PL was not affected by the hypervisor reboot
+                            if val_pre == val_post:
+                                _INF('OK: VM "%s" has same hypervisor "%s" after reboot' % (key_pre, val_pre))
+                            else:
+                                _ERR('VM "%s" has a new hypervisor after reboot: Before: "%s"   After: "%s"' % (key_pre, val_pre, val_post))
+
+                            evacuation = True
+                            hypervisor_orig = val_pre
+                            vm_pl_name = key_pre
+
+    # Enterprise type. Same hypervisor for all the VMs's
+    else:
+        _INF('Checking configuration after reboot for a Enterprise environment')
+        for key_pre,val_pre in vm_hypervisor_pre.items():
+            for key_post,val_post in vm_hypervisor_post.items():
+                if key_pre == key_post:
+                    if val_pre == val_post:
+                        _INF('OK: VM "%s" has same hypervisor "%s" after reboot' % (key_pre, val_pre))
+                    else:
+                        _ERR('VM "%s" has a different hypervisor after reboot: Before: "%s"   After: "%s"' % (key_pre, val_pre, val_post))
+    return evacuation, hypervisor_orig, vm_pl_name
+
+
+def get_pl_only_ldap_fee(fee_info):
+    current_pl = 'PL-'
+    ldap_pl = ''
+    for line in fee_info.splitlines():
+        if 'PL-' in line:
+            new_pl = line
+            if current_pl == ldap_pl:
+                return ldap_pl
+            current_pl = line
+        if 'ln_ldap_sc' in line:
+            ldap_pl = current_pl
+        if 'ln_raddia_sc' in line:
+            ldap_pl = ''
+        if 'ln_sig_sc' in line:
+            ldap_pl = ''
+    return ldap_pl
+
+
+def get_pl_not_ldap_fee(fee_info):
+    current_pl = 'PL-'
+    no_ldap_pl = ''
+    for line in fee_info.splitlines():
+        if 'PL-' in line:
+            new_pl = line
+            if current_pl == no_ldap_pl:
+                return no_ldap_pl
+            current_pl = line
+            no_ldap_pl = line
+        if 'ln_ldap_sc' in line:
+            no_ldap_pl = ''
+    return no_ldap_pl
+
+def show_free_computes(pod_name, vnf_name):
+        _INF('Showing free available computes for %s environment %s' % (type_vnf, env_name))
+        free_computes_info = ''
+        free_computes = rosetta_services.get_vnf_free_computes (pod_name, vnf_name)
+        if free_computes:
+            for compute_name in free_computes:
+               free_computes_info = free_computes_info + '\n\t' + compute_name
+            _INF('%s' % free_computes_info)
+        else:
+            _INF('Not free computes available for environment %s' % env_name)
+
+def wait_change_status_compute(pod_name, vnf_name, compute_name, c_state='down'):
+    init_time = time.time()
+    timeout = float(user_config.max_time)
+    _INF('Waiting until compute %s state changes to %s' % (compute_name,c_state))
+    while  True:
+        now = time.time()
+        time.sleep(float(1))
+        compute_state, compute_status = rosetta_services.get_vnf_compute_status (pod_name, vnf_name, compute_name)
+        if c_state in compute_state:
+            break
+        timeout -= time.time() - now
+        if timeout < 0:
+            error_info = 'Timeout waiting for Compute state %s' % c_state
+            _ERR(error_info)
+            quit_program(st_command.TIMEOUT, error_info)
+
+    change_time = now - init_time
+    return change_time
+
+
+def is_telco(type_vnf):
+    if 'Telco' in type_vnf:
+        return True
+    else:
+        return False
+
+def execute_live_migration (pod_name, vnf_name, vm_pl_name_migrate, hypervisor_migrate):
+
+    _INF('Executing Live Migration for % to hypervisor %s' % (vm_pl_name_migrate, hypervisor_migrate))
+    init_time = time.time()
+    if rosetta_services.vnf_live_migration (pod_name, vnf_name, hypervisor_migrate, vm_pl_name_migrate):
+        _INF('Waiting until migration is completed')
+        timeout = float(user_config.max_time)
+        while  True:
+            now = time.time()
+            time.sleep(float(1))
+            status = rosetta_services.get_hss_vnf_vms_status (pod_name, vnf_name, vm_pl_name_migrate)
+            if 'ACTIVE' in status:
+                break
+            timeout -= time.time() - now
+            if timeout < 0:
+                error_info = 'Timeout waiting for Live Migration'
+                _ERR(error_info)
+                quit_program(st_command.TIMEOUT, error_info)
+
+        _INF('Live Migration completed successfully. VM %s in status %s' % (vm_pl_name_migrate, status))
+        _INF('Live Migration lasted: %s ' % (now - init_time))
+
+    else:
+        error_info = 'ERROR when executing Live Migration for %s to the target %s' % (vm_pl_name_migrate, hypervisor_migrate)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+def reboot_vm_compute_node (compute_name):
+    evacuation = False
+    hypervisor_orig = ''
+    vm_pl_name = ''
+
+    pod_name = env_name.split('-')[0]
+    vnf_name = env_name.split('-')[1]
+    hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+
+    # Step 3: Check ha-policy used by VMs and the hosts (hypervisors)
+    vm_hypervisor_pre = {}
+    _INF('Showing information for %s environment %s before reboot' % (type_vnf, env_name))
+    show_params = ['status','ha-policy','hypervisor_id','hypervisor']
+    _INF('\n%s\n' % rosetta_services.display_hss_vnf_info(hss_vnf_data, list_vms, show_params))
+
+    vm_hypervisor_pre = {}
+    for key, vm in list_vms.items():
+        vm_info = rosetta_services.get_hss_vnf_info_params(hss_vnf_data, vm, ['hypervisor'])
+        vm_hypervisor_pre[vm] = vm_info.split()[1]
+
+
+    # Step 4: Check distribution of eVIP elements for Telco environments
+    if is_telco(type_vnf):
+        _INF('Multi compute (Telco) environment: Showing eVIP elements distribution:')
+        cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s --ip' % (user_config.NODE,
+		  	                         user_config.user, user_config.port)
+        TC.run_stFramework_command(cmd, check_result = True)
+
+    # Step 6: Check Diameter connections distribution for Telco environments
+        _INF('Multi compute (Telco) environment: Checking Diameter connections distribution')
+        cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE,
+                                                         user_config.user, user_config.port)
+        (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+        if output_code:
+            error_info = 'Error when executing command CBA_check_diacc_dump_json'
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    # Step 7: Check there are computes available in the avzone assigned to the VNF
+        show_free_computes(pod_name, vnf_name)
+
+
+    # Step 10: Rebooting the compute node
+    _INF('Rebooting the compute node %s ' % compute_name)
+    init_reboot = time.time()
+
+    answer = rosetta_services.vnf_reboot_compute (pod_name,vnf_name,compute_name)
+    _INF('%s' % answer)
+
+    time_wait = wait_change_status_compute(pod_name, vnf_name, compute_name, c_state='up')
+    end_reboot = time.time()
+    change_time = (end_reboot - init_reboot)
+    _INF('Compute %s changed to state "up" after %s seconds' % (compute_name,change_time))
+
+
+    # Step 11: waiting to the node to recover
+    timeout = user_config.max_time
+    _INF('Waiting %s seconds for system to recover' % timeout)
+    reload_time = TC.wait_for_node_reload(timeout, reconnect=True)
+    _INF('cluster reboot time: %s' % reload_time)
+    TC.release_node()
+    TC.connect_to_node()
+
+    # Step 12: Checking CM distribution after reboot
+    _INF('Showing information after reboot for %s environment %s' % (type_vnf, env_name))
+    hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+    show_params = ['status','ha-policy','hypervisor_id','hypervisor']
+    _INF('\n%s\n' % rosetta_services.display_hss_vnf_info(hss_vnf_data, list_vms, show_params))
+
+    vm_hypervisor_post = {}
+    for key, vm in list_vms.items():
+        vm_info = rosetta_services.get_hss_vnf_info_params(hss_vnf_data, vm, ['hypervisor'])
+        vm_hypervisor_post[vm] = vm_info.split()[1]
+
+    evacuation, hypervisor_orig, vm_pl_name = compare_changes_vm_hypervisor (compute_name, vm_hypervisor_pre, vm_hypervisor_post)
+
+    # Step 13: If EVACUATION, calculate the the time it takes to be running in the new compute
+    # Not implemented in the API
+
+    # Step 14: Check alarms both in CEE and HSS-FE
+    cee_alarms=rosetta_services.get_vnf_cee_list_alarms (pod_name)
+    if cee_alarms:
+        _INF('CEE alarms environment:\n%s' % cee_alarms)
+    else:
+        _INF('NO CEE alarms found')
+
+    # Step 15: Check distribution of eVIP elements and Check Diameter connections for Telco environments
+    if is_telco(type_vnf):
+        _INF('Multi compute (Telco) environment: Showing eVIP elements distribution after reboot')
+        cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s --ip' % (user_config.NODE, user_config.user, user_config.port)
+        TC.run_stFramework_command(cmd, check_result = True)
+
+        _INF('Multi compute (Telco) environment: Checking Diameter connections distribution after reboot')
+        cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE,
+                                                         user_config.user, user_config.port)
+        (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+        if output_code:
+            error_info = 'Error when executing command CBA_check_diacc_dump_json'
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    return evacuation, hypervisor_orig, vm_pl_name
+
+
+def main():
+    global TC
+    global env_name
+    global type_vnf
+    global list_vms
+    global user_config
+
+    evacuation = False
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+
+        TC.connect_to_node()
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        state=TC.controller_state('SC-1')
+        sc_standby = 'SC-1' if 'STANDBY' in state else 'SC-2'
+
+        _INF('Processors status')
+        TC.display_processors_state()
+
+        TC.start_alarm_monitoring()
+        TC.alarm_monitor.max_time_for_reconnection = user_config.max_time + 300
+
+        env, config = rosetta_services.get_env_for_localhost()
+        env_type = config.get_cabinet_type()
+        env_name = config.get_cabinet_name()
+        if (env_type != "VNF"):
+            error_info = 'Error: Environment %s is NOT VIRTUAL. This Test Case only applies to Virtual Environments' % env_name
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+        hypervisor_migrate = ''
+        vm_pl_name_migrate = ''
+
+        # Script to test TC's CROB-0702 and CROB-703
+        _INF('Environment %s is virtual. Rebooting a physical blade with Openstack commands' % env)
+        pod_name = env_name.split('-')[0]
+        vnf_name = env_name.split('-')[1]
+
+        rosetta_services.vnf_apis_rosetta()
+        hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+        list_vms = rosetta_services.get_hss_vnf_vms (hss_vnf_data)
+        type_vnf = rosetta_services.get_hss_vnf_type (hss_vnf_data,list_vms)
+
+        _INF('Showing NODES and VIRTUAL MACHINES association:')
+        TC.display_processors_vms(list_vms)
+
+        #######    Rebooting conmpute nodes for different type of VM's
+        # Rebooting conmpute node for STANDBY SC
+
+        node_uuid = TC.processor_uuid(sc_standby)
+        vm_standby = list_vms[node_uuid]
+        compute_name = rosetta_services.get_hss_vnf_hypervisor (hss_vnf_data,vm_standby)
+        _INF('##################################################################################')
+        _INF('REBOOT COMPUTE NODE %s (Standby SC %s is running)' % (compute_name, sc_standby))
+        _INF('##################################################################################')
+        reboot_vm_compute_node (compute_name)
+
+        # Rebooting conmpute node for PLs
+        # Step 16.1: Repeating the reboot for a PL VM where only FEES for LDAP are located
+        if is_telco(type_vnf):
+            _INF('Waiting %s seconds for next action' % user_config.wait_time)
+            time.sleep(float(user_config.wait_time))
+            _INF('Multi compute (Telco) environment: Checking PLs with ONLY LDAP FEEs')
+            cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s --ip' % (user_config.NODE,
+						user_config.user, user_config.port)
+            stdout, stderr, returncode = TC.run_stFramework_command(cmd, check_result = False)
+            if returncode:
+                error_info = 'Error when executing command CBA_get_FEE_eVIP_elements'
+                _ERR(error_info)
+                quit_program(st_command.EXECUTION_ERROR, stderr)
+
+            skip_evip_elements = True
+            pl_fe = get_pl_only_ldap_fee(stdout)
+            if pl_fe:
+                _INF('Rebooting compute for PL %s that has only ldap FEEs ' % pl_fe)
+                node_uuid = TC.processor_uuid(pl_fe)
+                vm_pl = list_vms[node_uuid]
+                _INF('Virtual machine for the node %s is %s' % (node_uuid,vm_pl))
+                compute_name = rosetta_services.get_hss_vnf_hypervisor (hss_vnf_data,vm_pl)
+                _INF('##################################################################################')
+                _INF('REBOOT COMPUTE NODE %s (%s with only ldap FEEs is running)' % (compute_name, pl_fe))
+                _INF('##################################################################################')
+                skip_evip_elements = False
+                evacuation, hypervisor_orig, vm_pl_name = reboot_vm_compute_node (compute_name)
+                if evacuation:
+                    hypervisor_migrate = hypervisor_orig
+                    vm_pl_name_migrate = vm_pl_name
+
+            else:
+                _INF('NOT PLs with only ldap FEEs')
+
+        # Step 16.2: Repeating the reboot for a PL VM where there are not FEES for LDAP
+            _INF('Waiting %s seconds for next action' % user_config.wait_time)
+            time.sleep(float(user_config.wait_time))
+            _INF('Multi compute (Telco) environment: Checking PLs  with NOT LDAP FEEs')
+            if not skip_evip_elements:
+                cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s --ip' % (user_config.NODE,
+							user_config.user, user_config.port)
+                stdout, stderr, returncode = TC.run_stFramework_command(cmd, check_result = False)
+                if returncode:
+                    error_info = 'Error when executing command CBA_get_FEE_eVIP_elements'
+                    _ERR(error_info)
+                    quit_program(st_command.EXECUTION_ERROR, stderr)
+
+            pl_fe = get_pl_not_ldap_fee(stdout)
+            if pl_fe:
+                _INF('Rebooting compute for PL %s that has not ldap FEEs ' % pl_fe)
+                node_uuid = TC.processor_uuid(pl_fe)
+                vm_pl = list_vms[node_uuid]
+                _INF('Virtual machine for the node %s is %s' % (node_uuid,vm_pl))
+                compute_name = rosetta_services.get_hss_vnf_hypervisor (hss_vnf_data,vm_pl)
+                _INF('##################################################################################')
+                _INF('REBOOT COMPUTE NODE %s (%s with NOT ldap FEEs is running)' % (compute_name, pl_fe))
+                _INF('##################################################################################')
+                evacuation, hypervisor_orig, vm_pl_name = reboot_vm_compute_node (compute_name)
+                if evacuation:
+                    hypervisor_migrate = hypervisor_orig
+                    vm_pl_name_migrate = vm_pl_name
+            else:
+                _INF('NOT PLs with NOT ldap FEEs')
+
+        # Step 16.3: Repeating the reboot for the conmpute node where the ACTIVE SC is running
+        _INF('Waiting %s seconds for next action' % user_config.wait_time)
+        time.sleep(float(user_config.wait_time))
+        TC.display_controllers_state()
+        state=TC.controller_state('SC-1')
+        sc_active = 'SC-1' if 'ACTIVE' in state else 'SC-2'
+
+        node_uuid = TC.processor_uuid(sc_active)
+        vm_active = list_vms[node_uuid]
+        _INF('Virtual machine for the node %s is %s' % (sc_active,vm_active))
+        compute_name = rosetta_services.get_hss_vnf_hypervisor (hss_vnf_data,vm_active)
+        _INF('##################################################################################')
+        _INF('REBOOT COMPUTE NODE %s (Active SC %s is running)' % (compute_name, sc_active))
+        _INF('##################################################################################')
+        reboot_vm_compute_node (compute_name)
+
+
+        # Step 17: Live migration th in CEE and HSS-FE
+        # Only applies to Telco systems
+        if is_telco(type_vnf) and evacuation:
+            _INF('Waiting %s seconds for next action' % user_config.wait_time)
+            time.sleep(float(user_config.wait_time))
+            if hypervisor_migrate:
+                _WRN('Live Migration for VM %s to hypervisor %s is NOT executed because it is not working on CEE 9.X versions' % (vm_pl_name_migrate,hypervisor_migrate))
+                ###_INF('Live Migration for VM %s to hypervisor %s' % (vm_pl_name_migrate,hypervisor_migrate))
+                ##execute_live_migration (pod_name, vnf_name, vm_pl_name_migrate, hypervisor_migrate)
+            else:
+                _INF('Looking for a hypervisor target')
+                target_hypervisors = rosetta_services.get_vnf_free_computes (pod_name, vnf_name)
+                _INF('TARGET HYPERVISORS: %s' % target_hypervisors)
+                if target_hypervisors:
+                    hypervisor_migrate = target_hypervisors[0].strip()
+                    _WRN('Live Migration for VM %s to hypervisor %s is NOT executed because it is not working on CEE 9.X versions' % (vm_pl_name_migrate,hypervisor_migrate))
+                    ###_INF('Live Migration for VM %s to hypervisor %s' % (vm_pl_name_migrate,hypervisor_migrate))
+                    ##execute_live_migration (pod_name, vnf_name, vm_pl_name_migrate, hypervisor_migrate)
+                else:
+                    _INF('Not hypervisors free to execute Live Migration')
+
+        _INF('Waiting %s seconds for next action' % user_config.wait_time)
+        time.sleep(float(user_config.wait_time))
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError as e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, hss_utils.rosetta.InfoNotFound) as e:
+        error_info = 'Error: %s. Use command line parameter -V' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.ROSETTA_ERROR,error_info)
+
+    except (hss_utils.rosetta.ActionFailure) as e:
+        error_info = 'Error when executing E3cloud action: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Execute a reboot for a compute node according the criteria for TC-CROB-0702',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-t', '--time',
+                        default=60, type=int, action='store', dest='wait_time',
+                        help='Waiting time for action. By default is "%(default)s"')
+
+    scenario_params.add_argument('--max_time',
+                        default=700, type=int, action='store', dest='max_time',
+                        help='Max time waiting for every single reboot. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_vnf_reboot_compute_node_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_vnf_reboot_compute_node_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        env, config = rosetta_services.get_env_for_localhost()
+        _INF('Environment  : %s' % env)
+        args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+        _INF('Node         :%s' % args.NODE)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)

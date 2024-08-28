@@ -1,0 +1,496 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+from datetime import datetime
+
+import ntpath
+import signal
+import textwrap
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+def no_log(*args, **kwargs):
+    pass
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+CWD = os.getcwd()
+def set_cwd(cwd):
+    global CWD
+    CWD = cwd
+
+DATA_MEM_FILE = os.path.join(CWD, 'free_memory.data')
+GIF_MEM_FILE = os.path.join(CWD, 'free_memory.gif')
+GNUPLOT_MEM_FILE = os.path.join(CWD, 'free_memory.cmd')
+GNUPLOT_MEM_LOOP = os.path.join(CWD, 'free_memory_loop_forever.cmd')
+DATA_CPU_FILE = os.path.join(CWD, 'cpu_load.data')
+GIF_CPU_FILE = os.path.join(CWD, 'cpu_load.gif')
+GNUPLOT_CPU_FILE = os.path.join(CWD, 'cpu_load.cmd')
+GNUPLOT_CPU_LOOP = os.path.join(CWD, 'cpu_load_loop_forever.cmd')
+
+def set_file_names():
+    global DATA_MEM_FILE
+    DATA_MEM_FILE = os.path.join(CWD, 'free_memory.data')
+    global GIF_MEM_FILE
+    GIF_MEM_FILE = os.path.join(CWD, 'free_memory.gif')
+    global GNUPLOT_MEM_FILE
+    GNUPLOT_MEM_FILE = os.path.join(CWD, 'free_memory.cmd')
+    global GNUPLOT_MEM_LOOP
+    GNUPLOT_MEM_LOOP = os.path.join(CWD, 'free_memory_loop_forever.cmd')
+    global DATA_CPU_FILE
+    DATA_CPU_FILE = os.path.join(CWD, 'cpu_load.data')
+    global GIF_CPU_FILE
+    GIF_CPU_FILE = os.path.join(CWD, 'cpu_load.gif')
+    global GNUPLOT_CPU_FILE
+    GNUPLOT_CPU_FILE = os.path.join(CWD, 'cpu_load.cmd')
+    global GNUPLOT_CPU_LOOP
+    GNUPLOT_CPU_LOOP = os.path.join(CWD, 'cpu_load_loop_forever.cmd')
+
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+NODE=None
+
+def quit_program(exit_code):
+    global NODE
+
+    if NODE is not None:
+        NODE.release()
+
+    cmd = 'ps -eaf | grep "gnuplot -noraise %s" | grep -v "grep" | awk \'{print $2}\' | xargs kill -9' % GNUPLOT_MEM_FILE
+    _DEB('Executing %s' % cmd)
+    stdout, stderr, returncode = st_command.execute_cmd(cmd ,stderr = True)
+
+    cmd = 'ps -eaf | grep "gnuplot -noraise %s" | grep -v "grep" | awk \'{print $2}\' | xargs kill -9' % GNUPLOT_CPU_FILE
+    _DEB('Executing %s' % cmd)
+    stdout, stderr, returncode = st_command.execute_cmd(cmd ,stderr = True)
+
+    try:
+        shutil.rmtree('/tmp/CBA_get_free_memory_%s' % os.getpid())
+    except Exception as e:
+        _WRN(str(e))
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def create_gnuplot_file(processors, user_config, cpu_load = False, gif = False, final_version = False):
+    if final_version:
+        gif = False
+    if cpu_load:
+        data_file = DATA_CPU_FILE
+        gif_file = GIF_CPU_FILE
+        label_message = 'CPU Load'
+    else:
+        data_file = DATA_MEM_FILE
+        gif_file = GIF_MEM_FILE
+        label_message = 'Free Memory'
+
+    output_gnuplot = '''set term %s
+set title "%s" noenhanced%s
+set ylabel "%% %s"
+set datafile separator ","
+set xdata time
+set timefmt "%%Y-%%m-%%d %%H:%%M:%%S"
+set format x "%%m-%%d %%H:%%M:%%S"
+set xtics rotate by -45
+set key outside
+set grid layerdefault
+set border 3
+plot''' % (('gif' if gif else 'x11 font "arial,15,italic"'),
+        user_config.NODE,
+        (('\nset output "%s"' % gif_file) if gif else ''),
+        label_message)
+
+    column = 2
+    color = range(2,124)
+    for processor in processors:
+        output_gnuplot += ' "%s" using 1:%s title "%s" noenhanced with lines lt %s,' % (data_file, column, processor, color[column])
+        column += 1
+
+    return output_gnuplot[:-1]
+
+
+def init_data_file(processors, cpu_load = False, append = False):
+    timestamp = '%s' % datetime.now()
+    output_data = '%s' % timestamp[:-7]
+    for processor in processors:
+        output_data += ',0.0'
+    _DEB('Initializing Data file %s for memory measures' % DATA_MEM_FILE)
+    with open(DATA_MEM_FILE, 'a' if append else 'w') as file:
+        file.write('%s\n' % output_data)
+    if cpu_load:
+        _DEB('Initializing Data file %s for CPU Load measures' % DATA_CPU_FILE)
+        with open(DATA_CPU_FILE, 'a' if append else 'w') as file:
+            file.write('%s\n' % output_data)
+
+
+def handle_gnuplot(user_config, processors, cpu_load = False, gif = False):
+    output_gnuplot = create_gnuplot_file(processors, user_config, cpu_load=cpu_load, gif=gif)
+
+    if cpu_load:
+        gnuplot_loop = GNUPLOT_CPU_LOOP
+        gnuplot_file = GNUPLOT_CPU_FILE
+    else:
+        gnuplot_loop = GNUPLOT_MEM_LOOP
+        gnuplot_file = GNUPLOT_MEM_FILE
+    _DEB('Handle gnuplot files %s and %s' % (gnuplot_loop, gnuplot_file))
+
+    if not gif:
+        output_gnuplot += '\nload "%s"\n' % gnuplot_loop
+        _DEB('Adding the loop to the gnuplot file %s' % gnuplot_file)
+
+        with open(gnuplot_loop, 'w') as file:
+            file.write('pause %s;replot;reread;' % user_config.refresh_time)
+
+    with open(gnuplot_file, 'w') as file:
+        file.write(output_gnuplot)
+
+    stdout, stderr, returncode = st_command.execute_cmd('chmod 755 %s %s' % (gnuplot_file, gnuplot_loop) ,stderr = True)
+
+    try:
+        if gif:
+            if not user_config.skip_plot:
+                cmd = 'ps -eaf | grep "gnuplot -noraise %s" | grep -v "grep" | awk \'{print $2}\' | xargs kill -9' % gnuplot_file
+                _INF('Executing %s' % cmd)
+                stdout, stderr, returncode = st_command.execute_cmd(cmd ,stderr = True)
+
+            cmd = 'gnuplot %s > /dev/null 2>&1' % gnuplot_file
+            _INF('Executing %s' % cmd)
+            os.system(cmd)
+
+            with open(gnuplot_file, 'w') as file:
+                file.write(create_gnuplot_file(processors, user_config, cpu_load=cpu_load, gif=False, final_version=True))
+
+            stdout, stderr, returncode = st_command.execute_cmd('chmod 755 %s' % gnuplot_file ,stderr = True)
+
+        elif not user_config.skip_plot:
+            cmd = 'gnuplot -noraise %s > /dev/null 2>&1 &' % gnuplot_file
+            _INF('executing %s' % cmd)
+            os.system(cmd)
+
+    except Exception as e:
+        _WRN('Problem starting gnuplot for memory measurements: %s' % e)
+
+
+def update_data_file(processors, info):
+    data_mem={}
+    data_cpu={}
+    cpu_info = False
+    for line in info.split('\n'):
+        if len(line):
+            if 'PROCESSOR' in line:
+                if 'CPU' in line:
+                    cpu_info = True
+                continue
+            processor=line.split()[0]
+            value=line.split()[1]
+            data_mem.update({processor:value})
+            if cpu_info:
+                value=line.split()[2]
+                data_cpu.update({processor:value})
+
+    timestamp = '%s' % datetime.now()
+
+    output ='%s' % timestamp[:-7]
+    for processor in processors:
+        try:
+            output += ',%s' % data_mem[processor]
+        except KeyError:
+            _WRN('Data for %s processor not found. Set value to 0.0' % processor)
+            output += ',0.00'
+
+    output += ' \n'
+    with open(DATA_MEM_FILE, 'a') as file:
+        file.write(output)
+
+    if cpu_info:
+        output ='%s' % timestamp[:-7]
+        for processor in processors:
+            try:
+                output += ',%s' % data_cpu[processor]
+            except KeyError:
+                _WRN('Data for %s processor not found. Set value to 0.0' % processor)
+                output += ',0.00'
+
+        output += ' \n'
+        with open(DATA_CPU_FILE, 'a') as file:
+            file.write(output)
+
+
+def main():
+
+    global NODE
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                     'port':user_config.port,
+                     'user':user_config.user}
+    connections = {}
+    try:
+        if st_command.get_ip(user_config.NODE) is None:
+            _ERR('Node value %s is not valid' % user_config.NODE)
+            quit_program(st_command.WRONG_PARAMETER)
+
+        NODE = hss_utils.node.cba.Cba(config = access_config)
+        allowed_processors = ['SC-1', 'SC-2'] + NODE.processors
+        processors = []
+        if  user_config.processors is None:
+            processors = allowed_processors
+        else:
+            for processor in user_config.processors:
+                if processor not in allowed_processors:
+                    _ERR('Processor %s not valid. Allowed values are: %s' % (processor, ' '.join(allowed_processors)))
+                    quit_program(WRONG_PARAMETER)
+
+            processors = user_config.processors
+
+
+    except connection.Unauthorized as e: 
+        _ERR('Error: %s' % e)
+        quit_program(AUTHENTICATION_ERROR)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        _ERR('Error: %s' % e)
+        quit_program(CONNECTION_ERROR)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        _ERR('Error: %s' % e)
+        quit_program(CONNECTION_ERROR)
+
+    init_data_file(processors, user_config.cpu_load)
+    handle_gnuplot(user_config, processors, cpu_load = False, gif = False)
+    if user_config.cpu_load:
+        handle_gnuplot(user_config, processors, cpu_load = True, gif = False)
+
+    print '\n Starting Monitoring'
+    while(True):
+        try:
+            if user_config.cpu_load:
+                cmd = 'run_command_node CBA_get_free_memory --node %s --user %s --cpu_load -v -o /tmp/CBA_get_free_memory_%s' % (user_config.NODE, user_config.user, os.getpid())
+            else:
+                cmd = 'run_command_node CBA_get_free_memory --node %s --user %s -v -o /tmp/CBA_get_free_memory_%s' % (user_config.NODE, user_config.user, os.getpid())
+            _DEB('Executing %s' % cmd)
+            stdout, stderr, returncode = st_command.execute_cmd('%s' % cmd ,stderr = True)
+
+            if returncode == 0:
+                update_data_file(processors, stdout)
+                time.sleep(float(user_config.capture_time))
+
+            elif user_config.keep_on_fail:
+                _WRN('Problem reading memory/cpu info. Set values to zero')
+                init_data_file(processors, user_config.cpu_load, append=True)
+                time.sleep(float(user_config.capture_time))
+
+            else:
+                error_info = st_command.get_stFramework_error_message(stderr)
+                if error_info is None:
+                    _ERR('Error: For more info execute manually "CBA_get_free_memory %s --user %s -v"' % (user_config.NODE, user_config.user))
+                else:
+                    _ERR('Error: %s' % error_info)
+
+                quit_program(EXECUTION_ERROR)
+
+
+
+        except KeyboardInterrupt:
+            _DEB('Monitoring stopped by user!')
+            print '\n Monitoring stopped by user!'
+            handle_gnuplot(user_config, processors, cpu_load=False, gif=True)
+            if user_config.cpu_load:
+                handle_gnuplot(user_config, processors, cpu_load=True, gif=True)
+
+            quit_program(SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Monitor memory usage on CBA and optionally also the cpu load. By default all the PL and SC are used',
+                        epilog=textwrap.dedent(get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--user',
+                        action='store', default='com-emergency',
+                        help='User for ssh. Default value is "com-emergency" ',
+                        dest='user')
+
+    access_params.add_argument('--port',
+                        action='store', default=22,
+                        help='Port used in ssh. Default value is 22',
+                        dest='port')
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('--cpu-load',
+                        default=False, action='store_true', dest='cpu_load',
+                        help='Optional parameter to get also cpu load data. Default: %(default)s')
+
+    scenario_params.add_argument('-t', '--time',
+                        default=10, action='store', dest='capture_time',
+                        help='Timer in seconds for getting new data. Default: %(default)s')
+
+    scenario_params.add_argument('-r', '--refresh',
+                        default=15, action='store', dest='refresh_time',
+                        help='Timer in seconds for replotting graph. Default: %(default)s')
+
+    scenario_params.add_argument('-p', '--processors', nargs='+',
+                        default=None, action='store', dest='processors',
+                        help='List of processors')
+
+    scenario_params.add_argument('--set-working-path',
+                      action='store', default=CWD,
+                      help='Set specific working path. By default is "%(default)s"',
+                      dest='working_path')
+
+    scenario_params.add_argument('-s', '--skip-real-time-plot',
+                      action='store_true', default=False,
+                      help='Do not plot graph during execution',
+                      dest='skip_plot')
+
+    scenario_params.add_argument('-k', '--keep_on_fail',
+                      action='store_true', default=False,
+                      help='Keep working even if there are problem reading memory data from cabinet',
+                      dest='keep_on_fail')
+
+    logging=e3utils.log.add_logging_options(parser)
+    logging.add_argument('--log-path',
+                        default=None, action='store', dest='log_path',
+                        help='Set an specific path for tool logs. Default is "%s"' % CWD)
+
+    args = parser.parse_args()
+
+    if args.log_path is not None and args.log_file is not None:
+        _ERR('Error: --log_file and --log_path can not be used at the same time' )
+        quit_program(ROSETTA_ERROR)
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_memory_monitor_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_path is None:
+        args.log_path = CWD
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(args.log_path, 'CBA_memory_monitor_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.working_path != CWD:
+        set_cwd(args.working_path)
+        set_file_names()
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable) as e:
+            _ERR('Error: %s. Use command line parameter --node' % e)
+            quit_program(ROSETTA_ERROR)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % e)
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

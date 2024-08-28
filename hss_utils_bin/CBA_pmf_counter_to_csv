@@ -1,0 +1,351 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+import xml.etree.ElementTree as ET
+import glob
+
+
+import ntpath
+import signal
+import textwrap
+import socket
+import getpass
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+
+NODE = None
+WORKING_DIRECTORY = None
+
+def quit_program(exit_code):
+    global NODE
+
+    if NODE is not None:
+         _INF('Release NODE: %s' % NODE)
+         NODE.release()
+
+    if WORKING_DIRECTORY is not None and os.path.exists(WORKING_DIRECTORY):
+        _INF('Remove working directory: %s' % WORKING_DIRECTORY)
+        shutil.rmtree(WORKING_DIRECTORY)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+def main():
+
+    global NODE
+    global WORKING_DIRECTORY
+    user_config = parse_commandline()
+
+    start_download = time.time()
+    WORKING_DIRECTORY = '/opt/hss/CBA_pmf_counters_to_csv_%s' % os.getpid()
+    if not os.path.exists(WORKING_DIRECTORY):
+        os.makedirs(WORKING_DIRECTORY)
+
+    if st_command.validate_ip(user_config.INPUT,IPv6=False):
+        try:
+            NODE = hss_utils.node.cba.Cba(config = {'host':user_config.INPUT,
+                                                    'port':user_config.port,
+                                                    'user':user_config.user})
+
+            main_path = '/storage/no-backup/com-apr9010443/PerformanceManagementReportFiles'
+
+            _INF('Download input files to %s' % WORKING_DIRECTORY)
+            NODE.download('%s/*.xml.gz' % main_path, WORKING_DIRECTORY)
+            download_time = time.time() - start_download
+            _INF('Download time %s seconds' % download_time)
+
+        except connection.Unauthorized, e:
+            _ERR('Error: %s' % str(e))
+            quit_program(AUTHENTICATION_ERROR)
+
+        except connection.ConnectionFailed, e:
+            _ERR('Error: %s' % str(e))
+            quit_program(CONNECTION_ERROR)
+
+        except connection.ConnectionTimeout, e:
+            _ERR('Error: %s' % str(e))
+            quit_program(TIMEOUT)
+
+        except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF), e:
+            _ERR('Error: %s' % str(e))
+            quit_program(TIMEOUT)
+
+        except Exception, e:
+            _ERR('Error: %s' % str(e))
+            quit_program(IMPLEMENTATION_ERROR)
+
+    else:
+        if not os.path.exists(user_config.INPUT):
+            _ERR('Wrong --input value: %s' % user_config.INPUT)
+            quit_program(WRONG_PARAMETER)
+
+        cmd = 'cp %s/*.xml.gz %s' % (user_config.INPUT, WORKING_DIRECTORY)
+        stdout_value, returncode = st_command.execute_cmd(cmd)
+        if returncode:
+            _ERR('Error executing: %s' % cmd)
+            quit_program(EXECUTION_ERROR)
+
+    cmd = 'gzip -d %s/*.xml.gz' % WORKING_DIRECTORY
+    stdout_value, returncode = st_command.execute_cmd(cmd)
+    if returncode:
+        _ERR('Error executing: %s' % cmd)
+        quit_program(EXECUTION_ERROR)
+
+    file_list= sorted(glob.glob("%s/*" % WORKING_DIRECTORY))
+
+    start_parsing = time.time()
+    measInfo_dict = {}
+    timestamp_dict = {}
+    num_files = len(file_list)
+    _INF('Parsing %s input files' % num_files)
+    in_counter = 0
+    for element in file_list:
+        now = time.time()
+        in_counter += 1
+        _INF('\tParsing file %s (%s out of %s)' % (element.split('/')[-1], in_counter, num_files))
+
+        tree = ET.parse(element)
+        root = tree.getroot()
+
+        md = root.find('{http://www.3gpp.org/ftp/specs/archive/32_series/32.435#measCollec}measData')
+        for mi in md.findall('{http://www.3gpp.org/ftp/specs/archive/32_series/32.435#measCollec}measInfo'): 
+            measType_dict = {}
+            measInfoId = mi.attrib['measInfoId']
+            try:
+                tmp = measInfo_dict[measInfoId]
+            except KeyError:
+                measInfo_dict.update({measInfoId:{'':[]}})
+
+            granPeriod = mi.find('{http://www.3gpp.org/ftp/specs/archive/32_series/32.435#measCollec}granPeriod')
+            timestamp = granPeriod.attrib['endTime'].split('+')[0]
+            date_stamp = timestamp.split('T')[0]
+            date_stamp = date_stamp.replace('-','/')
+            time_hour=timestamp.split('T')[1]
+            hour=time_hour.split(':')[0]
+            minute=time_hour.split(':')[1]
+            new_timestamp=('%s-%s:%s' %(date_stamp,hour,minute))
+
+            for measType in mi.findall('{http://www.3gpp.org/ftp/specs/archive/32_series/32.435#measCollec}measType'):
+                name = measType.text
+                attr = measType.attrib
+                measType_dict.update({measType.attrib['p']: measType.text})
+
+            for measValue in mi.findall('{http://www.3gpp.org/ftp/specs/archive/32_series/32.435#measCollec}measValue'):
+                key_suffix = '%s' %measValue.attrib['measObjLdn']
+                key_suffix = key_suffix.replace(',',';')
+                for r in measValue.findall('{http://www.3gpp.org/ftp/specs/archive/32_series/32.435#measCollec}r'):
+                    key_prefix = r.attrib['p']
+                    try:
+                        key = '%s,%s,%s' % (new_timestamp, measType_dict[key_prefix], key_suffix)
+                        measInfo_dict[measInfoId][key] = [int(r.text)]
+                    except KeyError:
+                        measInfo_dict[measInfoId].update({key:[int(r.text)]})
+
+
+    _INF('Parsing time %s seconds' % (time.time() - start_parsing))
+
+    _INF('Generating output files')
+    if not os.path.exists(user_config.output_dir):
+        os.makedirs(user_config.output_dir)
+    out_counter = 0
+    start_generating = time.time()
+    for measInfoId in sorted (measInfo_dict):
+        now = time.time()
+        out_counter += 1
+        with open("%s/%s_CSV_DATA.csv" % (user_config.output_dir, measInfoId), "w") as text_file:
+            header = 'Date,Counter,Counter detail,Value'
+            text_file.write('%s\n' % header)
+            for key in sorted (measInfo_dict[measInfoId]):
+                if key == '':
+                    continue
+                text_str = ''
+                text_str += '%s,' % key
+                if len(measInfo_dict[measInfoId][key]) > 0:
+                    value = measInfo_dict[measInfoId][key][0]
+                    text_str += '%s' % value
+                else:
+                    _INF('Not value for this counter')
+                    text_str += ' '
+
+                text_file.write('%s\n' % (text_str))
+
+    _INF('Generating time %s seconds' % (time.time() - start_generating))
+    _INF('Total time: %s seconds' % (time.time() - start_download))
+    _INF('\tInput  files %s ' % in_counter)
+    _INF('\tOutput files %s ' % out_counter)
+
+
+    quit_program(SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+
+            formatter_class=argparse.RawTextHelpFormatter,
+            description=textwrap.dedent('''\
+Convert pmf counters data file for a CBA cluster to csv files
+The origin of pmf files can be:
+    NODE      tool will connect to, collect and process the files
+    PATH      tool will just process the files
+''') ,
+                        epilog=textwrap.dedent(get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-i','--input',
+                        action='store', default=None,
+                        help='''For NODE: OAM IP address of the node. If ommitted local hostname will be used to find env in rosetta
+For PATH: Full local path where counters files are stored
+ ''',
+                        dest='INPUT')
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh. Default: %(default)s',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh. Default: %(default)s',
+                      dest='user')
+
+    behaviour_params = parser.add_argument_group('Toool behaviour configuration')
+    behaviour_params.add_argument('-o', '--output',
+                      action='store', default=CWD,
+                      help='Specify the output directory. Default %s' % CWD,
+                      dest='output_dir')
+
+    logging=e3utils.log.add_logging_options(parser)
+    logging.add_argument('--log-path',
+                        default=None, action='store', dest='log_path',
+                        help='Set an specific path for tool logs. Default is "%s"' % CWD)
+
+    args = parser.parse_args()
+
+    if args.log_path is not None and args.log_file is not None:
+        _ERR('Error: --log_file and --log_path can not be used at the same time' )
+        quit_program(ROSETTA_ERROR)
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_pmf_counter_to_csv_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_path is None:
+        args.log_path = CWD
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(args.log_path, 'CBA_pmf_counter_to_csv_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.INPUT is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.INPUT = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.INPUT)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+            _ERR('Error: %s. Use command line parameter --input' % str(e))
+            quit_program(ROSETTA_ERROR)
+
+    return (args)
+
+
+if __name__ == '__main__':
+
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user with Ctrl-c')
+        quit_program(SUCCESS)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(SUCCESS)
+
+
+

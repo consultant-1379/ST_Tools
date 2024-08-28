@@ -1,0 +1,474 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+
+import os
+import errno
+import sys
+import copy
+import hashlib
+import argparse
+import textwrap
+import string
+import subprocess
+import traceback
+import getpass
+import pexpect
+import socket
+import json
+
+HOSTNAME = socket.gethostname()
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+CWD = os.getcwd()
+import hss_utils.st_command as st_command
+import hss_utils.node.gentraf
+import hss_utils.connection as connection
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+100: 'Implementation error'
+    }
+
+# Exit status
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+IMPLEMENTATION_ERROR = 100
+
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+
+GENTRAF=None
+def quit_program(exit_code):
+
+    if GENTRAF is not None:
+        GENTRAF.release()
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+GIT_PATH = None
+def set_git_path(path):
+    global GIT_PATH
+    GIT_PATH= path
+    _INF("GIT_PATH: %s " % GIT_PATH)
+
+BUILD_PATH = None
+def set_build_path(path):
+    global BUILD_PATH
+    BUILD_PATH= path
+    _INF("BUILD_PATH: %s " % BUILD_PATH)
+
+PRJ_PATH = None
+def set_prj_path(path):
+    global PRJ_PATH
+    PRJ_PATH = path
+    _INF("PRJ_PATH: %s " % PRJ_PATH)
+
+OUTPUT_PATH = None
+def set_output_path(path):
+    global OUTPUT_PATH
+    OUTPUT_PATH = path
+    _INF("OUTPUT_PATH: %s " % OUTPUT_PATH)
+
+TARGET = ''
+def set_target(target):
+    global TARGET
+    TARGET = os.path.basename(target)
+
+
+def parse_prj_file(filename):
+    files=[]
+    groups=[]
+
+    with open(filename, 'r') as fd:
+        for line in fd.readlines():
+
+            if 'File path' in line:
+                path = line.split('"')
+                files.append(os.path.join(PRJ_PATH, path[1]))
+
+            if 'File_Group path' in line:
+                path = line.split('"')
+                groups.append(os.path.join(PRJ_PATH, path[1]))
+
+            if 'Executable_Path' in line:
+                line = string.replace(line.strip(),'<Executable_Path>','')
+                line = string.replace(line,'</Executable_Path>','')
+                set_target(line)
+
+    return files, groups
+
+
+def get_file_from_group(groups):
+    files=[]
+    new_groups=[]
+
+    for group in groups:
+        file_path=os.path.dirname(group)
+        if os.path.isfile(group) == False:
+            _ERR('***  %s file not found' % group)
+            sys.exit(-1)
+
+        with open(group, 'r') as fd:
+            for line in fd.readlines():
+
+                if 'File path' in line:
+                    path = line.split('"')
+                    files.append(os.path.join(file_path,path[1]))
+
+                if 'File_Group path' in line:
+                    path = line.split('"')
+                    new_groups.append(os.path.join(file_path, path[1]))
+
+    return files, new_groups
+
+def create_symlinks(file_list):
+    for element in file_list:
+        cmd = 'ln -sf %s .' % element
+        _INF('Executing: %s' % cmd)
+        stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True, cwd=BUILD_PATH)
+        if returncode:
+            _ERR(stderr_value)
+            quit_program(EXECUTION_ERROR)
+
+
+def create_makefile(file_list):
+
+    command = '''$TTCN3_DIR/bin/ttcn3_makefilegen -f -p -g -e '%s' ''' % os.path.join(BUILD_PATH, TARGET)
+    for element in file_list:
+        command += ''''%s' ''' % os.path.basename(element)
+
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd=BUILD_PATH)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+def update_makefile():
+
+    command = 'rm -f Makefile.tmp'
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd=BUILD_PATH)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    command = '%s/HSS_Traffic_Makefile_patch.sh Makefile Makefile.tmp' % PRJ_PATH
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd=BUILD_PATH)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    fd = open(os.path.join(BUILD_PATH,'Makefile.tmp'),'a')
+    fd.write("\ninstall: $(TARGET)\n")
+    fd.write("\tmkdir -p ${DESTDIR}/${ST_TOOL_PATH}/bin\n")
+    fd.write("\tcp $(TARGET) ${DESTDIR}/${ST_TOOL_PATH}/bin\n")
+    fd.write("\tcp %s/scripts/* ${DESTDIR}/${ST_TOOL_PATH}/bin\n" % GIT_PATH)
+    fd.write("\tmkdir -p ${DESTDIR}/${ST_TOOL_PATH}/share/BAT\n")
+    fd.write("\tcp -r %s/cfg/* ${DESTDIR}/${ST_TOOL_PATH}/share/BAT\n" % GIT_PATH)
+
+    fd.close()
+
+    command = 'mv -f Makefile.tmp Makefile'
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd=BUILD_PATH)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+def check_Makefile():
+    command = 'grep "DESTDIR" ~/GIT_repos/ST_BAT/build/Makefile'
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd=BUILD_PATH)
+    if returncode:
+        _ERR('Makefile not valid for debian packaging')
+        quit_program(EXECUTION_ERROR)
+
+
+def get_channel():
+    global GENTRAF
+    if not GENTRAF:
+        config = {'host':HOSTNAME, 'user' : getpass.getuser()}
+
+        try:
+            GENTRAF = hss_utils.node.gentraf.GenTraf(config)
+            GENTRAF.working_dir = BUILD_PATH
+        except connection.Unauthorized, e: 
+            _ERR('Error: %s' % str(e))
+            quit_program(AUTHENTICATION_ERROR)
+
+        except (connection.ConnectionTimeout, connection.ConnectionFailed), e: 
+            _ERR('Error: %s' % str(e))
+            quit_program(CONNECTION_ERROR)
+
+    return GENTRAF.get_channel()
+
+def compile_bat(core):
+    command = 'grep "#if GCC_VERSION < 40800" /opt/titan/5/R3A/include/cversion.h | wc -l'
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd=BUILD_PATH)
+    if returncode:
+        _ERR('Problem checking /opt/titan/5/R3A/include/cversion.h file')
+        quit_program(EXECUTION_ERROR)
+
+    if int(stdout_value.strip()) != 1:
+        _ERR('Wrong syntax in  /opt/titan/5/R3A/include/cversion.h file')
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'make -j%s' % core
+    _INF('Executing: %s' % cmd)
+
+    channel = get_channel()
+    channel.write_line(cmd)
+    while (True):
+        try:
+
+            result = channel.expect([GENTRAF.get_sync_expression(),
+                                    '\n'])
+
+            if result == 0:
+                _INF('BAT compilation finished')
+                break
+
+            if result == 1:
+                _DEB('  %s' % channel.stdout)
+
+        except pexpect.TIMEOUT, e:
+            continue
+
+        except pexpect.EOF, e:
+            _ERR('EOF received when executing "%s"' % cmd)
+            quit_program(EXECUTION_ERROR)
+
+def pack_bat():
+    cmd = 'rm -rf debian'
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True, cwd=BUILD_PATH)
+    if returncode:
+        _ERR('Problem moving debian info to %s' % BUILD_PATH)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'cp -r ../debian .'
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True, cwd=BUILD_PATH)
+    if returncode:
+        _ERR('Problem moving debian info to %s' % BUILD_PATH)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'dpkg-buildpackage -b -d -nc'
+    _INF('Executing: %s' % cmd)
+
+    channel = get_channel()
+    channel.write_line(cmd)
+    pack=None
+    while (True):
+        try:
+
+            result = channel.expect([GENTRAF.get_sync_expression(),
+                                    '\n'])
+
+            if result == 0:
+                _INF('Debian package creation finished')
+                break
+
+            if result == 1:
+                if 'building package' in channel.stdout:
+                    pack = channel.stdout.split()[-1][4:-2]
+                _DEB('  %s' % channel.stdout)
+
+        except pexpect.TIMEOUT, e:
+            continue
+
+        except pexpect.EOF, e:
+            _ERR('EOF received when executing "%s"' % cmd)
+            quit_program(EXECUTION_ERROR)
+
+    if not pack:
+        _ERR('Problem generating debian package')
+        quit_program(EXECUTION_ERROR)
+
+    _INF('Debian package generated: %s' % pack)
+    cmd = 'mv %s %s' % (os.path.join(GIT_PATH,pack.replace('deb','*')), OUTPUT_PATH)
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    return pack
+
+
+def main():
+
+    user_config = parse_command_line()
+
+    files, groups=parse_prj_file(user_config.prj_file)
+
+    while (len(groups) != 0):
+        temp_files, groups = get_file_from_group(groups)
+        files += temp_files
+
+    if not os.path.exists(BUILD_PATH):
+        os.makedirs(BUILD_PATH)
+
+    if user_config.symb_links:
+        create_symlinks(files)
+
+    if user_config.makefile:
+        create_makefile(files)
+        update_makefile()
+
+    if user_config.compile:
+        compile_bat(user_config.core)
+
+    if user_config.pack:
+        pack_bat()
+
+    quit_program(SUCCESS)
+
+
+def parse_command_line():
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawTextHelpFormatter,
+                        description=textwrap.dedent('''\
+                            Compile and/or generate a debian package for HSS BAT
+
+Add the following parameters for executing:
+
+    -s      Create symbolic links for files included in prj
+    -m      Create Makefile for BAT compilitation
+    -c      Compile BAT
+    -p      Create a debian package for BAT
+    
+                            '''),
+            epilog=textwrap.dedent(get_exit_status()))
+
+    parser.add_argument('--git-path',
+                        default='$GIT_PATH/ST_BAT', action='store', dest='git_path',
+                        help='Full path for the ST_BAT GIT repository. By default is "%(default)s"')
+
+    parser.add_argument('--prj',
+                      action='store', default='HSSTraffic_64.prj',
+                      help='Set the project file name. By default is "%(default)s"',
+                      dest='prj_file')
+
+    parser.add_argument('-j',type=int, 
+                      action='store', default=8,
+                      help='Set number of cores for compilation. By Default is %(default)s',
+                      dest='core')
+
+    parser.add_argument('-o', '--output',
+                      action='store', default=None,
+                      help='Specify the output directory. Default %s' % CWD,
+                      dest='output_dir')
+
+    action_params = parser.add_argument_group('Define actions to be done.')
+    action_params.add_argument('-s', '--symb_links',
+                      action='store_true', default=False,
+                      help='Create symbolic links for files included in prj.',
+                      dest='symb_links')
+
+    action_params.add_argument('-m', '--makefile',
+                      action='store_true', default=False,
+                      help='Create Makefile for BAT compilitation.',
+                      dest='makefile')
+
+    action_params.add_argument('-c', '--compile',
+                      action='store_true', default=False,
+                      help='Compile BAT.',
+                      dest='compile')
+
+    action_params.add_argument('-p', '--pack',
+                      action='store_true', default=False,
+                      help='Create a debian package for BAT.',
+                      dest='pack')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    if args.output_dir is not None and args.log_file is not None:
+        _ERR('Error: --log_file and -o can not be used at the same time' )
+        quit_program(WRONG_PARAMETER)
+
+    e3utils.log.CONSOLE_PREFIX='(cnHSS_BAT_Builder_PID%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if not args.output_dir:
+        args.output_dir = CWD
+    set_output_path(st_command.real_path(args.output_dir))
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(OUTPUT_PATH, 'cnHSS_BAT_Builder_PID%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    set_git_path(st_command.real_path(args.git_path))
+    set_prj_path(os.path.join(GIT_PATH,'prj'))
+    args.prj_file = os.path.join(PRJ_PATH,args.prj_file)
+    if os.path.isfile(args.prj_file) == False:
+        _ERR('%s file not found' % args.prj_file)
+        quit_program(WRONG_PARAMETER)
+
+    set_build_path(os.path.join(GIT_PATH,'build'))
+
+    return (args)
+
+
+if __name__ == '__main__':
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        sys.exit(-1)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        sys.exit(-1)
+
+
+

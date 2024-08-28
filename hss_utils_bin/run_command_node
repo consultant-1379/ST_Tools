@@ -1,0 +1,403 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import traceback
+import argparse
+import re
+import urllib2
+import tempfile
+
+import hss_utils.node
+import hss_utils.node.tsp
+import hss_utils.node.cba
+import hss_utils.node.gentraf
+import hss_utils.node.cudb
+import hss_utils.node.gtla
+import hss_utils.node.dummynet
+import hss_utils.node.cloud
+
+import hss_utils.connection as connection
+import hss_utils.st_command
+import hss_utils.st_command.tsp
+import hss_utils.st_command.cba
+import hss_utils.st_command.gentraf
+import hss_utils.st_command.cudb
+import hss_utils.st_command.gtla
+import hss_utils.st_command.dummynet
+import hss_utils.st_command.cloud
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+COMMAND = ''
+
+EXIT_CODE = 0
+
+NODE=None
+
+def quit_program(exit_code,message=''):
+    global NODE
+
+    if NODE is not None:
+        try:
+            NODE.release()
+        except Exception, e:
+            _DEB('Problem during release node: %s' % str(e))
+
+    if message != '':
+        _DEB('stFramework_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, hss_utils.st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def set_config_Node(user_config, key, extdb_type='GTLA'):
+
+    if user_config.NODE is None:
+        _DEB('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _DEB('Environment   : %s' % env)
+            if key in ['oam_vip']:
+                user_config.NODE = config.get_cabinet_oam_vip(cabinet=0)
+
+            elif key in ['scxb']:
+                user_config.NODE = config.get_cabinet_scxb(cabinet=0)
+
+            elif key in ['io2']:
+                user_config.NODE = config.get_cabinet_cc2(cabinet=0)
+
+            elif key in ['oam']:
+                user_config.NODE = config.get_extdb_oam_ip(extdb=0, extdb_type=extdb_type)
+
+            _DEB('%-*s: %s' % (14, key,user_config.NODE))
+
+        except (hss_utils.rosetta.InfoNotFound, hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, KeyError), e:
+            _DEB('Error: %s' % str(e))
+            quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+
+def set_dummynet_info(user_config):
+    if not user_config.NODE and not user_config.traffic_type:
+            _DEB('Error: For dummynet at least one of these parameters shall be provided: --node or --traffic_type')
+            quit_program(hss_utils.st_command.WRONG_PARAMETER)
+
+    if user_config.NODE and user_config.traffic_type:
+        return
+
+    try:
+        env, config = hss_utils.rosetta.services.get_env_for_localhost()
+        _DEB('Environment  : %s' % env)
+    except (hss_utils.rosetta.InfoNotFound, hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, KeyError), e:
+        _DEB('Error: %s' % str(e))
+        quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+    if user_config.NODE:
+        try:
+            user_config.traffic_type = config.get_dummynet_traffic_type_by_name(user_config.NODE)
+            if not user_config.traffic_type:
+                _DEB('Error: traffic type for %s not found' % user_config.NODE)
+                quit_program(hss_utils.st_command.ROSETTA_ERROR)
+        except (hss_utils.rosetta.InfoNotFound, hss_utils.rosetta.RosettaUnavailable, KeyError), e:
+            _DEB('Error trying to fetch traffic type for %s : %s' % (user_config.NODE, str(e)))
+            quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+    else:
+        try:
+            user_config.NODE = config.get_dummynet_name_by_traffic_type(user_config.traffic_type)
+            if not user_config.NODE:
+                _DEB('Error: Dummynet for %s traffic type not found' % user_config.traffic_type)
+                quit_program(hss_utils.st_command.ROSETTA_ERROR)
+
+        except (hss_utils.rosetta.InfoNotFound, hss_utils.rosetta.RosettaUnavailable, KeyError), e:
+            _DEB('Error trying to fetch dummynet for %s : %s' % (user_config.traffic_type, str(e)))
+            quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+
+
+def set_cloud_info(user_config):
+    access_config = {}
+    if user_config.eccd_type is None:
+        _DEB('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _DEB('Environment  : %s' % env)
+            user_config.eccd_type = config.get_eccd_type()
+        except (hss_utils.rosetta.InfoNotFound, hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, KeyError) as e:
+            _DEB('Error: %s' % str(e))
+            quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+        except hss_utils.rosetta.InfoNotFound as e:
+            _DEB('Error: %s. The TG shall belong to a cloud environment that is well configured in Rosetta' % str(e))
+            quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+
+    if user_config.eccd_type == 'ANS':
+        if not user_config.kubeconfig:
+            try:
+                credential_file = os.path.join(hss_utils.st_command.real_path(hss_utils.node.cloud.ANS_CREDENTIAL_PATH),
+                                        '%s.conf' % config.get_eccd_name())
+            except hss_utils.rosetta.InfoNotFound as e:
+                _DEB('Error: %s. The TG shall belong to a cloud environment that is well configured in Rosetta' % str(e))
+                quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+            if not os.path.isfile(credential_file):
+                cmd = 'mkdir -p %s' % hss_utils.st_command.real_path(hss_utils.node.cloud.ANS_CREDENTIAL_PATH)
+                stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                if returncode:
+                    _DEB('Error: %s' % stderr_value)
+                    quit_program(hss_utils.st_command.EXECUTION_ERROR, stderr_value)
+
+                try:
+                    file_content = hss_utils.rosetta.get_file_from_rosetta('eccds/%s/download_config_file/ ' % config.get_eccd_name())
+                except Exception as e:
+                    _DEB('Error: %s. The TG shall belong to a cloud environment that is well configured in Rosetta' % str(e))
+                    quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+                with open(credential_file,'w') as fd:
+                    fd.write(file_content)
+
+            user_config.kubeconfig = credential_file
+
+        access_config.update({'credential_file':hss_utils.st_command.real_path(user_config.kubeconfig)})
+
+    elif user_config.eccd_type == 'IBD':
+        try:
+            access_config = {'host':config.get_eccd_cloud_vip(eccd=0,IPv6=False),
+                        'port':user_config.port,
+                        'user':user_config.user}
+        except hss_utils.rosetta.InfoNotFound as e:
+            _DEB('Error: %s. The TG shall belong to a cloud environment that is well configured in Rosetta' % str(e))
+            quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+
+        if not user_config.ssh_key:
+            try:
+                credential_file = os.path.join(hss_utils.st_command.real_path(hss_utils.node.cloud.IBD_CREDENTIAL_PATH),
+                                        'id_rsa_%s' % config.get_eccd_name())
+            except hss_utils.rosetta.InfoNotFound as e:
+                _DEB('Error: %s. The TG shall belong to a cloud environment that is well configured in Rosetta' % str(e))
+                quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+            if not os.path.isfile(credential_file):
+                cmd = 'mkdir -p %s' % hss_utils.st_command.real_path(hss_utils.node.cloud.IBD_CREDENTIAL_PATH)
+                stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                if returncode:
+                    _DEB('Error: %s' % stderr_value)
+                    quit_program(hss_utils.st_command.EXECUTION_ERROR, stderr_value)
+
+                try:
+                    file_content = hss_utils.rosetta.get_file_from_rosetta('credentials/%s/download_ssh_key_file/ ' % config.get_director_credential())
+                except Exception as e:
+                    _DEB('Error: %s. The TG shall belong to a cloud environment that is well configured in Rosetta' % str(e))
+                    quit_program(hss_utils.st_command.ROSETTA_ERROR, str(e))
+
+                with open(credential_file,'w') as fd:
+                    fd.write(file_content)
+
+                cmd = 'chmod 600 %s' % credential_file
+                stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                if returncode:
+                    _DEB('Error: %s' % stderr_value)
+                    quit_program(hss_utils.st_command.EXECUTION_ERROR, stderr_value)
+
+            user_config.ssh_key = credential_file
+
+        access_config.update({'credential_file':hss_utils.st_command.real_path(user_config.ssh_key)})
+
+    else:
+        error = 'Error: %s is not a vlid ECCD type. Allowed values are "ANS" or "IBD"' % user_config.eccd_type
+        _DEB('%s' % error)
+        quit_program(hss_utils.st_command.ROSETTA_ERROR, error)
+
+
+    return access_config
+
+def main(command):
+    global NODE
+
+    prefix = 'default'
+    if command.startswith('CBA_NBI'):
+        group = 'cba'
+        prefix = 'scxb'
+    elif command.startswith('CBA'):
+        group = 'cba'
+    elif command.startswith('TSP'):
+        group = 'tsp'
+    elif command.startswith('CUDB'):
+        group = 'cudb'
+    elif command.startswith('GTLA'):
+        group = 'gtla'
+    elif command.startswith('DUMMYNET'):
+        group = 'dummynet'
+    elif command.startswith('CLOUD'):
+        group = 'cloud'
+    else:
+        group = 'gentraf'
+
+    user_parser = get_user_parser(group, command, prefix)
+    user_config = user_parser.parse_args()
+
+    try:
+        if isinstance(user_parser.parents[1],hss_utils.st_command.CBA_ArgumentParser):
+            set_config_Node(user_config, 'oam_vip')
+            access_config = {'host':user_config.NODE,
+                            'port':user_config.port,
+                            'user':user_config.user}
+            NODE = hss_utils.node.cba.Cba(config = access_config)
+
+        elif isinstance(user_parser.parents[1],hss_utils.st_command.CBA_scxb_ArgumentParser):
+            set_config_Node(user_config, 'scxb')
+            access_config = {'host':user_config.NODE,
+                            'port':user_config.port,
+                            'user':user_config.user}
+            NODE = hss_utils.node.cba.Cba(config = access_config)
+
+        elif isinstance(user_parser.parents[1],hss_utils.st_command.TSP_ArgumentParser):
+            set_config_Node(user_config, 'io2')
+            access_config = {'host':user_config.NODE,
+                            'port':user_config.port,
+                            'user':user_config.user,
+                            'password':user_config.password}
+            NODE = hss_utils.node.tsp.Tsp(config = access_config, force_primary = not user_config.primary)
+
+        elif isinstance(user_parser.parents[1],hss_utils.st_command.GTLA_ArgumentParser):
+            set_config_Node(user_config, 'oam', extdb_type='GTLA')
+            access_config = {'host':user_config.NODE}
+            NODE = hss_utils.node.gtla.Gtla(config = access_config)
+
+        elif isinstance(user_parser.parents[1],hss_utils.st_command.CLOUD_ArgumentParser):
+            access_config = set_cloud_info(user_config)
+            if user_config.eccd_type == 'IBD':
+                NODE = hss_utils.node.cloud.CloudIBD(config = access_config)
+            else:
+                NODE = hss_utils.node.cloud.CloudANS(config = access_config)
+
+        elif isinstance(user_parser.parents[1],hss_utils.st_command.CUDB_ArgumentParser):
+            set_config_Node(user_config, 'oam', extdb_type='CUDB')
+            access_config = {'host':user_config.NODE,
+                            'port':user_config.port,
+                            'user':user_config.user,
+                            'password':user_config.password}
+            NODE = hss_utils.node.cudb.Cudb(config = access_config)
+
+        elif isinstance(user_parser.parents[1],hss_utils.st_command.DUMMYNET_ArgumentParser):
+            set_dummynet_info(user_config)
+            access_config = {'host':user_config.NODE,
+                            'port':user_config.port,
+                            'user':user_config.user,
+                            'password':user_config.password}
+            NODE = hss_utils.node.dummynet.DummyNet(config = access_config,traffic_type=user_config.traffic_type )
+
+        elif isinstance(user_parser.parents[1],hss_utils.st_command.GENTRAF_ArgumentParser):
+            access_config = {'host':user_config.NODE,
+                            'port':user_config.port,
+                            'user':user_config.user,
+                            'password':user_config.password}
+            NODE = hss_utils.node.gentraf.GenTraf(config = access_config)
+
+        eval('hss_utils.st_command.%s.run_%s(user_config, NODE)' % (group, command))
+        quit_program(hss_utils.st_command.SUCCESS)
+
+    except AttributeError, e:
+        if "'module' object has no attribute" not in str(e):
+            raise e
+        else:
+            _DEB('Error: %s' % str(e))
+            print 'Error: comand %s not supported' % command
+            quit_program(hss_utils.st_command.NOT_FOUND, str(e))
+
+    except connection.Unauthorized, e: 
+        _DEB('Error: %s' % str(e))
+        quit_program(hss_utils.st_command.AUTHENTICATION_ERROR, str(e))
+
+    except (connection.ConnectionFailed, connection.ConnectionTimeout), e: 
+        _DEB('Error: %s' % str(e))
+        quit_program(hss_utils.st_command.CONNECTION_ERROR, str(e))
+
+    except (hss_utils.st_command.ExecutionTimeout), e: 
+        _DEB('Error: %s' % str(e))
+        quit_program(hss_utils.st_command.TIMEOUT, str(e))
+
+    except (hss_utils.st_command.NotFound), e: 
+        _DEB('Error: %s' % str(e))
+        quit_program(hss_utils.st_command.NOT_FOUND, str(e))
+
+    except (hss_utils.st_command.CommandFailure), e: 
+        _DEB('Error: %s' % str(e))
+        quit_program(hss_utils.st_command.EXECUTION_ERROR, str(e))
+
+    except (hss_utils.st_command.WrongParameter), e: 
+        _DEB('Error: %s' % str(e))
+        quit_program(hss_utils.st_command.WRONG_PARAMETER, str(e))
+
+    except (hss_utils.node.gtla.CreateGtlaKeyFile), e: 
+        _DEB('Error: %s' % str(e))
+        quit_program(hss_utils.st_command.AUTHENTICATION_ERROR, str(e))
+
+    except KeyboardInterrupt:
+        _DEB('Execution stopped by user!')
+        quit_program(hss_utils.st_command.SUCCESS)
+
+def get_user_parser(group, command, prefix='default_'):
+    parents = [get_command_parser(), eval('hss_utils.st_command.%s_%s_command_parser()' % (prefix, group))]
+    try:
+        action_parser = eval('hss_utils.st_command.%s.%s_parser()' % (group, command))
+        if action_parser is not None:
+            parents.append(action_parser)
+    except AttributeError, e:
+        if "'module' object has no attribute" not in str(e):
+            raise e
+
+    parser = hss_utils.st_command.stFramework_ArgumentParser(
+                description = 'Execute a Tse-Tse command in a node',
+                parents = parents
+            )
+
+    return (parser)
+
+
+
+def get_command_parser():
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('COMMAND',
+                        help='Node command to be executed')
+
+    return (parser)
+
+
+if __name__ == '__main__':
+
+    if '-v' in sys.argv:
+        e3utils.log.enable_console_logging(level=e3utils.log.DEBUG)
+        e3utils.log.enable_internal_logging()
+
+    try:
+        main(sys.argv[1])
+    except KeyboardInterrupt:
+        _DEB('User sends Ctr-C')
+        quit_program(hss_utils.st_command.SUCCESS)
+    except Exception, e:
+        _DEB('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(hss_utils.st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+
+

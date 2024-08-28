@@ -1,0 +1,1 @@
+pause 15;replot;reread;

@@ -1,0 +1,271 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+import traceback
+import argparse
+import re
+import pprint
+import pexpect
+
+import ntpath
+import signal
+import textwrap
+import socket
+import getpass
+
+import essclient
+import json
+import pprint
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.gentraf
+import hss_utils.rosetta
+import hss_utils.rosetta.services
+import e3utils.clients.jenkins
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+HOSTNAME = socket.gethostname()
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+
+def quit_program(exit_code):
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def main():
+    user_config = parse_commandline()
+    try:
+        envs = hss_utils.rosetta.related_environments(HOSTNAME)
+        if not envs or envs[0] is None:
+            _ERR('Error: Rosetta return an empty list or None')
+            quit_program(EXECUTION_ERROR)
+    except Exception as e:
+        _ERR('Can not fetch environment for "%s" from Rosetta (%s)' % (HOSTNAME,e))
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        info = hss_utils.rosetta.services.installation_info_for(envs[0])
+    except KeyError as e:
+        _ERR('Missing data in rosetta: %s' % e)
+        quit_program(EXECUTION_ERROR)
+    except ValueError as e:
+        _ERR('%s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        node_name  = info['cabinet']['name']
+        node_type = info['cabinet']['type']
+        if user_config.build:
+            if node_type == 'VNF':
+                user_config.baseline = 'v' + user_config.build
+                if info['cabinet']['disk_sc'] == 100:
+                    user_config.baseline += '_100G'
+            else:
+                user_config.baseline = user_config.build
+    except KeyError as e:
+        _ERR('Problem getting node info from Rosetta %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+
+    _INF('Node name   : %s' % node_name)
+    _INF('Node type   : %s' % node_type)
+    _INF('Baseline    : %s' % user_config.baseline)
+    _INF('')
+
+
+    if user_config.ess is None:
+        try:
+            user_config.ess = info['ait']['mgmt'][0]
+        except (KeyError, TypeError) as e:
+            _ERR('Can not fetch ESS from Rosetta (%s)' % HOSTNAME)
+            quit_program(EXECUTION_ERROR)
+
+    ess_uri = 'pot://%s' % user_config.ess
+    _INF('ESS URI     : %s' % ess_uri)
+
+    try:
+        ESS_CLIENT = essclient.ESS(ess_uri)
+    except Exception as e:
+        _ERR('Problem in ESS client creation: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    ESS_CLIENT.default_timeout=60.0
+
+    try:
+        if ESS_CLIENT.ping() != 'pong':
+            _ERR('No connection to ESS %s' % ess_uri)
+            quit_program(EXECUTION_ERROR)
+    except Exception as e:
+        _ERR('Problem in ESS client ping: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        available_baselines = ESS_CLIENT.available_baselines
+    except Exception as e:
+        _ERR('Problem in ESS client available_baselines: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    _INF('Available baselines: %s' % ' '.join(available_baselines))
+
+    if user_config.baseline in available_baselines:
+        _INF('Removing %s baseline in ESS' % user_config.baseline)
+        try:
+            ESS_CLIENT.remove_baseline(user_config.baseline)
+        except Exception as e:
+            _WRN('Problem in ESS client remove_baseline: %s' % e)
+    else:
+        _INF('%s baseline does not exist in ESS' % user_config.baseline)
+
+
+
+    quit_program(SUCCESS)
+
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawTextHelpFormatter,
+                        description=textwrap.dedent('''\
+                        Remove a baseline in the ESS. Rosetta is mandatory
+            '''),
+            epilog=textwrap.dedent(get_exit_status()))
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('--baseline', default=None,
+                        action='store', dest='baseline',
+                        help='Baseline name to be removed')
+
+    scenario_params.add_argument('--build', default=None,
+                        action='store', dest='build',
+                        help='Build Id used for generating the baseline name based on type of HSS')
+
+    behaviour_params = parser.add_argument_group('Define behaviour ')
+    behaviour_params.add_argument('--ess',
+                      action='store', default=None,
+                      help='ESS IP. If not present use rosetta to find it.',
+                      dest='ess')
+
+    behaviour_params.add_argument('-o', '--output',
+                      action='store', default=None,
+                      help='Specify the output directory. Default %s' % CWD,
+                      dest='output_dir')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    if args.output_dir is not None and args.log_file is not None:
+        _ERR('Error: --log_file and -o can not be used at the same time' )
+        quit_program(ROSETTA_ERROR)
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_remove_ESS_baseline_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.output_dir is None:
+        args.output_dir = CWD
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(st_command.real_path(args.output_dir), 'CBA_remove_ESS_baseline_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+
+    if args.build and args.baseline:
+        _ERR('Error: --build and -baseline can not be used at the same time' )
+        quit_program(ROSETTA_ERROR)
+
+
+    if not args.build and not args.baseline:
+        _ERR('Error: --build or -baseline shall be used' )
+        quit_program(ROSETTA_ERROR)
+
+
+    return (args)
+
+
+if __name__ == '__main__':
+    CWD = os.getcwd()
+    signal.signal(signal.SIGINT, quit_gracefully)
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

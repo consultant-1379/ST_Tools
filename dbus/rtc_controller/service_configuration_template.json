@@ -1,0 +1,124 @@
+{
+    "common.mkr": [
+        {
+            "name": "HSS_BASE_BACKUP", 
+            "value": "HSSFE#BASE_RELEASE#_#AUTH_VECTOR#"
+        }, 
+        {
+            "name": "HSS_UPGRADE_BACKUP", 
+            "value": "HSSFE_UPGRADE_#AUTH_VECTOR#"
+        }, 
+        {
+            "name": "ESM_UP_PACKAGE", 
+            "value": "$RTC_UPGRADE_PATH/ESM_UP_PACKAGE"
+        }, 
+        {
+            "name": "DUMMY_UP_PACKAGE", 
+            "value": "$RTC_UPGRADE_PATH/DUMMY_UP_PACKAGE"
+        }, 
+        {
+            "name": "HSS_UPGRADE_TOOL", 
+            "value": "$RTC_UPGRADE_PATH/hss_upgrade_tool.tar.gz"
+        }, 
+        {
+            "name": "HSS_UPGRADE_CONFIG_PROPERTIES", 
+            "value": "$RTC_UPGRADE_PATH/config.properties"
+        }, 
+        {
+            "name": "CONSOLE_ENABLED", 
+            "value": "false"
+        }, 
+        {
+            "name": "CONSOLE_SERVER", 
+            "value": "xx.xx.xx.xx"
+        }, 
+        {
+            "name": "CONSOLE_PORT_SC1", 
+            "value": "xxxx"
+        }, 
+        {
+            "name": "CONSOLE_PORT_SC2", 
+            "value": "xxxx"
+        }, 
+        {
+            "name": "CONSOLE_PORT_PL3", 
+            "value": "xxxx"
+        }, 
+        {
+            "name": "CONSOLE_PORT_PL4", 
+            "value": "xxxx"
+        }
+    ], 
+    "service_parameters": {
+        "folder_to_create": [
+            "$RTC_UPGRADE_PATH"
+        ], 
+        "base_release": null, 
+        "git_path": "$RTC_WD_PATH/GIT_repos", 
+        "test_suite": "$GIT_PATH/ST_AUTOMATION/........./Test_Suite/....._#ENV_TYPE#_#AUTH_VECTOR#.cfg", 
+        "output_dir": "/proj/........", 
+        "test_result": "$RTC_TEST_PATH", 
+        "to_pack_and_store": [
+            "$RTC_TEST_PATH"
+        ],
+        "rtc_cmd_user_parameters":"",
+        "CBA_user":"root"
+    }, 
+    "env_var": [
+        {
+            "name": "RTC_WD_PATH", 
+            "value": "#WD#"
+        }, 
+        {
+            "name": "GIT_PATH", 
+            "value": "$RTC_WD_PATH/GIT_repos"
+        }, 
+        {
+            "name": "RTC_TEST_PATH", 
+            "value": "$RTC_WD_PATH/test_result"
+        }, 
+        {
+            "name": "RTC_UPGRADE_PATH", 
+            "value": "$RTC_WD_PATH/upgrade"
+        }, 
+        {
+            "name": "RTC_JSON_PATH", 
+            "value": "$GIT_PATH/ST_AUTOMATION/............/json"
+        }, 
+        {
+            "name": "RTC_TRAF_REF_PATH", 
+            "value": "$GIT_PATH/ST_AUTOMATION/............/Traffic_reference/#ENV_TYPE#/#AUTH_VECTOR#"
+        }, 
+        {
+            "name": "RTC_CFG_PATH", 
+            "value": "$GIT_PATH/ST_AUTOMATION/............/cfg"
+        }
+    ], 
+    "git_repos": [
+        {
+            "repo": "ST_AUTOMATION", 
+            "commit": "HEAD", 
+            "branch": ""
+        }, 
+        {
+            "repo": "ST_BAT", 
+            "commit": "", 
+            "branch": ""
+        }, 
+        {
+            "repo": "TCM/HSS_TCM_DOCS", 
+            "commit": "", 
+            "branch": ""
+        }, 
+        {
+            "repo": "ST_Population_Netconf", 
+            "commit": "", 
+            "branch": ""
+        }, 
+        {
+            "repo": "ST_HssUpgradeTool", 
+            "commit": "", 
+            "branch": ""
+        }
+    ]
+}

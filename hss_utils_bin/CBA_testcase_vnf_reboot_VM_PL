@@ -1,0 +1,409 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services as rosetta_services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+env_name=''
+type_vnf=''
+user_config={}
+
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def reboot_vnf_vm (vm, pl_name):
+
+    pod_name = env_name.split('-')[0]
+    vnf_name = env_name.split('-')[1]
+
+    timestamp = datetime.now()
+    reboot_msg = rosetta_services.vnf_reboot_server (pod_name, vnf_name, vm)
+    reboot_data = reboot_msg['data']
+    reboot_error = reboot_msg['errors']
+    if ("Reboot server did not report any error" in reboot_data):
+        _INF('VM %s rebooted successfully' % vm)
+        _DEB('%s' % reboot_data)
+    else:
+        _ERR('Error when executing reboot for virtual machine %s ' % vm)
+        error_info = 'Command Error message: %s ' % str(reboot_error)
+        quit_program(EXECUTION_ERROR, error_info)
+
+  # Steps 8 - 13: Wait for VM to be ACTIVE 
+    _INF('Waiting until VM %s is ACTIVE again' % vm)
+    timeout = float(user_config.max_time)
+    init_time = time.time()
+    while  True:
+        now = time.time()
+        time.sleep(float(1))
+        _INF('Checking VM %s Status' % vm)
+        status = rosetta_services.get_hss_vnf_vms_status (pod_name, vnf_name, vm)
+        if 'ACTIVE' in status:
+            _INF('VM %s Status is already %s ' % (vm, status))
+            now = time.time()
+            break
+        else:
+            _INF('VM %s Status is %s. Keep on waiting ... ' % (vm, status))
+        timeout -= time.time() - now
+        if timeout < 0:
+            error_info = 'Timeout waiting for VM rebooted to be ACTIVE'
+            _ERR(error_info)
+            quit_program(st_command.TIMEOUT, error_info)
+
+    _INF('Reboot completed successfully. VM %s in status %s' % (vm, status))
+    active_time = now - init_time
+    _INF('Time to be ACTIVE again: %s ' % active_time)
+
+    try:
+        TC.close_connection(identity = pl_name)
+        _INF('Closing connection for %s' % pl_name)
+    except Exception, e:
+        _ERR('Closing connection Exception: %s' % e)
+
+    # Steps 8 - 13: Wait for node to be up and check External Database Connections
+    time.sleep(float(30))
+
+    _INF('Waiting for ExtDb connections for payload %s ' % pl_name)
+    reboot_time = TC.wait_for_all_ExtDb_connections_up(pl_name, user_config.max_time)
+    reboot_time += float(30)
+    action = 'Reboot VM'
+    _INF('Reboot Time from Openstack:    %s' % str(reboot_time + active_time))
+    TC.send_test_case_info('%-*s %-*s executed at %s   Action time (sec) %.2f' % (15,action,
+                                                                                      6,pl_name,
+                                                                                      timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                                      float(reboot_time + active_time)))
+
+def check_evip_cdiam ():
+    if 'Telco' in type_vnf:
+        _INF('Multi compute (Telco) environment: Showing eVIP elements distribution:')
+        cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s --ip' % (user_config.NODE,
+			                              user_config.user, user_config.port)
+        _DEB('Executing command:%s' % cmd)
+        TC.run_stFramework_command(cmd, check_result = True)
+
+        _INF('Multi compute (Telco) environment: Checking Diameter connections distribution')
+        cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE, user_config.user, user_config.port)
+        (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+        if output_code:
+            error_info = 'Error when executing command CBA_check_diacc_dump_json'
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+
+
+def main():
+    global TC
+    global env_name
+    global user_config
+    global type_vnf
+
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+
+        TC.connect_to_node()
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        state=TC.controller_state('SC-1')
+        sc_standby = 'SC-1' if 'STANDBY' in state else 'SC-2'
+
+        _INF('Processors status')
+        TC.display_processors_state()
+        TC.start_alarm_monitoring()
+        TC.alarm_monitor.max_time_for_reconnection = user_config.max_time
+
+        _INF('Waiting %s seconds for next action' % user_config.wait_time)
+        time.sleep(float(user_config.wait_time))
+
+        env, config = rosetta_services.get_env_for_localhost()
+        env_type = config.get_cabinet_type()
+        env_name = config.get_cabinet_name()
+        if (env_type != "VNF"):
+            error_info = 'Error: Environment %s is NOT VIRTUAL. Test Case CROB-0705 only applies to Virtual Environments' % env_name
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+        _INF('Environment %s is virtual. Rebooting all the PL Virtual Machines with Openstack commands' % env)
+        pod_name = env_name.split('-')[0]
+        vnf_name = env_name.split('-')[1]
+
+        rosetta_services.vnf_apis_rosetta()
+        hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+        list_vms = rosetta_services.get_hss_vnf_vms (hss_vnf_data)
+        type_vnf = rosetta_services.get_hss_vnf_type (hss_vnf_data,list_vms)
+
+        _INF('Showing information for %s environment %s' % (type_vnf, env_name))
+        show_params = ['status','ha-policy','hypervisor_id','hypervisor','flavor']
+        _INF('\n%s\n' % rosetta_services.display_hss_vnf_info(hss_vnf_data, list_vms, show_params))
+
+        vm_hypervisor_pre = {}
+        for key, vm in list_vms.items():
+            vm_info = rosetta_services.get_hss_vnf_info_params(hss_vnf_data, vm, ['hypervisor'])
+            vm_hypervisor_pre[vm] = vm_info.split()[1]
+
+        # Step 4: Check distribution of eVIP elements for Telco environments
+        # Step 6: Check Diameter connections distribution for Telco environments
+        check_evip_cdiam()
+
+        # Step 7: Rebooting all the PL's of the system
+        processors = TC.processors
+        for pl_name in processors:
+            if ('PL-' in pl_name):
+                node_uuid = TC.processor_uuid(pl_name)
+                vm = list_vms[node_uuid]
+                _INF('Preparing alarm filters for %s' % pl_name)
+                TC.clean_alarm_filters()
+                alarm_filters = [{'source':'safApp=OpenSAF,SaAmfSI.safSi='},
+                                 {'source':'safApp=ERIC-CoreMW,SaAmfSI.safSi='}]
+
+                TC.add_alarm_filters(alarm_filters)
+                TC.display_alarm_filter()
+
+                _INF('Rebooting Virtual Machine %s for %s' % (vm, pl_name))
+                reboot_vnf_vm(vm, pl_name)
+
+                # Step 14.1: Check distribution of eVIP elements for Telco environments
+                # Step 14.2: Check Diameter connections distribution for Telco environments
+                check_evip_cdiam()
+
+                # Step 24: Check alarms both in CEE and HSS-FE
+                cee_alarms=rosetta_services.get_vnf_cee_list_alarms (pod_name)
+                if cee_alarms:
+                    _INF('CEE alarms environment:\n%s' % cee_alarms)
+                else:
+                    _INF('NO CEE alarms found')
+
+                _INF('Waiting up to %s seconds for alarms to be cleared' % user_config.wait_time)
+                if not TC.wait_for_expected_alarms(user_config.wait_time):
+                    error_info = 'Some expected alarms have not been received'
+                    if not user_config.skip_missing_alarms:
+                        quit_program(st_command.EXECUTION_ERROR,error_info)
+                    else:
+                        TC.first_error = error_info
+
+                _INF('Waiting %s seconds for next action' % user_config.wait_time)
+                time.sleep(float(user_config.wait_time))
+
+
+
+        # Step 17: Check the location of the VM's and the compute nodes
+        # Not implemented the acces to CIC
+
+        hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+        _INF('Showing information for %s environment %s after reboots' % (type_vnf, env_name))
+        show_params = ['status','ha-policy','hypervisor_id','hypervisor','flavor']
+        _INF('\n%s\n' % rosetta_services.display_hss_vnf_info(hss_vnf_data, list_vms, show_params))
+
+
+        # Step 23: Check alarms both in CEE and HSS-FE
+        # Waiting to system clear the alarms after reboot
+        time.sleep(float(30))
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError as e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, hss_utils.rosetta.InfoNotFound) as e: 
+        error_info = 'Error: %s. Use command line parameter -V' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.ROSETTA_ERROR,error_info)
+
+    except (hss_utils.rosetta.ActionFailure) as e:
+        error_info = 'Error when executing E3cloud action: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Execute a reboot of a virtual machine initiate from virtual machine level',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-t', '--time',
+                        default=60, type=int, action='store', dest='wait_time',
+                        help='Waiting time for action. By default is "%(default)s"')
+
+    scenario_params.add_argument('--max-time',
+                        default=600, type=int, action='store', dest='max_time',
+                        help='Max time waiting for every single reboot. By default is "%(default)s"')
+
+    scenario_params.add_argument('--skip-missing-alarms',
+                      action='store_true', default=False,
+                      help='Do not stop execution when there are missing expected alarms.',
+                      dest='skip_missing_alarms')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_vnf_reboot_VM_PL_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_vnf_reboot_VM_PL_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        env, config = rosetta_services.get_env_for_localhost()
+        _INF('Environment  : %s' % env)
+        args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+        _INF('Node         :%s' % args.NODE)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

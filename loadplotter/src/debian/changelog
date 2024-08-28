@@ -1,0 +1,17 @@
+hss-st-loadplotter (3.0-1) UNRELEASED; urgency=medium
+
+  * HCR50
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Fri, 24 Jul 2020 10:00:04 +0200
+
+hss-st-loadplotter (2.3-1) UNRELEASED; urgency=medium
+
+  * Update gnuplot cmd file for ubuntu
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Wed, 22 Jul 2020 10:00:04 +0200
+
+hss-st-loadplotter (2.2-1) UNRELEASED; urgency=medium
+
+  * Initial release. (Closes: #XXXXXX)
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Tue, 21 Jul 2020 10:00:04 +0200

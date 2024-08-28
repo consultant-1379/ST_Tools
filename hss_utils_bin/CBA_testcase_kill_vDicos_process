@@ -1,0 +1,301 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def main():
+    global TC
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+
+        TC.connect_to_node()
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        _INF('Processors status')
+        TC.display_processors_state()
+        TC.start_alarm_monitoring()
+
+        allowed_processors = TC.processors
+        processors = []
+        if  user_config.processors is None:
+            processors = TC.processors
+        else:
+            for processor in user_config.processors:
+                if processor not in allowed_processors:
+                    error_info = 'Processor %s not valid. Allowed values are: %s' % (processor, ' '.join(allowed_processors))
+                    _ERR(error_info)
+                    quit_program(st_command.WRONG_PARAMETER,error_info)
+
+            processors = user_config.processors
+
+        for processor in processors:
+            vDicos_pid = {}
+            if TC.processor_state(processor) == 'LOCKED':
+                _WRN('Test for %s will be skipped. Processor is locked' % processor)
+                continue
+
+            cmd = 'ps -ef | grep vDicosVM | grep $(pidof vDicosSpawner)'
+            answer = TC.run_processor_command(cmd, processor)
+            for line in answer:
+                vDicos = line.split()[-1]
+                pid = line.split()[1]
+                vDicos_pid.update({vDicos:pid})
+
+            cmd = 'ps -eaf | grep Dbn | grep -v grep'
+            dbn_pid = TC.run_processor_command(cmd, processor)[0].split()[1]
+            _INF('Dbn PID: %s' % dbn_pid)
+
+            vDicos_to_kill = vDicos
+            pid_to_kill = pid
+            _INF('Killing %s with PID %s' % (vDicos_to_kill, pid_to_kill))
+            cmd = 'kill %s' % pid_to_kill
+            TC.run_processor_command(cmd, processor)
+
+            _INF('Waiting %s seconds for next action' % user_config.wait_time)
+            time.sleep(float(user_config.wait_time))
+
+            new_vDicos_pid = {}
+            cmd = 'ps -ef | grep vDicosVM | grep $(pidof vDicosSpawner)'
+            answer = TC.run_processor_command(cmd, processor)
+            for line in answer:
+                vDicos = line.split()[-1]
+                pid = line.split()[1]
+                new_vDicos_pid.update({vDicos:pid})
+
+            if new_vDicos_pid[vDicos_to_kill] == vDicos_pid[vDicos_to_kill]:
+                _ERR('PID for %s (%s) has not changed' % (vDicos_to_kill, pid_to_kill))
+            else:
+                _INF('New PID for %s is %s' % (vDicos_to_kill, new_vDicos_pid[vDicos_to_kill]))
+
+            _INF('Killing Dbn with PID %s' % dbn_pid)
+            cmd = 'kill %s' % dbn_pid
+            TC.run_processor_command(cmd, processor)
+
+            _INF('Waiting %s seconds for next action' % user_config.wait_time)
+            time.sleep(float(user_config.wait_time))
+
+            cmd = 'ps -ef | grep vDicosVM | grep $(pidof vDicosSpawner)'
+            answer = TC.run_processor_command(cmd, processor)
+            for line in answer:
+                vDicos = line.split()[-1]
+                pid = line.split()[1]
+                if pid == new_vDicos_pid[vDicos]:
+                    info = 'PID for %s (%s) has not changed' % (vDicos, pid)
+                    _ERR(info)
+                    quit_program(st_command.EXECUTION_ERROR,message=info)
+
+            if len(answer) != len(new_vDicos_pid):
+                    info = 'Different numbers of vDicos processes after killing Dbn process'
+                    _ERR(info)
+                    quit_program(st_command.EXECUTION_ERROR,message=info)
+
+            _INF('Waiting %s seconds for load stability' % user_config.wait_time)
+            time.sleep(float(user_config.wait_time))
+
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+    except connection.Unauthorized, e: 
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed), e: 
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF), e: 
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError, e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError, e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='kill one vDicos process and DBN process in PLs',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-p', '--processors', nargs='+',
+                        default=None, action='store', dest='processors',
+                        help='List of processors to be used')
+
+    scenario_params.add_argument('-t', '--time',
+                        default=60, type=int, action='store', dest='wait_time',
+                        help='Waiting time for action. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_kill_vDicos_process_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_kill_vDicos_process_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

@@ -1,0 +1,12 @@
+Source: hss-st-loadplotter
+Section: networking
+Priority: optional
+Maintainer: <mitxel.garcia@ericsson.com>
+Build-Depends: debhelper (>= 7)
+Standards-Version: 3.9.2
+
+Package: hss-st-loadplotter 
+Architecture: amd64
+Section: networking
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: LoadPlotter: Meassure, save and plot HSS CPU

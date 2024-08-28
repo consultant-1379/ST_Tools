@@ -1,0 +1,355 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+import copy
+import json
+import threading
+import ntpath
+import signal
+import textwrap
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+NODE=None
+
+def quit_program(exit_code):
+    global NODE
+
+    if NODE:
+        NODE.release()
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+class Handler(object):
+    def __init__(self, id):
+
+        self.__id = id
+        self.__cmds = []
+        self.__file_names = []
+        self.__file_descriptors = []
+        self.__running = False
+
+    @property
+    def id(self):
+        return self.__id 
+
+    def display(self):
+        _INF('%s' % self.id)
+        for index in range (0, len(self.__cmds)):
+            _INF('\t%s\tto\t%s' % (self.__cmds[index], self.__file_names[index]))
+
+    def add_cmd(self, cmd, output,suffix):
+        self.__cmds.append(cmd)
+        self.__file_names.append('%s%s%s' % (output,
+                                          ('.' if output and suffix else ''),
+                                          (self.id if not output or suffix else '')
+                                          )
+        )
+    def run(self):
+        NODE.extend_connection(self.id, self.id,user='root')
+        _INF('')
+        _INF('%s: Connecting....' % self.id)
+
+
+        for index in range(0, len(self.__cmds)):
+            answer = '\n\n%s' % NODE.run_command('date', self.id, timeout=float(10), full_answer=True)
+            command = self.__cmds[index]
+            file_name = self.__file_names[index]
+            _INF('%s: Executing "%s"' % (self.id, command))
+            answer += '\nExecuting "%s" in %s\n' % (command, self.id)
+            answer = answer + '\n' + NODE.run_command(command, self.id, timeout=float(60), full_answer=True)
+
+            if os.path.dirname(file_name):
+                if not os.path.exists(os.path.dirname(file_name)):
+                    os.makedirs(os.path.dirname(file_name))
+                    os.chmod(os.path.dirname(file_name), 0o777)
+            with open(file_name,'a') as fd:
+                fd.write(answer)
+            answer = ''
+
+
+def main():
+
+    global NODE
+    user_config = parse_commandline()
+    handlers = {}
+    try:
+        access_config = {'host':user_config.node,
+                          'port':user_config.port,
+                          'user':user_config.user}
+
+
+        NODE = hss_utils.node.cba.Cba(config = access_config)
+        processors = NODE.processors
+        all_processors = processors + ['SC-1','SC-2']
+
+    except connection.Unauthorized as e: 
+        _ERR('Error: %s' % str(e))
+        quit_program(AUTHENTICATION_ERROR)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e: 
+        _ERR('Error: %s' % str(e))
+        quit_program(CONNECTION_ERROR)
+
+    try:
+        with open(os.path.join(user_config.CFG)) as json_data:
+            data = json.load(json_data)
+
+    except IOError as e:
+        _ERR('Error with %s json file: %s' % (user_config.CFG, e))
+        quit_program(EXECUTION_ERROR)
+    except Exception as e:
+        _ERR('Error parsing %s json file: %s' % (user_config.CFG, e))
+        quit_program(AUTHENTICATION_ERROR)
+
+
+    for cmd in data:
+        handlers_list = []
+        if cmd.get('enable',False):
+            pls = cmd.get('pls','')
+            if pls == 'all':
+                handlers_list += processors
+            else:
+                handlers_list += pls.split()
+
+            scs = cmd.get('scs','')
+            if scs == 'all':
+                handlers_list += ['SC-1','SC-2']
+            else:
+                handlers_list += scs.split()
+
+            for handler in handlers_list:
+                if handler not in all_processors:
+                    _ERR('')
+                    _ERR('"%s" not valid. Allowed values: %s' % (handler, ' '.join(all_processors)))
+                    quit_program(EXECUTION_ERROR)
+                if handler not in handlers.keys():
+                    handlers.update({handler:Handler(handler)})
+
+                handlers[handler].add_cmd(cmd.get('cmd',''), cmd.get('output',''),cmd.get('suffix',False))
+
+    if not handlers.keys():
+        _ERR('')
+        _ERR('Not commands enabled in %s' % user_config.CFG)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        _INF('')
+        _INF('Loop will take %s seconds. Press ctrl-c to stop' % user_config.LOOP_TIME)
+
+        timeout = float(user_config.LOOP_TIME)
+        while timeout  > float(0):
+            now = time.time()
+            _INF('')
+            try:
+                NODE.create_connection(config=access_config, session_type=NODE.session_type)
+
+                for key in sorted(handlers.keys()):
+                    handlers[key].run()
+
+                NODE.release()
+
+            except (connection.ConnectionTimeout, connection.Unauthorized, connection.ConnectionFailed) as e: 
+                _WRN('Connection problem')
+                _DEB('%s' % str(e))
+
+            _INF('')
+            _INF('Waiting %s seconds for next cycle' % user_config.SLEEP_TIME)
+            time.sleep(float(user_config.SLEEP_TIME))
+            timeout -= time.time() - now
+
+    except KeyboardInterrupt:
+        _INF('Loop stopped by user!')
+
+    quit_program(SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawTextHelpFormatter,
+                        description=textwrap.dedent('''\
+                            Execute the list of commands defined in CFG during LOOP-TIME sec. and wait SLEEP-TIME sec. between loop iterations 
+                            '''),
+            epilog=textwrap.dedent(get_exit_status()))
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='node')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('CFG',
+                        help='''Absolute path of configuration file (json format) with the command list definition
+Each single command is a dictionary including the following info:
+    "enable" :      Execute or not the command.
+
+    "cmd"    :      Command to be excuted. It shall be quoted.
+
+    "pls"    :      Optional. String with the list of PLs (white-space separated) where to run the command.
+                    If "all" the full list of available PLs will be used 
+
+    "scs"    :      Optional. String with the list of SCs (white-space separated) where to run the command.
+                    If "all" the full list of available SCs will be used 
+
+    "output" :      Optional. Filename (absolute path) where to store the output command execution
+                    If missing or empty the CWD/<processor-name> will be used
+
+    "suffix" :      Optional. If output is not empty and suffix is true then the processor name will be added as suffix
+
+
+Example of CFG content:
+
+    [
+            {"enable": true, "cmd":"ps -AO cpuid,%%cpu --sort=-pcpu", "pls":"all"},
+            {"enable": true, "cmd":"top -n 1 -b |head -25", "output":"top_PL-3","pls":"PL-3"},
+            {"enable": true, "cmd":"top -n 1 -b |head -25", "output":"top","scs":"all","suffix":true}
+    ]
+
+
+''')
+    scenario_params.add_argument('LOOP_TIME',type=int,
+                        help='Duration of the command loop in sec')
+
+    scenario_params.add_argument('SLEEP_TIME',type=int,
+                        help='Sleep time in sec between loop iterations')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_run_command_loop_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_run_command_loop_%s.log' % os.getpid()),
+                                    level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+
+    if args.node is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.node = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.node)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+            _ERR('Error: %s. Use command line parameter --node' % str(e))
+            quit_program(ROSETTA_ERROR)
+
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

@@ -1,0 +1,71 @@
+hss-st-runtitansim (5.16) UNRELEASED; urgency=medium
+
+  * User com-emergency by default (Jira HSSSTT-336)
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Tue, 28 Apr 2024 13:00:00 +0200
+
+hss-st-runtitansim (5.15) UNRELEASED; urgency=medium
+
+  * fix bug for node_type on CBA traffic (Jira HSSSTT-264)
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Wed, 11 Jan 2023 13:30:00 +0200
+
+hss-st-runtitansim (5.14) UNRELEASED; urgency=medium
+
+  * Add node_type on CBA traffic (Jira HSSSTT-235)
+
+ -- Serafin Alonso Alonso <serafin.alonso@capgemini.com>  Tue, 17 May 2022 12:30:00 +0200
+
+hss-st-runtitansim (4.5) UNRELEASED; urgency=medium
+
+  * Bugfix IPv6 in cnHSS
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Tue, 01 Jun 2021 10:00:00 +0200
+
+hss-st-runtitansim (4.4) UNRELEASED; urgency=medium
+
+  * Allow IPv6 in cnHSS
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Tue, 20 Apr 2020 10:00:00 +0200
+
+hss-st-runtitansim (4.3) UNRELEASED; urgency=medium
+
+  * jira HSSSTT-172
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Tue, 01 Dec 2020 10:00:00 +0200
+
+hss-st-runtitansim (4.2) UNRELEASED; urgency=medium
+
+  * Set default value for soap_ldap IPv6 
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Wed, 30 Sep 2020 15:00:00 +0200
+
+hss-st-runtitansim (4.1) UNRELEASED; urgency=medium
+
+  * Bug fixes in cloud and find soap info 
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Thu, 06 Aug 2020 13:00:00 +0200
+
+hss-st-runtitansim (4.0) UNRELEASED; urgency=medium
+
+  * HCR50
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Fri, 24 Jul 2020 10:00:04 +0200
+
+hss-st-runtitansim (3.65) UNRELEASED; urgency=medium
+
+  * Add trafficGroup handling
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Mon, 08 Jun 2020 12:49:04 +0200
+
+hss-st-runtitansim (3.61) UNRELEASED; urgency=medium
+
+  * Add extdb suppor for cnHSS
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Fri, 5 Jun 2020 10:00:04 +0200
+
+hss-st-runtitansim (3.57) UNRELEASED; urgency=medium
+
+  * Initial release. (Closes: #XXXXXX)
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Mon, 20 Apr 2020 08:00:04 +0200

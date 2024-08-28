@@ -1,0 +1,87 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+
+'''
+Tool to send/receive signals
+'''
+
+__version__ = '0.1'
+__author__ = 'Tobias Diaz'
+__email__ = 'tobias.diaz@ericsson.com'
+
+import sys
+import time
+import argparse
+
+import e3utils.log
+
+import hss_utils.dbus
+
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+        
+def watch_signals():
+    watcher = hss_utils.dbus.Watcher()
+    try:
+        _INF('Wait for Ctrl-C to quit')
+        while watcher.running:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        _INF('User quit...')
+        watcher.stop()
+    except Exception as e:
+        _WRN('Unknown exception: %s' % e)
+        watcher.stop()
+    finally:
+        watcher.join()
+    _INF('Watcher ended successfully')
+    
+
+def emit_signal(signal_id, *args):
+    hss_utils.dbus.emit(signal_id, *args)
+    _INF('Signal emitted successfully')
+
+
+def main(args=None):
+    user_config = parse_commandline()
+    if user_config.signal_id is None:
+        watch_signals()
+    else:
+        if user_config.args is None:
+            args = tuple()
+        else:
+            args = tuple(user_config.args.split(','))            
+        emit_signal(user_config.signal_id, *args)
+
+
+def parse_commandline():
+    '''Parse and check command line'''
+    parser = argparse.ArgumentParser(
+        description='ST Signal Watcher')
+    parser.add_argument('--version', action='version', version=__version__)
+
+    emitter = parser.add_argument_group('emitter', 'Emit signals')
+    emitter.add_argument('-e', '--emit',
+                         action='store', default=None,
+                         help='ID of signal to emit',
+                         dest='signal_id')
+    emitter.add_argument('-a', '--args',
+                         action='store', default=None,
+                         help='Arguments for the signal (comma separated)',
+                         dest='args')
+
+    logging=e3utils.log.add_logging_options(parser)
+    args = parser.parse_args()
+    e3utils.log.setup_logging_options(args)
+
+
+    return args
+
+
+if __name__ == '__main__':
+    main()
+    sys.exit(0)

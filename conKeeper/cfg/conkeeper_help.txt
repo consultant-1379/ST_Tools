@@ -1,0 +1,39 @@
+
+********************************
+ ALLOWED COMMANDS FOR CONKEEPER
+********************************
+
+        getstatus
+
+        reset
+
+        exit
+
+        getconfig
+
+        setdesthost <type> <hostname> <port>
+                type:   LOAD | DIAMETER | LDAP | ALL
+
+        getlistener <type>
+                type:   LOAD | DIAMETER | LDAP | ALL
+
+        getconnection <type>
+                type:   LOAD | DIAMETER | LDAP | ALL
+
+        change <config_parameter> <value>
+        
+                config_parameter:       LogMask         value summing what to log
+
+    							Log type          Binary Value
+    							Errors            0000 0001 (1)
+    							Warnings          0000 0010 (2)
+    							Connections       0000 0100 (4)
+    							Events            0000 1000 (8)
+    							Info              0001 0000 (16)
+    							Debug             0010 0000 (32)
+    							Log all           0011 1111 (63)
+
+                config_parameter:       LogMode         value:  0       FILE_MODE
+                                                                1       STDOUT_MODE
+                                                                2       MIXED_MODE
+

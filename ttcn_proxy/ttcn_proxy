@@ -1,0 +1,465 @@
+#!/usr/bin/env python
+#
+# TTCN proxy
+#
+
+import os
+import os.path
+CWD = os.getcwd()
+import hashlib
+import logging
+
+import sys
+sys.path.append('/tsp/projects/HSS/ST_tools/lib/python2.7/site-packages')
+import time
+import Queue
+import select
+import socket
+import threading
+from optparse import OptionParser
+
+try:
+    import gais
+    from gais.log import INF
+    from gais.log import DEB
+    from gais.log import ERR
+    from gais.log import WRN
+except ImportError:
+    print 'WARNING: required GAIS libraries not found in this system!'
+    logging,basicConfig(format="%(asctime)-15s %(message)s")
+    INF=logging.info
+    DEB=logging.debug
+    ERR=logging.error
+    WRN=logging.warning
+
+def silent(*args, **kargs):
+    logging.debug(args, kargs)
+
+# TTCN config
+DEFAULT_TTCN_CLI_PROMPT = 'TTCN> '
+DEFAULT_TTCN_DISPLAY_PROMPT = 'TTCN> '
+
+DEFAULT_TTCN_CLI_PORT = 34570
+DEFAULT_TTCN_DISPLAY_PORT = 34580
+
+DEFAULT_TTCN_TIMEOUT = 25.0
+
+# Proxy config
+DEFAULT_CLI_LISTEN_PORT = 7777
+DEFAULT_DISPLAY_LISTEN_PORT = 8888
+
+# Exit codes
+NO_ERROR = 0
+CMDLINE_ERROR = 1
+NET_ERROR = 2
+USER_CANCEL = 3
+
+
+class Dispatcher(threading.Thread):
+    def __init__(self, server):
+        threading.Thread.__init__(self)
+        INF('Creating dispatcher...')
+        self.__server = server
+        self.__request = Queue.Queue()
+        self.__running = True
+        self.start()
+
+    @property
+    def active(self):
+        return self.__running
+
+    def shutdown(self):
+        if self.__running:
+            INF('Dispatcher shutdown()')
+        self.__running = False
+
+    def add(self, command, client_callback):
+        self.__request.put_nowait((command, client_callback))
+
+    def run(self):
+        while self.__running:
+            try:
+                command, client_callback = self.__request.get(True, timeout=2.0)
+                response = self.__server.run_command(command)
+                client_callback(response)
+            except Queue.Empty:
+                pass
+
+
+class TTCNCliReader(threading.Thread):
+    def __init__(self, connection, server):
+        threading.Thread.__init__(self)
+        INF('Creating server listener...')
+        self.__connection = connection
+        self.__server = server
+        self.__buffer = Queue.Queue()
+        self.__running = True
+        self.start()
+
+    @property
+    def active(self):
+        return self.__running
+
+    @property
+    def socket(self):
+        return self.__connection
+
+    @property
+    def data(self):
+        return self.__buffer.get()
+
+    def shutdown(self):
+        if self.__running:
+            INF('Listener shutdown()')
+        self.__running = False
+        self.__buffer.put_nowait(None)
+        self.__server.shutdown()
+
+
+    def run(self):
+        response = ''
+        while self.__running:
+            rs, ws, es = select.select([self.__connection], [], [])
+            for sock in rs:
+                try:
+                    data = sock.recv(4096)
+                except Exception, e:
+                    WRN('Cannot read from TTCN: "%s"' % e)
+                    data = None
+                    
+                if len(data) <= 0:
+                    INF('Listener connection closed by remote peer. Data lenght %s' % (len(data)))
+                    self.shutdown()
+                else:
+                    response += data
+            DEB("Received response from TTCN: %s" % repr(response))
+                
+            if '\r\n' + DEFAULT_TTCN_CLI_PROMPT in response:                        
+                self.__buffer.put_nowait(response)
+                response = ''
+            
+        self.__buffer.put_nowait(None)
+
+
+class Server(object):
+    def __init__(self, connection, options,
+                 listen_port=DEFAULT_CLI_LISTEN_PORT, timeout=DEFAULT_TTCN_TIMEOUT):
+        INF('Creating server...')
+        self.__listen_port = int(listen_port)
+        self.__connection = connection
+        self.__timeout = timeout
+        self.__options = options
+        self.__active = True
+        self.__socket = None
+
+        self.__client_pool = []
+
+        self.__dispatcher = Dispatcher(self)
+        self.__reader = TTCNCliReader(self.__connection, self)
+
+    @property
+    def active(self):
+        return self.__active
+
+    def queue_command(self, command, callback):
+        self.__dispatcher.add(command, callback)
+
+    def run_command(self, command):
+        DEB('Sending to TTCN: %s' % repr(command))
+        if not self.__active:
+            return
+        self.__connection.send(command)
+
+        complete_request = False
+        response = ''
+        while not complete_request:
+            data = self.__reader.data
+            if data is None:
+                self.shutdown()
+                return None
+            response += data
+            if DEFAULT_TTCN_CLI_PROMPT in response:
+                complete_request = True
+        return response
+
+
+    def shutdown(self):
+        if self.__dispatcher.active:
+            self.__dispatcher.shutdown()
+        if self.__reader.active:
+            self.__reader.shutdown()
+        if self.__active:
+            INF('Disconnecting from TTCN')
+        self.__active = False
+
+    def run(self):
+        INF('Waiting clients on port %s' % self.__listen_port)
+        INF('Press Ctrl-C to end')
+        self.__socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.__socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.__socket.settimeout(5.0)
+        try:
+            self.__socket.bind(('0.0.0.0', self.__listen_port))
+            self.__socket.listen(1)
+        except Exception, e:
+            WRN('Cannot accept clients: "%s"' % e)
+            self.shutdown()
+
+        # Wait clients
+        while self.__active:
+            try:
+                connection, client_address = self.__socket.accept()
+                INF('New client connected from %s:%s' % client_address)
+                new_client = ClientThread(connection, self)
+                self.__client_pool.append(new_client)
+            except KeyboardInterrupt:
+                if self.__options.ignore_user:
+                    WRN('User press Ctrl-C but ignoring...')
+                    continue
+                WRN('User request to end proxy')
+                self.shutdown()
+            except socket.timeout:
+                continue
+
+        # Terminate clients
+        for client in self.__client_pool:
+            if client.is_alive():
+                INF('Terminate one client using shutdown')
+                client.shutdown()
+
+        # Terminate server socket
+        try:
+            self.__socket.shutdown(socket.SHUT_WR)
+            self.__socket.close()
+        except socket.error:
+            WRN('Connection already closed')
+        self.__socket = None
+
+        # Terminate dispatcher
+        self.__dispatcher.shutdown()
+        INF('Server run finsihed')
+
+
+class ClientThread(threading.Thread):
+    def __init__(self, socket, server, autostart=True):
+        threading.Thread.__init__(self)
+        INF('Creating new client')
+        self.__socket = socket
+        self.__socket.send(DEFAULT_TTCN_CLI_PROMPT)
+        self.__server = server
+        self.__active = True
+        self.__response = Queue.LifoQueue()
+        if autostart:
+            self.start()
+
+    @property
+    def active(self):
+        return self.__active
+
+    def send_response(self, response):
+        self.__response.put_nowait(response)
+
+    def __run_command(self, command):
+        # Send command
+        self.__server.queue_command(command, self.send_response)
+        # Wait response
+        response = self.__response.get()
+        if response is None:
+            self.shutdown()
+        DEB('Sending to client: %s' % repr(response))
+        try:
+            self.__socket.send(response)
+        except:
+            WRN('TTCN already disconnected')
+            self.shutdown()
+
+    def shutdown(self):
+        if self.__active:
+            INF('Disconnecting client...')
+        self.__active = False
+
+    def run(self):
+        while self.__active:
+            # Wait until client sends something
+            rs, ws, es = select.select([self.__socket],[] ,[], 1.0)
+            for sock in rs:
+                command = sock.recv(4096)
+                if len(command) <= 0:
+                    self.shutdown()
+                else:
+                    if command == 'quit\r\n':
+                        INF('quit received from client')
+                        self.shutdown()
+                    else:
+                        self.__run_command(command)
+
+        self.__socket.shutdown(socket.SHUT_WR)
+        self.__socket.close()
+        self.__socket = None
+        INF('Client disconnected')
+
+
+def parse_arguments():
+    try:
+        parser = OptionParser(
+            usage='%prog [options] cli_host [cli_port]',
+            epilog='Telnet proxy for TTCN CLI')
+    except TypeError:
+        parser = OptionParser(
+            usage='%prog [options] cli_host [cli_port]')
+
+    parser.add_option('-v', '--verbose',
+                      action='store_true', default=False,
+                      help='Verbose. Set max logging level.',
+                      dest='verbose')
+    parser.add_option('-p', '--polltime',
+                      action='store', default=0.0,
+                      help='Set poll time for connection or disable (default)',
+                      dest='poll_time')
+    parser.add_option('-f', '--forever',
+                      action='store_true', default=False,
+                      help='Ignore CLI shutdown.',
+                      dest='forever')
+    parser.add_option('-l', '--listen-port',
+                      action='store', default=DEFAULT_CLI_LISTEN_PORT,
+                      help='Listen port for clients.',
+                      dest='listen_port')
+    parser.add_option('-c', '--set-cli-prompt',
+                      action='store', default=DEFAULT_TTCN_CLI_PROMPT,
+                      help='Set CLI prompt.',
+                      dest='cli_prompt')
+    parser.add_option('-t', '--set-ttcn-timeout',
+                      action='store', default=DEFAULT_TTCN_TIMEOUT,
+                      help='Set TTCN CLI timeout.',
+                      dest='ttcn_timeout')
+    parser.add_option('-s', '--silent',
+                      action='store_true', default=False,
+                      help='No output.',
+                      dest='silent')
+    parser.add_option('-i', '--ignore-user',
+                      action='store_true', default=False,
+                      help='Ignore Ctrl-C signal.',
+                      dest='ignore_user')
+
+    (options, arguments) = parser.parse_args()
+    if len(arguments) < 1:
+        ERR('Argument "cli_host" is mandatory')
+        parser.print_help()
+        sys.exit(CMDLINE_ERROR)
+
+    # Add port if missing and check value
+    if len(arguments) == 1:
+        arguments.append(DEFAULT_TTCN_CLI_PORT)
+    try:
+        if int(arguments[1]) not in range(1024, 65536):
+            ERR('"cli_port" must be in range 1024 to 65535')
+            sys.exit(CMDLINE_ERROR)       
+    except:
+        ERR('Argument "cli_port" is not a valid port definition.')
+        sys.exit(CMDLINE_ERROR)
+
+    try:
+        float(options.poll_time)
+    except:
+        ERR('Option "poll_time" is not a valid float value.')
+        sys.exit(CMDLINE_ERROR)
+
+    return options, arguments
+
+def get_connection(host, port, timeout):
+    try:
+        connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        connection.settimeout(timeout)
+        connection.connect((host, port))
+        return connection
+    except socket.error:
+        WRN('Cannot connect to %s:%s' % (host, port))
+    except KeyboardInterrupt:
+        WRN('Open connection cancelled by user')
+        sys.exit(USER_CANCEL)
+
+def wait_prompt(socket, prompt):
+    rs, ws, es = select.select([socket], [], [])
+    for sock in rs:
+        data = sock.recv(4096)
+        if not data:
+            return False
+        else:
+            return prompt in data
+
+def main():
+    options, arguments = parse_arguments()
+    global DEB
+    global WRN
+    global INF
+    if options.silent:
+        WRN = DEB
+        INF = DEB
+    host, port = arguments[0], int(arguments[1])
+    poll_time = float(options.poll_time)
+
+    while True:
+        INF('Attempting to connect to %s:%s...' % (host, port))
+        timeout = 5.0 if (poll_time <= 0) else poll_time
+        now = time.time()
+        connection = get_connection(host, port, timeout)       
+        if not connection:
+            # Continue poll if requested
+            if poll_time > 0.0:
+                # Avoid overflow
+                need_to_wait = poll_time - (time.time() - now)
+                if need_to_wait > 0.0:
+                    try:
+                        time.sleep(need_to_wait)
+                    except KeyboardInterrupt:
+                        if options.ignore_user:
+                            WRN('User press Ctrl-C but ignoring...')
+                            continue
+                        WRN('Connection poll cancelled by user')
+                        sys.exit(USER_CANCEL)
+                continue
+            # No poll and no connection: END
+            ERR('Cannot connect to "%s:%s"' % (host, port))
+            sys.exit(NET_ERROR)
+
+        # Wait for prompt
+        result = wait_prompt(connection, options.cli_prompt)
+        if result:
+            INF('Opened CLI session!')
+        else:
+            WRN('Server contacted but prompt not found, disconnect...')
+            connection.shutdown(socket.SHUT_WR)
+            connection.close()
+            if poll_time > 0.0:
+                continue
+            else:
+                ERR('Unkown CLI server or status')
+                sys.exit(NET_ERROR)
+
+        # Create server
+        server = Server(connection, options,
+                        listen_port=options.listen_port)
+        server.run()
+        INF('Server thread closed')
+
+        # Shutdown proxy
+        try:
+            connection.shutdown(socket.SHUT_WR)
+            connection.close()
+        except Exception, e:
+            WRN('Error closing CLI connection (%s)' % e)
+        if not options.forever:
+            INF('CLI is over, shutting down...')
+            break
+
+
+if __name__ == '__main__':
+
+    log_level = (logging.DEBUG if ('--verbose' in sys.argv or '-v' in sys.argv) else logging.INFO)
+
+    gais.log.set_core_name('ttcn_proxy_%s.log' % os.getpid(),
+                           logdir=CWD, timestamp=False, level=log_level)
+    with open(os.path.realpath(__file__), 'r') as myself:
+        DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+    main()

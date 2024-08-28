@@ -1,0 +1,634 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+from datetime import datetime, timedelta
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+import xml.etree.ElementTree as ET
+import glob
+
+
+import ntpath
+import signal
+import textwrap
+import socket
+import getpass
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import hss_utils.st_command.cba
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+ALLOWED_FIELDS= ['activeSeverity','eventType','lastEventTime','source','specificProblem',
+                    'additionalText','originalAdditionalText']
+OUTPUT_FILE = None
+def set_output_file(filename):
+    global OUTPUT_FILE
+    try:
+        OUTPUT_FILE= open(filename,"w")
+    except Exception as e:
+        _ERR('%s' % str(e))
+        quit_program(EXECUTION_ERROR)
+
+NODE = None
+WORKING_DIRECTORY = None
+EVENTS = {}
+CLEAN_DIR = True
+
+def set_clean_dir(value):
+    global CLEAN_DIR
+    CLEAN_DIR = value
+
+def quit_program(exit_code,message=''):
+    global NODE
+
+    if OUTPUT_FILE:
+        OUTPUT_FILE.close()
+
+    if NODE:
+         _INF('Release NODE: %s' % NODE)
+         NODE.release()
+
+    if WORKING_DIRECTORY and os.path.exists(WORKING_DIRECTORY) and CLEAN_DIR:
+        _INF('Remove working directory: %s' % WORKING_DIRECTORY)
+        shutil.rmtree(WORKING_DIRECTORY)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+def main():
+
+    global NODE
+    global WORKING_DIRECTORY
+    user_config = parse_commandline()
+
+    if os.path.isdir(user_config.INPUT) and os.path.exists(user_config.INPUT):
+        WORKING_DIRECTORY = user_config.INPUT
+        set_clean_dir(False)
+
+    else:
+        WORKING_DIRECTORY = '/opt/hss/CBA_check_alarm_logs_%s' % os.getpid()
+        if not os.path.exists(WORKING_DIRECTORY):
+            os.makedirs(WORKING_DIRECTORY)
+        tar_file = 'FmAlarmLog_%s.tgz' % os.getpid()
+
+        if st_command.validate_ip(user_config.INPUT,IPv6=False):
+            _INF('Collecting logs from the node %s to generate the tar.gz file' % user_config.INPUT)
+            cmd = 'CBA_collect_logs --node %s  --user %s --port %s --log_type alarms -o %s -s %s' % (user_config.INPUT,
+                                                                                                user_config.user,
+                                                                                                user_config.port,
+                                                                                                WORKING_DIRECTORY,
+                                                                                                os.getpid())
+            _INF('Executing command: %s' % cmd)
+
+            (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+            if output_code:
+                error = 'Error when collecting the logs from the HSS environment'
+                _ERR(error)
+                _ERR(output_err)
+                quit_program(EXECUTION_ERROR, error)
+
+        else:
+
+            files = glob.glob(user_config.INPUT)
+            if not files:
+                error = 'Wrong --input value: %s' % user_config.INPUT
+                _ERR(error)
+                quit_program(WRONG_PARAMETER, error)
+
+            cmd = 'cp %s %s/%s' % (user_config.INPUT, WORKING_DIRECTORY, tar_file)
+            _INF('Executing: %s' % cmd)
+            stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+            if returncode:
+                error = 'Error executing "%s": %s' % (cmd, stderr_value)
+                _ERR(error)
+                quit_program(WRONG_PARAMETER, error)
+
+        cmd = 'tar -xvf %s/%s' % (WORKING_DIRECTORY, tar_file)
+        _INF('Executing: %s' % cmd)
+        stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd, stdout=True, stderr=True, cwd=WORKING_DIRECTORY)
+        if returncode:
+            error = 'Error executing "%s": %s' % (cmd, stderr_value)
+            _ERR(error)
+            quit_program(WRONG_PARAMETER, error)
+
+    file_list= sorted(glob.glob("%s/*.log" % WORKING_DIRECTORY))
+
+    if user_config.from_time:
+        try:
+            user_config.offset_date = datetime.strptime(user_config.from_time, '%Y-%m-%dT%H:%M:%S')
+        except Exception as e:
+            error = '--from_time %s not valid. Value shall be in format "Y-m-dTH:M:S"' % user_config.from_time
+            _ERR(error)
+            quit_program(WRONG_PARAMETER, error)
+    else:
+        user_config.offset_date = datetime.strptime('2010-7-10T22:55:56', '%Y-%m-%dT%H:%M:%S')
+
+    if user_config.to_time:
+        try:
+            user_config.last_date = datetime.strptime(user_config.to_time, '%Y-%m-%dT%H:%M:%S')
+        except Exception as e:
+            error = '--to-time %s not valid. Value shall be in format "Y-m-dTH:M:S"' % user_config.to_time
+            _ERR(error)
+            quit_program(WRONG_PARAMETER, error)
+    elif user_config.period:
+        user_config.last_date = user_config.offset_date + timedelta(seconds=user_config.period)
+    else:
+        user_config.last_date = datetime.now()
+
+    global EVENTS
+    for filename in file_list:
+        name = os.path.splitext(os.path.basename(filename))[0]
+        try:
+            start_date_file = datetime.strptime('_'.join(name.split('_')[1:3]), '%Y%m%d_%H%M%S')
+        except Exception:
+            _INF('Discard file "%s". Wrong filename format'% name)
+            continue
+        if name.count('_') == 4:
+            try:
+                stop_date_file = datetime.strptime('_'.join(name.split('_')[3:]), '%Y%m%d_%H%M%S')
+            except Exception:
+                _INF('Discard file "%s". Wrong filename format'% name)
+                continue
+        else:
+            stop_date_file = datetime.now()
+            # Checking if the FmAlarm File is with a future date from CERT TCs
+            if user_config.offset_date > stop_date_file:
+                _WRN ('Checking file %s with a future date' % filename)
+                _INF ('Setting stop date file to a future date:%s' % user_config.offset_date)
+                stop_date_file = user_config.offset_date
+
+        if start_date_file > user_config.last_date or stop_date_file < user_config.offset_date:
+            _INF ('Discard %s' % filename)
+            continue
+
+        _INF('Parsing %s' % filename)
+        with open(filename) as f:
+            info = f.read()
+        data = '''<data>
+%s
+</data>''' % info
+
+        try:
+            xml_info = ET.fromstring(data)
+        except Exception:
+            _INF('Discard file "%s". XML format error' % name)
+            continue
+
+        for event in xml_info.iter('FmLogRecord'):
+            event_data ={}
+            new_event = event.find('LogTimestamp').text
+            info = event.find('Alarm').text.split(';')
+            event_index = '%s - %s' % (info[11], info[14])
+            state= 'New' if info[7] != 'CLEARED' else 'Cleared'
+            event_data.update({'lastEventTime':info[1]})
+            event_data.update({'source':info[2]})
+            event_data.update({'specificProblem':info[5]})
+            event_data.update({'additionalText':info[8]})
+            event_data.update({'eventType':info[10]})
+            event_data.update({'OriginalEventTime':info[11]})
+            event_data.update({'activeSeverity':info[12]})
+            event_data.update({'originalAdditionalText':info[13]})
+            event_data.update({'seqnum':info[14]})
+
+            try:
+                alarm_date = datetime.strptime(info[11].split('.')[0], '%Y-%m-%dT%H:%M:%S')
+            except Exception as e:
+                _DEB('%s timestamp not valid: %s' % (info[11],str(e)))
+                continue
+
+            if alarm_date >= user_config.offset_date and alarm_date <= user_config.last_date:
+                if event_data['activeSeverity'] in user_config.severity:
+                    try:
+                        re.compile(user_config.filter)
+                    except re.error:
+                        error = 'Invalid regular expression in "--filter": "%s"' % user_config.filter
+                        _ERR(error)
+                        quit_program(WRONG_PARAMETER, error)
+                    try:
+                        re.compile(user_config.source)
+                    except re.error:
+                        error = 'Invalid regular expression in "--source": "%s"' % user_config.source
+                        _ERR(error)
+                        quit_program(WRONG_PARAMETER, error)
+
+                    if re.match( r'%s' % user_config.filter, event_data['specificProblem']) and re.match( r'%s' % user_config.source, event_data['source']):
+                        skip = False
+                        for exclude in user_config.exclude:
+                            try:
+                                re.compile(exclude)
+                            except re.error:
+                                error = 'Invalid regular expression in "-x": "%s"' % exclude
+                                _ERR(error)
+                                quit_program(WRONG_PARAMETER, error)
+
+                            if re.match( r'%s' % exclude, event_data['specificProblem']):
+                                skip = True
+                                break;
+                        if skip:
+                            continue
+
+                        if state == 'New':
+                            EVENTS.update({(event_index):{'data':event_data,'state':state}})
+                        else:
+                            try:
+                                EVENTS[(event_index)]['state']=state
+                                EVENTS[(event_index)]['data']=event_data
+                            except KeyError:
+                                EVENTS.update({(event_index):{'data':event_data,'state':'Trigger_not_found'}})
+                                _DEB('Event to be cleared %s not found' % event_index)
+    if not EVENTS:
+        info = 'Not alarms found.'
+        print ('%s ' % info)
+        quit_program(SUCCESS, info)
+
+
+    if  user_config.output_file:
+        set_output_file(user_config.output_file)
+
+    if user_config.summary:
+        summary = {}
+        for field in user_config.summary:
+            field = field.split(':',1)
+            if field[0] not in ALLOWED_FIELDS:
+                error = '%s not valid as summary index.' % field[0]
+                _ERR(error)
+                quit_program(WRONG_PARAMETER, error)
+
+            if len(field) == 1 or field[1] == '':
+                regex = '.*'
+            else:
+                regex = field[1]
+            try:
+                re.compile(regex)
+            except re.error:
+                error = 'Invalid regular expression in "--summary": "%s"' % regex
+                _ERR(error)
+                quit_program(WRONG_PARAMETER, error)
+
+            summary.update({field[0]:{'regex':regex,'data':{'New':{},'Cleared':{},'Trigger_not_found':{}}}})
+
+        for event in EVENTS.values():
+            if event['state'] not in user_config.state:
+                continue
+            for key in summary.keys():
+                if re.match( r'%s' % summary[key]['regex'], event['data'][key]):
+                    try:
+                        summary[key]['data'][event['state']][event['data'][key]] += 1
+                    except KeyError:
+                        summary[key]['data'][event['state']].update({event['data'][key]:1})
+
+        info = '\nSummary from %s  to  %s\n' % (user_config.offset_date.isoformat(), user_config.last_date.strftime('%Y-%m-%dT%H:%M:%S'))
+        for key, value in summary.iteritems():
+            for state in sorted(value['data'].keys()):
+                if state in user_config.state:
+                    info += '\n  %s  (%s)\n' % (key, state)
+                    if len(value['data'][state].keys()):
+                        for key2 in sorted(value['data'][state].keys()):
+                            severity = ''
+                            if user_config.add_severity:
+                                severity = '%-*s' % (10, severity_by_event_field(key, key2, state))
+                            info += '\n    %-*s %s %s' % (10,value['data'][state][key2], severity, key2)
+                    else:
+                        info += '\n    %-*s' % (10,'Not alarms found.')
+                    info += '\n'
+
+        display(info)
+    else:
+        for state in user_config.state:
+            events = events_by_state(state)
+            report_events(events)
+
+    quit_program(SUCCESS)
+
+def display(info):
+    if OUTPUT_FILE:
+        OUTPUT_FILE.write('%s\n' % info)
+    else:
+        print (info)
+
+def event_info(event):
+    info = 'EventTimestamp - sequence number: %s - %s' % (EVENTS[event]['data']['lastEventTime'],
+                                                           EVENTS[event]['data']['seqnum'])
+    info += '\n  activeSeverity        : %s' % EVENTS[event]['data']['activeSeverity']
+    info += '\n  eventType             : %s' % EVENTS[event]['data']['eventType']
+    info += '\n  OriginalEventTime     : %s' % EVENTS[event]['data']['OriginalEventTime']
+    info += '\n  lastEventTime         : %s' % EVENTS[event]['data']['lastEventTime']
+    info += '\n  source                : %s' % EVENTS[event]['data']['source']
+    info += '\n  specificProblem       : %s' % EVENTS[event]['data']['specificProblem']
+    info += '\n  additionalText        : %s' % EVENTS[event]['data']['additionalText']
+    info += '\n  originalAdditionalText: %s' % EVENTS[event]['data']['originalAdditionalText']
+    return info
+
+def show_event(event):
+    try:
+        state = EVENTS[event]['state']
+        display('\n%s     %s\n' % (state, event_info(event)))
+
+    except (IndexError,KeyError) as e:
+        _DEB('Exception %s' % str(e))
+        _WRN('%s event %s data to be displayed not found in DB' % (state, event))
+
+def severity_by_event_field(key, value, state):
+    severity = ''
+    for event, event_info in EVENTS.iteritems():
+        if event_info['data'][key] == value and event_info['state'] == state:
+            if not severity:
+                severity = event_info['data']['activeSeverity']
+            elif severity != event_info['data']['activeSeverity']:
+                _WRN('Found events with %s = %s but different activeSeverity' % (key,value))
+                return 'UNKNOWN'
+
+    return severity
+
+
+def events_by_state(state):
+    events = []
+    for event, event_info in EVENTS.iteritems():
+        if event_info['state'] == state:
+            events.append(event)
+    return events
+
+def report_events(events=[]):
+    for event in sorted(events):
+        show_event(event)
+
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+
+            formatter_class=argparse.RawTextHelpFormatter,
+            description=textwrap.dedent('''\
+Parse and select info from alarm logs for a CBA cluster.
+The origin of alarm files can be:
+    NODE      tool will connect to, collect and process the files in a temporary directory
+    PATH      tool will just process the alarm log files loacted in the PATH directory
+    FILE      tool will uncompress tgz file in a temporary directory and process the alarm log  files
+
+
+The first action is to select the alarm records to be analyzed using the criteria
+    - Time slot defined as
+            first_record    <-->     ( --to )
+            ( --from )      <-->     ( --to )
+            ( --from )      <-->     ( --from )  + ( --period )
+            ( --from )      <-->     last_record
+            first_record    <-->     last_record
+
+    - Alarm state ( -s )
+            'New'   'Cleared'    'Trigger_not_found'
+
+    - Selection filter using activeSeverityalarm field      ( --severity )
+    - Selection filter using specificProblem alarm field    ( --filter )
+    - Selection filter using source alarm field             ( --source )
+    - Exclusion filter using specificProblem alarm field    ( -x )
+
+Once the records are selected the folowing action can be executed:
+    - Display list of selected alarms                    ( Default )
+    - Display the summary for a list of specific fields  ( --summary )
+
+''') ,
+                        epilog=textwrap.dedent(get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-i','--input',
+                        action='store', default=None,
+                        help='''For NODE: OAM IP address of the node. If ommitted local hostname will be used to find env in rosetta
+For PATH: Full local path where alarm log files are located.
+For FILE: Full local path of alarm tgz files. 
+          Wilcard "*" can be used in the filename but if there are more than one tgz file the value shall be quotted
+ 
+''',
+                        dest='INPUT')
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh. Default: %(default)s',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh. Default: %(default)s',
+                      dest='user')
+
+    filter_params = parser.add_argument_group('Filtering criteria configuration')
+
+    filter_params.add_argument('-s','--state',nargs='*',
+                      action='store', default=['New','Cleared'],
+                      choices=['New','Cleared','Trigger_not_found'],
+                      help='''List of alarm state values used as filter. Default value are 'New' and 'Cleared'
+Allowed values:
+    New                 Alarm triggered during the checking period but no cleared.
+    Cleared             Alarm triggered and cleared during the checking period.
+    Trigger_not_found   Alarm cleared during the checking period but triggered before.
+
+''',
+                      dest='state')
+
+    filter_params.add_argument('--severity',
+                      action='store', default=['CRITICAL','MAJOR','MINOR','WARNING'],nargs='*',
+                      choices=['CRITICAL','MAJOR','MINOR','WARNING'],
+                      help='Severity value used as filter. By default all of them will be used',
+                      dest='severity')
+
+    filter_params.add_argument('-f','--filter',
+                      action='store', default='.*',
+                      help='Regex used as filter for specificProblem description. Default: %(default)s',
+                      dest='filter')
+
+    filter_params.add_argument('-x','--exclude',nargs='*',
+                      action='store', default='',
+                      help='List of regex used as exclusion filter in specificProblem description. Default: %(default)s',
+                      dest='exclude')
+
+    filter_params.add_argument('--source',
+                      action='store', default='.*',
+                      help='Regex used as filter for source. Default: %(default)s',
+                      dest='source')
+
+    time_params = parser.add_argument_group('Slot time configuration')
+
+    time_params.add_argument('--from',
+                      action='store', default=None,
+                      help='Set the start time for filtering alarms. Value shall be in format "Y-m-dTH:M:S"',
+                      dest='from_time')
+
+    time_params.add_argument('--to',
+                      action='store', default=None,
+                      help='Set the last time for filtering alarms. Value shall be in format "Y-m-dTH:M:S"',
+                      dest='to_time')
+
+    time_params.add_argument('--period',
+                      action='store', default=0,type=int,
+                      help='Number of seconds to be added to "from" time for setting the "to" time.',
+                      dest='period')
+
+    behaviour_params = parser.add_argument_group('Tool behaviour configuration')
+
+    behaviour_params.add_argument('--summary',nargs='*',
+                      action='store', default=[],
+                      help='''Display the summary (number of events and values) for a list of specific fields
+Syntax:  [field_name[:regex][field_name[:regex] ...]]
+If regex is not present '.*' will be used as default
+Allowed values for field_name:
+    %s
+
+If the --add-severity is set the activeSeverity info will be also included in summary. 
+    UNKNOWN means that there are more than one activeSeverity value for the same content of a field_name
+
+''' % ' '.join(ALLOWED_FIELDS),
+                      dest='summary')
+
+    behaviour_params.add_argument('--add-severity',
+                      action='store_true', default=False,
+                      help='Add the activeSeverity information to the summary',
+                      dest='add_severity')
+
+    behaviour_params.add_argument('-o', '--output',
+                      action='store', default=None,
+                      help='Save info is the full path file specified. By default /opt/hss/CBA_check_alarm_logs_<pid>',
+                      dest='output_file')
+
+    behaviour_params.add_argument('--skip-clean',
+                      action='store_true', default=False,
+                      help='DO NOT remove temporary directory',
+                      dest='skip_clean')
+
+    logging=e3utils.log.add_logging_options(parser)
+    logging.add_argument('--log-path',
+                        default=None, action='store', dest='log_path',
+                        help='Set an specific path for tool logs. Default is "%s"' % CWD)
+
+    args = parser.parse_args()
+
+    if args.log_path is not None and args.log_file is not None:
+        error = 'Error: --log_file and --log_path can not be used at the same time'
+        _ERR(error)
+        quit_program(ROSETTA_ERROR, error)
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_check_alarm_logs_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_path is None:
+        args.log_path = CWD
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(args.log_path, 'CBA_check_alarm_logs_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.INPUT is None:
+        _DEB('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _DEB('Environment  : %s' % env)
+            args.INPUT = config.get_cabinet_oam_vip(cabinet=0)
+            _DEB('Node         :%s' % args.INPUT)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable) as e:
+            error = 'Error: %s. Use command line parameter --input' % str(e)
+            _ERR(error)
+            quit_program(ROSETTA_ERROR, error)
+
+    if args.skip_clean:
+        set_clean_dir(False)
+
+    return (args)
+
+
+if __name__ == '__main__':
+
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _DEB('Execution stopped by user with Ctrl-c')
+        quit_program(SUCCESS)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(SUCCESS)
+
+
+

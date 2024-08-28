@@ -1,0 +1,922 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+
+
+__version__ = '0.1'
+__author__ = 'Mitxel Garcia'
+__email__ = 'mitxel.garcia@ericsson.com'
+
+import sys
+import time
+import argparse
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+import traceback
+import argparse
+import subprocess
+import cmd
+from optparse import OptionParser
+from datetime import datetime
+import uuid
+import json
+import os.path
+import pprint
+from distutils.version import LooseVersion
+
+
+import hss_utils.dbus
+
+from hss_utils.st_command import send_udp_command
+from hss_utils.st_command import real_path
+import HSS_rtc_lib.components.test_suite
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+def quit_program(code):
+    sys.exit(code)
+
+class ShellOptionParser(OptionParser):
+    def error(self, msg):
+        print msg
+    def exit(self, code=0, msg=None):
+        if msg is not None:
+            print msg
+
+def send_tcp(data):
+    HOST, PORT = "localhost", 10000
+
+    # Create a socket (SOCK_STREAM means a TCP socket)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    try:
+        sock.connect((HOST, PORT))
+    except Exception as e:
+        print 'connect problem: %s' % e
+
+    try:
+        sock.sendall(data)
+        sock.sendall('\n')
+    except Exception as e:
+        print 'sendall problem: %s' % e
+        sock.close()
+        return
+
+    try:
+        sock.settimeout(20.0)
+        data = sock.recv(1024)
+        print data
+    except Exception as e:
+        print 'recv problem:%s' % e
+
+    sock.close()
+    return
+
+
+def create_trigger(trigger, build,*args):
+    trigger = str(trigger)
+    data = {
+        'op': trigger,
+        'build':build,
+        'args': args,
+        'request_answer':True
+    }
+    #with open('trigger.json', 'w') as fp:
+        #json.dump(data, fp, indent=4)
+    return json.dumps(data)
+
+HSS_RTC_UDP_PORT=5000
+def execute_HSS_rtc_command(cmd):
+    answer = send_udp_command(cmd, 'localhost', HSS_RTC_UDP_PORT, timeout=5.0)
+    if answer is None:
+        answer = 'No answer received. HSS_rtc is not running.'
+    print answer
+
+
+class DbusHandler(object):
+    def __init__(self,owner):
+        self.__owner = owner
+        self.__watcher = hss_utils.dbus.Watcher()
+        self.__signal_default_answer = str(uuid.uuid4())
+        self.__watcher.install_handler(self.__signal_default_answer,self.process_default_answer)
+        self.__watcher.install_handler('cli_fetch_config_%s' % self.__signal_default_answer,self.process_fetch_config_answer)
+        self.__watcher.install_handler('cli_fetch_build_test_info_%s' % self.__signal_default_answer,self.process_fetch_build_test_info_answer)
+        self.__watcher.install_handler('cli_fetch_pending_build_list_%s' % self.__signal_default_answer,self.process_fetch_pending_build_list_answer)
+        self.__watcher.install_handler('cli_fetch_available_builds_%s' % self.__signal_default_answer,self.process_fetch_available_builds_answer)
+        self.__watcher.install_handler('cli_fetch_build_test_result_%s' % self.__signal_default_answer,self.process_fetch_build_test_result_answer)
+        self.output_file=None
+        self.test_name=''
+
+
+    def send_command(self,signal_req,args=[]):
+        if signal_req in ['cli_update_config','cli_fetch_baseline','cli_activate_baseline','cli_add_baseline','cli_del_baseline',
+                          'cli_update_build_test_info','cli_set_build_status',
+                          'cli_resume','cli_pause','cli_status','cli_force_build','cli_clean_build','cli_purge_build',
+                          'cli_update_trigger', 'cli_fetch_tcp_port','cli_fetch_trigger']:
+            args =tuple([self.__signal_default_answer] + args)
+        else:
+            args =tuple(['%s_%s' % (signal_req, self.__signal_default_answer)] + args)
+        self.__watcher.emit(signal_req,*args)
+
+
+    def process_default_answer(self,answer):
+        print answer
+        self.__owner.answer_received = True
+
+
+    def process_fetch_config_answer(self,answer):
+        if isinstance(answer, dict):
+            print json.dumps(answer, indent=4)
+            if self.output_file is not None:
+                try:
+                    with open(self.output_file, 'w') as fp:
+                        json.dump(answer, fp, indent=4)
+                except Exception as e:
+                    _ERR('Error saving %s file: %s' % (self.output_file, str(e)))
+
+        else:
+            print answer
+
+        self.output_file=None
+        self.__owner.answer_received = True
+
+
+    def process_fetch_build_test_info_answer(self,answer):
+        if isinstance(answer, dict):
+            print json.dumps(answer, indent=4)
+            if self.output_file is not None:
+                try:
+                    with open(self.output_file, 'w') as fp:
+                        json.dump(answer, fp, indent=4)
+                except Exception as e:
+                    _ERR('Error saving %s file: %s' % (self.output_file, str(e)))
+
+        else:
+            print answer
+
+        self.output_file=None
+        self.__owner.answer_received = True
+
+
+    def process_fetch_pending_build_list_answer(self,answer):
+        if isinstance(answer, list):
+            for build in answer:
+                print '%s\t%s' % (build[0], ('High Priority' if build[1] else ''))
+        else:
+            print answer
+        self.__owner.answer_received = True
+
+
+    def process_fetch_available_builds_answer(self,answer):
+        if isinstance(answer, dict):
+            for key in sorted(answer.keys(), key=LooseVersion):
+                print '%s\t%s' % (key, answer[key])
+        else:
+            print answer
+        self.__owner.answer_received = True
+
+
+    def process_fetch_build_test_result_answer(self,answer):
+        if isinstance(answer, list):
+            if len(answer) == 1:
+                print str(HSS_rtc_lib.components.test_suite.TestSuite(data=answer[0]))
+            elif self.test_name != '':
+                for test_result in answer:
+                    if isinstance(test_result, dict) and test_result['name'] == self.test_name:
+                        print str(HSS_rtc_lib.components.test_suite.TestSuite(data=test_result))
+            else:
+                for test_result in answer:
+                    if isinstance(test_result, dict):
+                        print '%s' % test_result['name']
+
+        #elif isinstance(answer, dict):
+            #print str(HSS_rtc_lib.components.test_suite.TestSuite(data=answer))
+
+        else:
+            print answer
+
+        self.test_name=''
+        self.__owner.answer_received = True
+
+
+    @property
+    def running(self):
+        return self.__watcher.running
+
+    def stop(self):
+        self.__watcher.stop()
+
+class RtcShellClient(object):
+    def __init__(self):
+        pass
+
+    def execute_cmd(self, cmd):
+        try:
+            proc = subprocess.Popen(cmd,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    shell=True)
+
+        except Exception, e:
+            _ERR('Cmd result error : %s' % repr(str(e)))
+            if self.stop_on_error is True:
+                quit_program(2)
+
+        try:
+            stdout_value, stderr_value = proc.communicate() 
+            if proc.returncode == 0:
+                _INF('Cmd ok')
+            else:
+                _ERR('Cmd return code %s' % proc.returncode)
+                if stderr_value != '':
+                    _ERR('%s' % repr(stderr_value))
+
+        except KeyboardInterrupt:
+            _WRN('User send Ctrl-C, Stopped cmd execution')
+            proc.terminate()
+        except OverflowError, e:
+            _ERR('Cmd result error : %s' % repr(str(e)))
+        except Exception, e:
+            _ERR('Cmd result error : %s' % repr(str(e)))
+
+
+    def wait(self, seconds):
+        print '\t Waiting.....'
+        try:
+            time.sleep(float(seconds))
+        except KeyboardInterrupt:
+            _WRN('User send Ctrl-C, Stop waiting')
+
+        return
+
+class RtcShell(cmd.Cmd):
+    intro = 'Welcome to RTC shell. Type help or ? to list commands.\n'
+    prompt = 'rtc_cli> '
+    client = RtcShellClient()
+    answer_received = False
+    dbus_handler = None
+
+    def default(self, line):
+        # Ignore comments
+        line = line.strip()
+        for begin in ['#', '//']:
+            if line.startswith(begin):
+                return
+        print('Unknown command: %s. Type help or ? to list allowed commands' % line)
+        return
+
+    def emptyline(self):
+        pass
+
+    def do_EOF(self, line):
+        self.do_exit(line)
+
+    def do_shutdown(self, line):
+        self.do_exit(line)
+
+    def do_exit(self, line):
+        self.stop()
+        print('')
+        quit_program(0)
+
+    def stop(self):
+        if self.dbus_handler is not None:
+            self.dbus_handler.stop()
+
+    def set_output_file(self,name):
+        if self.dbus_handler is None:
+            self.dbus_handler = DbusHandler(self)
+        self.dbus_handler.output_file = name
+
+    def set_test_name(self,name):
+        if self.dbus_handler is None:
+            self.dbus_handler = DbusHandler(self)
+        self.dbus_handler.test_name = name
+
+
+    def send_dbus_command(self, cmd, args=[]):
+        if self.dbus_handler is None:
+            self.dbus_handler = DbusHandler(self)
+        self.answer_received = False
+        self.dbus_handler.send_command(cmd, args)
+
+        timeout = float(5.0)
+        started = time.time()
+        while not self.answer_received:
+            now = time.time()
+            time.sleep(float(1))
+            timeout -= time.time() - now
+            if timeout < float(0):
+                _ERR('Timeout.')
+                break
+
+
+##### Commands for actions in rtc_controller service 
+
+    def help_SERVICE_TEST_BUILD(self):
+        print '''\nSERVICE_TEST_BUILD <build_id> [--build_info <build_info>] [--test_suite <test_suite>] [--high_priority]
+\nForce the test execution of an specific build. rtc_controller service shall be in paused state
+ <build_info> location of the file with info needed for testing
+ <test_suite> set an specific test suite. User hss_st shall have reading permission
+ 
+'''
+
+    def _parse_SERVICE_TEST_BUILD_args_(self, args):
+        parser = ShellOptionParser()
+        parser.add_option('--build_info',
+                          action='store', default=None,
+                          dest='build_info')
+        parser.add_option('--test_suite',
+                          action='store', default=None,
+                          dest='test_suite')
+        parser.add_option('--high_priority',
+                          action='store_true', default=False,
+                          dest='high_priority')
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_TEST_BUILD(self, arg):
+        options, args = self._parse_SERVICE_TEST_BUILD_args_(arg)
+        if len(args) < 1:
+            print '*** Cmd requires <build_id> '
+            return
+
+        if options.test_suite is not None:
+            options.test_suite = real_path(options.test_suite)
+
+        self.send_dbus_command('cli_force_build',[args[0],options.build_info,options.test_suite,options.high_priority])
+        return
+
+
+    def help_SERVICE_CLEAN_BUILD(self):
+        print '''\nSERVICE_CLEAN_BUILD <build_id_wildcard>
+\nClean form service Db the info for all build_id starting by build_id_wildcard
+'''
+
+    def _parse_SERVICE_CLEAN_BUILD_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_CLEAN_BUILD(self, arg):
+        options, args = self._parse_SERVICE_CLEAN_BUILD_args_(arg)
+        if len(args) < 1:
+            print '*** Cmd requires <build_id_wildcard>'
+            return
+
+        self.send_dbus_command('cli_clean_build',[args[0]])
+        return
+
+
+    def help_SERVICE_PURGE_BUILD(self):
+        print '''\nSERVICE_PURGE_BUILD <build_id_wildcard>
+\nKeep only the latest test result in service Db for all build_id starting by build_id_wildcard
+'''
+
+    def _parse_SERVICE_PURGE_BUILD_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_PURGE_BUILD(self, arg):
+        options, args = self._parse_SERVICE_PURGE_BUILD_args_(arg)
+        if len(args) < 1:
+            print '*** Cmd requires <build_id_wildcard>'
+            return
+
+        self.send_dbus_command('cli_purge_build',[args[0]])
+        return
+
+
+
+    def help_SERVICE_SET_BUILD_STATUS(self):
+        print '''\nSERVICE_SET_BUILD_STATUS <build_id> <status>
+\nSet the status of a build
+<status>   Allowed values are: CANCELLED | SKIPPED | TESTED | TEST_FAULTY'
+'''
+
+    def _parse_SERVICE_SET_BUILD_STATUS_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_SET_BUILD_STATUS(self, arg):
+        options, args = self._parse_SERVICE_SET_BUILD_STATUS_args_(arg)
+        if len(args) < 2:
+            print '*** Cmd requires <build_id> <status>'
+            return
+
+        self.send_dbus_command('cli_set_build_status',[args[0], args[1]])
+        return
+
+
+
+
+    def help_SERVICE_FETCH_BUILD_TEST_RESULT(self):
+        print '''\nSERVICE_FETCH_BUILD_TEST_RESULT<build_id> [--test]
+\nFetch test report of an specific build. If there is only one the report will be shown
+If there are several the list of test names will be shown
+\t --test   specify one of available test report
+'''
+
+    def _parse_SERVICE_FETCH_BUILD_TEST_RESULT_args_(self, args):
+        parser = ShellOptionParser()
+        parser.add_option('--test',
+                          action='store', default='',
+                          dest='test')
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_FETCH_BUILD_TEST_RESULT(self, arg):
+        options, args = self._parse_SERVICE_FETCH_BUILD_TEST_RESULT_args_(arg)
+        if len(args) < 1:
+            print '*** Cmd requires <build_id> '
+            return
+
+        self.set_test_name(options.test)
+        self.send_dbus_command('cli_fetch_build_test_result',[args[0]])
+        return
+
+
+    def help_SERVICE_FETCH_AVAILABLE_BUILDS(self):
+        print '''\nSERVICE_FETCH_AVAILABLE_BUILDS
+\nFetch list of builds that can be tested'''
+
+    def do_SERVICE_FETCH_AVAILABLE_BUILDS(self, arg):
+
+        self.send_dbus_command('cli_fetch_available_builds')
+        return
+
+
+
+    def help_SERVICE_FETCH_PENDING_BUILD_LIST(self):
+        print '''\nSERVICE_FETCH_PENDING_BUILD_LIST
+\nFetch the full list of pending builds ordered by priority'''
+
+
+    def do_SERVICE_FETCH_PENDING_BUILD_LIST(self, arg):
+
+        self.send_dbus_command('cli_fetch_pending_build_list')
+        return
+
+
+
+    def help_SERVICE_STATUS(self):
+        print '''\nSERVICE_STATUS
+\nCheck the rtc_controller service status
+'''
+
+
+    def do_SERVICE_STATUS(self, arg):
+        self.send_dbus_command('cli_status')
+        return
+
+
+    def help_SERVICE_PAUSE(self):
+        print '''\nSERVICE_PAUSE
+\nPause the rtc_controller service. The environment will be free for testers
+Ongoing test execution will be stopped'''
+
+
+    def do_SERVICE_PAUSE(self, arg):
+        self.send_dbus_command('cli_pause')
+        return
+
+
+    def help_SERVICE_RESUME(self):
+        print '''\nSERVICE_RESUME
+\nResume the rtc_controller service. The environment can not be used by testers'''
+
+    def do_SERVICE_RESUME(self, arg):
+
+        self.send_dbus_command('cli_resume')
+        return
+
+
+
+    def help_SERVICE_FETCH_CONFIG(self):
+        print '''\nSERVICE_FETCH_CONFIG [--file <config_file.json>]
+\nFetch the rtc_controller service configuration.'''
+
+    def _parse_SERVICE_FETCH_CONFIG_args_(self, args):
+        parser = ShellOptionParser()
+        parser.add_option('--file',
+                          action='store', default=None,
+                          dest='filename')
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_FETCH_CONFIG(self, arg):
+        options, args = self._parse_SERVICE_FETCH_CONFIG_args_(arg)
+
+        self.set_output_file(options.filename)
+        self.send_dbus_command('cli_fetch_config')
+        return
+
+
+
+    def help_SERVICE_UPDATE_CONFIG(self):
+        print '''\nSERVICE_UPDATE_CONFIG <config_file.json> [--persist]
+\nUpdate rtc_controller service configuration.
+rtc_controller service shall be in paused state
+if persist is not present changes in configuration will be discarded after resume'''
+
+    def _parse_SERVICE_UPDATE_CONFIG_args_(self, args):
+        parser = ShellOptionParser()
+        parser.add_option('--persist',
+                          action='store_true', default=False,
+                          dest='persist')
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_UPDATE_CONFIG(self, arg):
+        options, args = self._parse_SERVICE_UPDATE_CONFIG_args_(arg)
+        if len(args) < 1:
+            print '*** Cmd requires <config_file.json>'
+            return
+
+        try:
+            with open(args[0]) as json_data:
+                service_config = json.load(json_data)
+        except IOError as e:
+            _ERR('Error reading file. %s' % e)
+            return
+        except Exception as e:
+            _ERR('Error parsing json %s file: %s' % (args[0], e))
+            return
+
+        self.send_dbus_command('cli_update_config',[service_config,options.persist])
+        return
+
+
+    def help_SERVICE_FETCH_BUILD_TEST_INFO(self):
+        print '''\nSERVICE_FETCH_BUILD_TEST_INFO <build_id> [--file <build_test_info_file.json>]
+\nFetch the test build info (ARM links and commit-id for allowed GIT repos).'''
+
+    def _parse_SERVICE_FETCH_BUILD_TEST_INFO_args_(self, args):
+        parser = ShellOptionParser()
+        parser.add_option('--file',
+                          action='store', default=None,
+                          dest='filename')
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_FETCH_BUILD_TEST_INFO(self, arg):
+        options, args = self._parse_SERVICE_FETCH_BUILD_TEST_INFO_args_(arg)
+        if len(args) != 1:
+            print '*** Cmd requires <build_id>'
+            return
+
+        self.set_output_file(options.filename)
+        self.send_dbus_command('cli_fetch_build_test_info',[args[0]])
+        return
+
+
+    def help_SERVICE_UPDATE_BUILD_TEST_INFO(self):
+        print '''\nSERVICE_UPDATE_BUILD_TEST_INFO <build_id> <build_test_info_file.json> [--persist]
+\nUpdate the test build info.
+rtc_controller service shall be in paused state
+if persist is not present changes will be discarded after resume'''
+
+    def _parse_SERVICE_UPDATE_BUILD_TEST_INFO_args_(self, args):
+        parser = ShellOptionParser()
+        parser.add_option('--persist',
+                          action='store_true', default=False,
+                          dest='persist')
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_UPDATE_BUILD_TEST_INFO(self, arg):
+        options, args = self._parse_SERVICE_UPDATE_BUILD_TEST_INFO_args_(arg)
+        if len(args) != 2:
+            print '*** Cmd requires <build_id> <build_test_info_file.json>'
+            return
+
+        try:
+            with open(args[1]) as json_data:
+                test_info = json.load(json_data)
+        except IOError as e:
+            _ERR('Error reading file. %s' % e)
+            return
+        except Exception as e:
+            _ERR('Error parsing json %s file: %s' % (args[1], e))
+            return
+
+        self.send_dbus_command('cli_update_build_test_info',[args[0],test_info,options.persist])
+        return
+
+
+    def help_SERVICE_BASELINE_LIST(self):
+        print '''\nSERVICE_BASELINE_LIST
+\nFetch the list of allowed baselines'''
+
+    def do_SERVICE_BASELINE_LIST(self, arg):
+        self.send_dbus_command('cli_fetch_baseline')
+        return
+
+
+    def help_SERVICE_BASELINE_ACTIVATE(self):
+        print '''\nSERVICE_BASELINE_ACTIVATE <baseline>
+\nActivate the baseline used for tests.'''
+
+    def _parse_SERVICE_BASELINE_ACTIVATE_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_BASELINE_ACTIVATE(self, arg):
+        options, args = self._parse_SERVICE_BASELINE_ACTIVATE_args_(arg)
+        if len(args) < 1:
+            print '*** Cmd requires <baseline>'
+            return
+
+        self.send_dbus_command('cli_activate_baseline',[args[0]])
+        return
+
+
+
+    def help_SERVICE_BASELINE_ADD(self):
+        print '''\nSERVICE_BASELINE_ADD <build>
+\nAdd a new the baseline for the provided build.'''
+
+    def _parse_SERVICE_BASELINE_ADD_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_BASELINE_ADD(self, arg):
+        options, args = self._parse_SERVICE_BASELINE_ADD_args_(arg)
+        if len(args) < 1:
+            print '*** Cmd requires <baseline>'
+            return
+
+        self.send_dbus_command('cli_add_baseline',[args[0]])
+        return
+
+
+
+    def help_SERVICE_BASELINE_DEL(self):
+        print '''\nSERVICE_BASELINE_DEL <baseline> [--clean][--force]
+\nDelete a baseline.
+If clean is present the info for all the builds in this release will be removed
+Use --force for deleting the active baseline, No one will be the active from this moment'''
+
+    def _parse_SERVICE_BASELINE_DEL_args_(self, args):
+        parser = ShellOptionParser()
+        parser.add_option('--clean',
+                          action='store_true', default=False,
+                          dest='persist')
+        parser.add_option('--force',
+                          action='store_true', default=False,
+                          dest='force')
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_BASELINE_DEL(self, arg):
+        options, args = self._parse_SERVICE_BASELINE_DEL_args_(arg)
+        if len(args) < 1:
+            print '*** Cmd requires <baseline>'
+            return
+
+        self.send_dbus_command('cli_del_baseline',[args[0],options.persist,options.force])
+        return
+
+
+
+    def help_SERVICE_FETCH_GATEWAY_TCP_PORT(self):
+        print '''\nSERVICE_FETCH_TCP_PORT
+\nFetch the current tcp port waiting for jenkins triggers.
+'''
+
+    def do_SERVICE_FETCH_GATEWAY_TCP_PORT(self, arg):
+        self.send_dbus_command('cli_fetch_tcp_port')
+        return
+
+
+    def help_SERVICE_UPDATE_GATEWAY_TRIGGER(self):
+        print '''\nSERVICE_UPDATE_GATEWAY_TRIGGER <operation> <trigger> [<action1> <action2> ... <actionX>]
+\nUpdate the list of actions for an specific trigger.
+\t <operation>   Allowed values:   update | delete
+\t <trigger>     Allowed values:  execute SERVICE_FETCH_GATEWAY_TRIGGER and check under "Available triggers"
+\t <action>      Allowed values:  execute SERVICE_FETCH_GATEWAY_TRIGGER and check under "Available actions"
+'''
+
+    def _parse_SERVICE_UPDATE_GATEWAY_TRIGGER_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_SERVICE_UPDATE_GATEWAY_TRIGGER(self, arg):
+        options, args = self._parse_SERVICE_UPDATE_GATEWAY_TRIGGER_args_(arg)
+        if len(args) < 2:
+            print '*** Cmd requires <operation> <trigger> [<action> ... <action>]'
+            return
+
+        if args[0] == 'update':
+            if len(args) < 3:
+                print '*** Update operation requires a list of actions'
+                return
+            actions = args[2:]
+        elif args[0] == 'delete':
+            actions = []
+        else:
+            print '*** Wrong value for operation. Allowed values update | delete'
+            return
+        self.send_dbus_command('cli_update_trigger',[args[0],args[1],actions])
+        return
+
+    def help_SERVICE_FETCH_GATEWAY_TRIGGER(self):
+        print '''\nSERVICE_FETCH_GATEWAY_TRIGGER
+\nList available actions and configured triggers.
+'''
+
+    def do_SERVICE_FETCH_GATEWAY_TRIGGER(self, arg):
+        self.send_dbus_command('cli_fetch_trigger')
+        return
+
+
+##### Commands for simulatting Jenkins
+
+
+    def help_TCP_TRIGGER(self):
+        print '''\nTCP_TRIGGER <trigger> <build_id> [<build_info>]
+\nSend a TCP trigger simulating Jenkins trigger
+\tnew_build <build_id> <build_info>
+\t\t build_info    full path for the json file including info needed for testing
+\tfaulty_build <build_id>
+\tpromote_release <build_id>
+'''
+
+    def _parse_TCP_TRIGGER_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_TCP_TRIGGER(self, arg):
+        options, args = self._parse_TCP_TRIGGER_args_(arg)
+        if len(args) < 2:
+            print '*** Cmd requires <trigger> <build_id> [<build_info>]'
+            return
+
+        if len(args) == 3:
+            if os.path.isfile(args[2]):
+                try:
+                    with open(args[2]) as json_data:
+                        data = json.load(json_data)
+                except Exception, e:
+                    _ERR('*** Error parsing json %s file: %s' % (args[2], str(e)))
+                    return
+            else:
+                _ERR('*** %s Not Found' % args[2])
+                return
+
+            send_tcp(create_trigger(args[0], args[1],data))
+        else:
+            send_tcp(create_trigger(args[0], args[1]))
+        return
+
+##### Commands for handling HSS_rtc 
+
+    def help_RTC_TEST_STATUS(self):
+        print '''\nRTC_TEST_STATUS
+\nFetch the ongoing HSS_rtc test status'''
+
+    def do_RTC_TEST_STATUS(self, arg):
+        execute_HSS_rtc_command('get status')
+        return
+
+
+
+    def help_RTC_TEST_REPORT(self):
+        print '''\nRTC_TEST_REPORT
+\nFetch the ongoing HSS_rtc test provisional report'''
+
+    def do_RTC_TEST_REPORT(self, arg):
+        execute_HSS_rtc_command('get report')
+        return
+
+
+
+    def help_RTC_CANCEL_ACTION(self):
+        print '''\nRTC_CANCEL_ACTION
+\nStop ongoing action being executed by action_handler and continue with the test'''
+
+    def do_RTC_CANCEL_ACTION(self, arg):
+        execute_HSS_rtc_command('cancel_action')
+        return
+
+
+
+    def help_RTC_SET_TEST_EXECUTION_STATUS(self):
+        print '''\nRTC_SET_TEST_EXECUTION_STATUS <status>
+\nSet the ongoing HSS_rtc test execution status
+    status:  SUCCESS | FAILED
+'''
+
+    def _parse_RTC_SET_TEST_EXECUTION_STATUS_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_RTC_SET_TEST_EXECUTION_STATUS(self, arg):
+        options, args = self._parse_RTC_SET_TEST_EXECUTION_STATUS_args_(arg)
+        if len(args) != 1:
+            print '*** Cmd requires <status>'
+            return
+        if args[0] not in ['SUCCESS','FAILED']:
+            print '*** Wrong value. Allowed values are: SUCCESS | FAILED'
+            return
+
+        execute_HSS_rtc_command('set test_execution_status %s' % args[0])
+        return
+
+
+
+    def help_RTC_STOP_TEST(self):
+        print '''\nRTC_STOP_TEST [--force | --continue]
+\nStop the execution of HSS_rtc
+if force, HSS_rtc will be stopped immediately
+if continue, the ongoing TC is stopped but the HSS_rtc will continue executing the rest of TCs
+If not options, HSS_rtc will be stopped as soon as the ongoing TC ends
+'''
+
+    def _parse_RTC_STOP_TEST_args_(self, args):
+        parser = ShellOptionParser()
+        parser.add_option('--force',
+                          action='store_true', default=False,
+                          dest='force')
+        parser.add_option('--continue',
+                          action='store_true', default=False,
+                          dest='next_tc')
+
+        return parser.parse_args(args.split())
+
+    def do_RTC_STOP_TEST(self, arg):
+        options, args = self._parse_RTC_STOP_TEST_args_(arg)
+
+        if options.force and options.next_tc:
+            print ('*** Incompatible options for the command')
+            return
+
+        if options.force:
+            execute_HSS_rtc_command('force_quit')
+        elif options.next_tc:
+            execute_HSS_rtc_command('continue_quit')
+        else:
+            execute_HSS_rtc_command('quit')
+        return
+
+
+    def help_RTC_SHOW_SUMMARY(self):
+        print '''\nRTC_SHOW_SUMMARY <test_case>
+\nFetch the RTC summary report for an specific test case.'''
+
+    def _parse_RTC_SHOW_SUMMARY_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_RTC_SHOW_SUMMARY(self, arg):
+        options, args = self._parse_RTC_SHOW_SUMMARY_args_(arg)
+
+        if len(args) != 1:
+            print '*** Cmd requires <test_case>'
+            return
+
+        execute_HSS_rtc_command('show_summary %s' % args[0])
+        return
+
+
+    def help_RTC_SHOW_MACRO(self):
+        print '''\nRTC_SHOW_MACRO
+\nFetch the macro list being used for the ongoing test case.'''
+
+    def do_RTC_SHOW_MACRO(self, arg):
+
+        execute_HSS_rtc_command('show_macro')
+        return
+
+
+def main(args=None):
+    user_config = parse_commandline()
+
+    try:
+        shell = RtcShell(stdin=sys.stdin)
+        shell.cmdloop()
+
+    except KeyboardInterrupt:
+        _INF('User send Ctrl-C')
+        shell.stop()
+        quit_program(0)
+
+    except Exception as e:
+        _ERR('Exception: %s' % str(e))
+        shell.stop()
+        quit_program(1)
+
+
+def parse_commandline():
+    parser = argparse.ArgumentParser(
+        description='CLI for handling RTC Automation')
+    parser.add_argument('--version', action='version', version=__version__)
+
+    logging=e3utils.log.add_logging_options(parser)
+    args = parser.parse_args()
+    e3utils.log.setup_logging_options(args)
+    return args
+
+
+if __name__ == '__main__':
+    main()
+    sys.exit(0)

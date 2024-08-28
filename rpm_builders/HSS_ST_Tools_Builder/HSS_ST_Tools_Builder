@@ -1,0 +1,391 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+
+import os
+import errno
+import sys
+import copy
+import hashlib
+import argparse
+import string
+import subprocess
+import traceback
+import getpass
+import pexpect
+import socket
+HOSTNAME = socket.gethostname()
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+CWD = os.getcwd()
+import hss_utils.st_command as st_command
+import hss_utils.node.gentraf
+import hss_utils.connection as connection
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+100: 'Implementation error'
+    }
+
+# Exit status
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+IMPLEMENTATION_ERROR = 100
+
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+GENTRAF=None
+def quit_program(exit_code):
+
+    if GENTRAF is not None:
+        GENTRAF.release()
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+DEFAULT_RPM_BASE_DIR = '/opt/hss/%s' % getpass.getuser()
+RPM_BASE_DIR = ''
+STD_RPM_BASE_DIR = '/usr/src/packages'
+
+
+def prepare_rpm_base_dir():
+    global RPM_BASE_DIR
+    rpmmacros_created = False
+    rpmmacro = os.path.expanduser('~/.rpmmacros')
+    if os.path.isfile(rpmmacro) == True:
+        RPM_BASE_DIR = STD_RPM_BASE_DIR
+        with open(rpmmacro, 'r') as fd:
+            for line in fd.readlines():
+                if '%_topdir'in line:
+                    RPM_BASE_DIR = line.split()[1]
+                    create_rpm_folders()
+
+    else:
+        RPM_BASE_DIR = DEFAULT_RPM_BASE_DIR
+        fd = open(rpmmacro,'a')
+        fd.write('%')
+        fd.write('''_topdir     %s  \n''' % RPM_BASE_DIR)
+        fd.close()
+        rpmmacros_created = True
+        create_rpm_folders()
+        _INF("~/.rpmmacros created with topdir     %s " % RPM_BASE_DIR)
+
+    _INF("RPM_BASE_DIR: %s " % RPM_BASE_DIR)
+    return rpmmacros_created
+
+
+def delete_rpmmacros():
+   filename = os.path.expanduser('~/.rpmmacros')
+   try:
+        os.remove(filename)
+        _INF('%s removed' % filename)
+   except OSError as e:
+        if e.errno != errno.ENOENT: 
+            _ERR('%s' % str(e))
+            quit_program(EXECUTION_ERROR)
+        else:
+            _DEB('%s' % str(e))
+
+
+def create_rpm_folders():
+
+    for folder in ['BUILD','RPMS','SOURCES','SPECS','SRPMS']:
+        try:
+            path = '%s/%s' % (RPM_BASE_DIR, folder)
+            os.makedirs(path)
+            _INF('%s created' % path)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                _ERR('%s' % str(e))
+                quit_program(EXECUTION_ERROR)
+
+            else:
+                _DEB('%s' % str(e))
+
+
+BUILD_DIR = ''
+def set_build_path():
+    global BUILD_DIR
+
+    if RPM_BASE_DIR != STD_RPM_BASE_DIR:
+        BUILD_DIR = RPM_BASE_DIR
+    else:
+        BUILD_DIR = DEFAULT_RPM_BASE_DIR
+
+    build_dir = '%s/%s-%s' % (BUILD_DIR, RPM_INFO['Name'], RPM_INFO['Version'])
+
+    BUILD_DIR= build_dir
+    _INF("BUILD_DIR: %s " % BUILD_DIR)
+
+def prepare_build_directory(source):
+    if not os.path.exists(BUILD_DIR):
+        os.makedirs(BUILD_DIR)
+
+    cmd = 'cp -r %s .' % source
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True, cwd=BUILD_DIR)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'rm %s/*.o' % source
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True, cwd=BUILD_DIR)
+    if returncode and 'No such file or directory' not in stderr_value:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+
+TARGET = ''
+def set_target(target):
+    global TARGET
+    TARGET = os.path.basename(target)
+    _DEB("TARGET: %s " % TARGET)
+
+RPM_INFO = {
+'Name' : '',
+'Version' : ''	
+}
+
+
+def parse_spec_file(filename):
+    global RPM_INFO
+    for key in RPM_INFO.keys():
+        RPM_INFO[key] = get_data_from_file(filename,key)
+
+def get_data_from_file(filename,data):
+    with open(filename, 'r') as fd:
+        for line in fd.readlines():
+            if data in line:
+                return line.split()[1]
+
+    return ''
+
+
+def get_channel():
+    global GENTRAF
+    if not GENTRAF:
+        config = {'host':HOSTNAME, 'user' : getpass.getuser()}
+
+        try:
+            GENTRAF = hss_utils.node.gentraf.GenTraf(config)
+            GENTRAF.working_dir = RPM_BASE_DIR
+        except connection.Unauthorized, e: 
+            _ERR('Error: %s' % str(e))
+            quit_program(AUTHENTICATION_ERROR)
+
+        except (connection.ConnectionTimeout, connection.ConnectionFailed), e: 
+            _ERR('Error: %s' % str(e))
+            quit_program(CONNECTION_ERROR)
+
+    return GENTRAF.get_channel()
+
+def rpmbuild(spec_file,output_dir):
+    command = 'tar -czvf %s/SOURCES/%s.tar.gz %s-%s' % (RPM_BASE_DIR, RPM_INFO['Name'], RPM_INFO['Name'],RPM_INFO['Version'])
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd='%s/..' % BUILD_DIR)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    #config = {'host':HOSTNAME, 'user' : getpass.getuser()}
+
+    #try:
+        #GENTRAF = hss_utils.node.gentraf.GenTraf(config)
+        #GENTRAF.working_dir = RPM_BASE_DIR
+    #except connection.Unauthorized, e: 
+        #_ERR('Error: %s' % str(e))
+        #quit_program(AUTHENTICATION_ERROR)
+
+    #except (connection.ConnectionTimeout, connection.ConnectionFailed), e: 
+        #_ERR('Error: %s' % str(e))
+        #quit_program(CONNECTION_ERROR)
+
+    channel = get_channel()
+    cmd = 'rpmbuild -bb %s' % spec_file
+    _INF('Executing: %s' % cmd)
+    channel.write_line(cmd)
+    rpm=None
+    while (True):
+        try:
+
+            result = channel.expect([GENTRAF.get_sync_expression(),
+                                    '\n'])
+
+            if result == 0:
+                _INF('rpmbuild execution finished')
+                break
+
+            if result == 1:
+                if 'Wrote:' in channel.stdout:
+                    rpm = channel.stdout.split()[-1]
+                _DEB('  %s' % channel.stdout)
+
+        except pexpect.TIMEOUT, e:
+            continue
+
+        except pexpect.EOF, e:
+            _ERR('EOF received when executing run_configure.sh')
+            quit_program(EXECUTION_ERROR)
+
+    if not rpm:
+        _ERR('rpmbuild failed')
+        quit_program(EXECUTION_ERROR)
+
+    _INF('RPM generated: %s' % rpm)
+    command = 'mv %s %s' % (rpm, output_dir)
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    command = 'rm -rf %s/BUILD/%s-%s' % (RPM_BASE_DIR, RPM_INFO['Name'],RPM_INFO['Version'])
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    command = 'rm %s/SOURCES/%s.tar.gz' % (RPM_BASE_DIR, RPM_INFO['Name'])
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+
+def main():
+
+    user_config = parse_command_line()
+
+    rpmmacros_created = prepare_rpm_base_dir()
+
+    parse_spec_file( user_config.SPEC_FILE)
+    set_build_path()
+
+    prepare_build_directory(user_config.SOURCE)
+
+    rpmbuild(user_config.SPEC_FILE, user_config.output_dir)
+
+    if rpmmacros_created == True:
+        delete_rpmmacros()
+
+    if user_config.skip_clean == False:
+        command = 'rm -rf %s' % (BUILD_DIR)
+        _INF('Executing: %s' % command)
+        stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True)
+        if returncode:
+            _ERR(stderr_value)
+            quit_program(EXECUTION_ERROR)
+
+    quit_program(SUCCESS)
+
+
+
+def parse_command_line():
+    parser = argparse.ArgumentParser(
+        description='Build a rpm for a HSS ST Tool'
+    )
+
+    parser.add_argument('SPEC_FILE',
+                      help='Set the absolute path of rpm spec file.')
+
+    parser.add_argument('SOURCE',
+                      help='Set the absolute path of source code tool.')
+
+    parser.add_argument('--skip_clean',
+                      action='store_true', default=False,
+                      help='Skip removal of BUILD_DIR.',
+                      dest='skip_clean')
+
+    parser.add_argument('-o', '--output',
+                      action='store', default=None,
+                      help='Specify the output directory. Default %s' % CWD,
+                      dest='output_dir')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    if args.output_dir is not None and args.log_file is not None:
+        _ERR('Error: --log_file and -o can not be used at the same time' )
+        quit_program(WRONG_PARAMETER)
+
+    e3utils.log.CONSOLE_PREFIX='(HSS_ST_Tools_Builder_PID%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.output_dir is None:
+        args.output_dir = CWD
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(st_command.real_path(args.output_dir), 'HSS_ST_Tools_Builder_PID%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+
+    if os.path.isfile(args.SPEC_FILE) == False:
+        _ERR('%s file not found' % args.SPEC_FILE)
+        quit_program(WRONG_PARAMETER)
+
+    if not os.path.exists(args.SOURCE):  
+        _ERR('%s source code tool not found' % args.SOURCE)
+        quit_program(WRONG_PARAMETER)
+
+    args.output_dir = st_command.real_path(args.output_dir)
+    return (args)
+
+
+if __name__ == '__main__':
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        sys.exit(-1)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        sys.exit(-1)
+

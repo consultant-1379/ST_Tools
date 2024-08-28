@@ -1,0 +1,586 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+
+import os
+import errno
+import sys
+import copy
+import hashlib
+import argparse
+import string
+import subprocess
+import traceback
+import getpass
+import pexpect
+import socket
+HOSTNAME = socket.gethostname()
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+CWD = os.getcwd()
+import hss_utils.st_command as st_command
+import hss_utils.node.gentraf
+import hss_utils.connection as connection
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+100: 'Implementation error'
+    }
+
+# Exit status
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+IMPLEMENTATION_ERROR = 100
+
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+
+GENTRAF=None
+def quit_program(exit_code):
+
+    if GENTRAF is not None:
+        GENTRAF.release()
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+DEFAULT_RPM_BASE_DIR = '/opt/hss/%s' % getpass.getuser()
+RPM_BASE_DIR = ''
+STD_RPM_BASE_DIR = '/usr/src/packages'
+
+BUILD_DIR = os.path.join(CWD, ('build/'))
+def set_build_path(user_config):
+    global BUILD_DIR
+
+    if user_config.spec_file is not None:
+
+        if RPM_BASE_DIR != STD_RPM_BASE_DIR:
+            BUILD_DIR = RPM_BASE_DIR
+        else:
+            BUILD_DIR = DEFAULT_RPM_BASE_DIR
+
+        build_dir = '%s/%s-%s' % (BUILD_DIR, RPM_INFO['Name'], RPM_INFO['Version'])
+        BUILD_DIR= build_dir
+
+    else:
+        BUILD_DIR= user_config.build_path
+
+    _INF("BUILD_DIR: %s " % BUILD_DIR)
+
+
+PRJ_DIR = CWD
+def set_prj_dir(path):
+    global PRJ_DIR
+    PRJ_DIR = path
+
+TARGET = ''
+def set_target(target):
+    global TARGET
+    TARGET = os.path.basename(target)
+
+
+RPM_INFO = {
+'Name' : '',
+'Version' : ''	
+}
+
+def prepare_rpm_base_dir(cores):
+    global RPM_BASE_DIR
+    rpmmacros_created = False
+    rpmmacro = os.path.expanduser('~/.rpmmacros')
+    set_core = True
+    if os.path.isfile(rpmmacro) == True:
+        RPM_BASE_DIR = STD_RPM_BASE_DIR
+        with open(rpmmacro, 'r') as fd:
+            for line in fd.readlines():
+                if '_mflags' in line:
+                    set_core = False
+                if '%_topdir'in line:
+                    RPM_BASE_DIR = line.split()[1]
+                    create_rpm_folders()
+        if set_core:
+            fd = open(rpmmacro,'a')
+            fd.write('%')
+            fd.write('''_smp_mflags -j %s\n''' % cores)
+            fd.close()
+
+    else:
+        RPM_BASE_DIR = DEFAULT_RPM_BASE_DIR
+        fd = open(rpmmacro,'a')
+        fd.write('%')
+        fd.write('''_topdir     %s  \n''' % RPM_BASE_DIR)
+        fd.write('%')
+        fd.write('''_smp_mflags -j %s\n''' % cores)
+        fd.close()
+        rpmmacros_created = True
+        create_rpm_folders()
+        _INF("~/.rpmmacros created with topdir     %s " % RPM_BASE_DIR)
+
+    _INF("RPM_BASE_DIR: %s " % RPM_BASE_DIR)
+
+    return rpmmacros_created
+
+
+def delete_rpmmacros():
+   filename = os.path.expanduser('~/.rpmmacros')
+   try:
+        os.remove(filename)
+        _INF('%s removed' % filename)
+   except OSError as e:
+        if e.errno != errno.ENOENT: 
+            _ERR('%s' % str(e))
+            quit_program(EXECUTION_ERROR)
+        else:
+            _DEB('%s' % str(e))
+
+def create_rpm_folders():    
+    for folder in ['BUILD','RPMS','SOURCES','SPECS','SRPMS']:
+        try:
+            path = '%s/%s' % (RPM_BASE_DIR, folder)
+            os.makedirs(path)
+            _INF('%s created' % path)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                _ERR('%s' % str(e))
+                quit_program(EXECUTION_ERROR)
+
+            else:
+                _DEB('%s' % str(e))
+
+def parse_prj_file(filename):
+    files=[]
+    groups=[]
+
+    with open(filename, 'r') as fd:
+        for line in fd.readlines():
+
+            if 'File path' in line:
+                path = line.split('"')
+                files.append(os.path.join(PRJ_DIR, path[1]))
+
+            if 'File_Group path' in line:
+                path = line.split('"')
+                groups.append(os.path.join(PRJ_DIR, path[1]))
+
+            if 'Executable_Path' in line:
+                line = string.replace(line.strip(),'<Executable_Path>','')
+                line = string.replace(line,'</Executable_Path>','')
+                set_target(line)
+
+    return files, groups
+
+
+def parse_spec_file(filename):
+    global RPM_INFO
+    for key in RPM_INFO.keys():
+        RPM_INFO[key] = get_data_from_file(filename,key)
+
+
+def get_data_from_file(filename,data):
+    with open(filename, 'r') as fd:
+        for line in fd.readlines():
+            if data in line:
+                return ' '.join(line.split()[1:])
+
+    return ''
+
+
+def get_file_from_group(groups):
+    files=[]
+    new_groups=[]
+
+    for group in groups:
+        file_path=os.path.dirname(group)
+        if os.path.isfile(group) == False:
+            _ERR('***  %s file not found' % group)
+            sys.exit(-1)
+
+        with open(group, 'r') as fd:
+            for line in fd.readlines():
+
+                if 'File path' in line:
+                    path = line.split('"')
+                    files.append(os.path.join(file_path,path[1]))
+
+                if 'File_Group path' in line:
+                    path = line.split('"')
+                    new_groups.append(os.path.join(file_path, path[1]))
+
+    return files, new_groups
+
+def create_symlinks(file_list):
+    for element in file_list:
+        cmd = 'ln -sf %s .' % element
+        _INF('Executing: %s' % cmd)
+        stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True, cwd=BUILD_DIR)
+        if returncode:
+            _ERR(stderr_value)
+            quit_program(EXECUTION_ERROR)
+
+
+def create_makefile(file_list):
+
+    command = '''$TTCN3_DIR/bin/ttcn3_makefilegen -f -p -g -e '%s' ''' % os.path.join(BUILD_DIR, TARGET)
+    for element in file_list:
+        command += ''''%s' ''' % os.path.basename(element)
+
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd=BUILD_DIR)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+def update_makefile(prj_file, spec_file):
+
+    command = 'rm -f Makefile.tmp'
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd=BUILD_DIR)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    prj_path = os.path.dirname(prj_file)
+    if 'GIT_PATH' in prj_path:
+        bat_path = '${GIT_PATH}'
+    else:
+        bat_path = prj_path[:-4]
+
+    command = '%s/HSS_Traffic_Makefile_patch.sh Makefile Makefile.tmp' % prj_path
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd=BUILD_DIR)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    if spec_file:
+        fd = open(os.path.join(BUILD_DIR,'Makefile.tmp'),'a')
+        fd.write("\ninstall: $(TARGET)\n")
+        fd.write("\tmkdir -p ${RPM_BUILD_ROOT}/${ST_TOOL_PATH}/bin\n")
+        fd.write("\tcp $(TARGET) ${RPM_BUILD_ROOT}/${ST_TOOL_PATH}/bin\n")
+        fd.write("\tcp %s/scripts/* ${RPM_BUILD_ROOT}/${ST_TOOL_PATH}/bin\n" % bat_path)
+        fd.write("\tmkdir -p ${RPM_BUILD_ROOT}/${ST_TOOL_PATH}/share/BAT\n")
+        fd.write("\tcp -r %s/cfg/* ${RPM_BUILD_ROOT}/${ST_TOOL_PATH}/share/BAT\n" % bat_path)
+
+        fd.close()
+
+    command = 'mv -f Makefile.tmp Makefile'
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd=BUILD_DIR)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+def get_channel(wd=RPM_BASE_DIR):
+    global GENTRAF
+    if not GENTRAF:
+        config = {'host':HOSTNAME, 'user' : getpass.getuser()}
+
+        try:
+            GENTRAF = hss_utils.node.gentraf.GenTraf(config)
+            GENTRAF.working_dir = wd
+        except connection.Unauthorized, e: 
+            _ERR('Error: %s' % str(e))
+            quit_program(AUTHENTICATION_ERROR)
+
+        except (connection.ConnectionTimeout, connection.ConnectionFailed), e: 
+            _ERR('Error: %s' % str(e))
+            quit_program(CONNECTION_ERROR)
+
+    return GENTRAF.get_channel()
+
+def compile_bat(core):
+    command = 'make  -j%s' % core
+    _INF('Executing: %s' % command)
+
+    channel = get_channel(BUILD_DIR)
+    channel.write_line(command)
+    while (True):
+        try:
+
+            result = channel.expect([GENTRAF.get_sync_expression(),
+                                    '\n'])
+
+            if result == 0:
+                _INF('BAT compilation finished')
+                break
+
+            if result == 1:
+                _DEB('  %s' % channel.stdout)
+
+        except pexpect.TIMEOUT, e:
+            continue
+
+        except pexpect.EOF, e:
+            _ERR('EOF received when executing "%s"' % command)
+            quit_program(EXECUTION_ERROR)
+
+
+def rpmbuild(spec_file,output_dir):
+    command = 'tar -czvf %s/SOURCES/%s.tar.gz %s-%s' % (RPM_BASE_DIR, RPM_INFO['Name'], RPM_INFO['Name'],RPM_INFO['Version'])
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True, cwd='%s/..' % BUILD_DIR)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    channel = get_channel()
+    cmd = 'rpmbuild -bb %s' % spec_file
+    _INF('Executing: %s' % cmd)
+    channel.write_line(cmd)
+    rpm=None
+    while (True):
+        try:
+
+            result = channel.expect([GENTRAF.get_sync_expression(),
+                                    '\n'])
+
+            if result == 0:
+                _INF('rpmbuild execution finished')
+                break
+
+            if result == 1:
+                if 'Wrote:' in channel.stdout:
+                    rpm = channel.stdout.split()[-1]
+                _DEB('  %s' % channel.stdout)
+
+        except pexpect.TIMEOUT, e:
+            continue
+
+        except pexpect.EOF, e:
+            _ERR('EOF received when executing run_configure.sh')
+            quit_program(EXECUTION_ERROR)
+
+    if not rpm:
+        _ERR('rpmbuild failed')
+        quit_program(EXECUTION_ERROR)
+
+    _INF('RPM generated: %s' % rpm)
+    command = 'mv %s %s' % (rpm, output_dir)
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    command = 'rm -rf %s/BUILD/%s-%s' % (RPM_BASE_DIR, RPM_INFO['Name'],RPM_INFO['Version'])
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+    command = 'rm %s/SOURCES/%s.tar.gz' % (RPM_BASE_DIR, RPM_INFO['Name'])
+    _INF('Executing: %s' % command)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True)
+    if returncode:
+        _ERR(stderr_value)
+        quit_program(EXECUTION_ERROR)
+
+def main():
+
+    user_config = parse_command_line()
+    rpm_needed = False
+    rpmmacros_created = False
+
+    if user_config.spec_file:
+        rpm_needed = True
+        rpmmacros_created = prepare_rpm_base_dir(user_config.core)
+        parse_spec_file( user_config.spec_file)
+        set_build_path(user_config)
+
+    prj_dir = os.path.dirname(user_config.prj_file)
+    if prj_dir != '':
+        set_prj_dir(prj_dir)
+
+    files, groups=parse_prj_file(user_config.prj_file)
+
+    while (len(groups) != 0):
+        temp_files, groups = get_file_from_group(groups)
+        files += temp_files
+
+    if not os.path.exists(BUILD_DIR):
+        os.makedirs(BUILD_DIR)
+
+    if user_config.symb_links:
+        create_symlinks(files)
+
+    if user_config.makefile:
+        create_makefile(files)
+        update_makefile(user_config.prj_file, user_config.spec_file)
+
+    if user_config.compile and not user_config.spec_file:
+        compile_bat(user_config.core)
+
+    if user_config.spec_file:
+        rpmbuild(user_config.spec_file, user_config.output_dir)
+
+    if rpmmacros_created:
+        delete_rpmmacros()
+
+    if not user_config.skip_clean and rpm_needed:
+        command = 'rm -rf %s' % (BUILD_DIR)
+        _INF('Executing: %s' % command)
+        stdout_value, stderr_value, returncode = st_command.execute_cmd(command,stdout= True,stderr = True)
+        if returncode:
+            _ERR(stderr_value)
+            quit_program(EXECUTION_ERROR)
+
+
+    quit_program(SUCCESS)
+
+
+def parse_command_line():
+    parser = argparse.ArgumentParser(
+        description='Create Makefile for HSS BAT'
+    )
+
+    parser.add_argument('-p', '--prj',
+                      action='store', default=None,
+                      help='Set the absolute path of project file.',
+                      dest='prj_file')
+
+    parser.add_argument('-b', '--build_path',
+                      action='store', default=BUILD_DIR,
+                      help='Set the absolute path of build directory. By Default is %(default)s',
+                      dest='build_path')
+
+    parser.add_argument('-j',type=int, 
+                      action='store', default=8,
+                      help='Set number of cores for compilation. By Default is %(default)s',
+                      dest='core')
+
+    parser.add_argument('-o', '--output',
+                      action='store', default=None,
+                      help='Specify the output directory. Default %s' % CWD,
+                      dest='output_dir')
+
+
+    action_params = parser.add_argument_group('Define action to be done.')
+    action_params.add_argument('-s', '--symb_links',
+                      action='store_true', default=False,
+                      help='Create symbolic links for files included in prj.',
+                      dest='symb_links')
+
+    action_params.add_argument('-m', '--makefile',
+                      action='store_true', default=False,
+                      help='Create Makefile for BAT compilitation.',
+                      dest='makefile')
+
+    action_params.add_argument('-c', '--compile',
+                      action='store_true', default=False,
+                      help='Compile BAT.',
+                      dest='compile')
+
+    action_params.add_argument('-r', '--rpmbuild',
+                      action='store', default=None,
+                      help='Set the absolute path of rpm spec file.',
+                      dest='spec_file')
+
+    action_params.add_argument('--skip_clean',
+                      action='store_true', default=False,
+                      help='Skip removal of BUILD_DIR.',
+                      dest='skip_clean')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    if args.output_dir is not None and args.log_file is not None:
+        _ERR('Error: --log_file and -o can not be used at the same time' )
+        quit_program(WRONG_PARAMETER)
+
+    e3utils.log.CONSOLE_PREFIX='(HSS_BAT_Builder_PID%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.output_dir is None:
+        args.output_dir = CWD
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(st_command.real_path(args.output_dir), 'HSS_BAT_Builder_PID%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+
+    if args.prj_file is None:
+        _ERR('Absolute path of project file is mandatory')
+        quit_program(WRONG_PARAMETER)
+
+    if os.path.isfile(args.prj_file) == False:
+        _ERR('%s file not found' % args.prj_file)
+        quit_program(WRONG_PARAMETER)
+
+    if args.spec_file is not None:
+        if args.symb_links or args.makefile or args.compile or args.build_path != BUILD_DIR :
+            _ERR('Option -r is exclusive with -s -m -r -b')
+            quit_program(WRONG_PARAMETER)
+
+        args.symb_links  = True
+        args.makefile  = True
+        args.compile  = True
+
+        if os.path.isfile(args.spec_file) == False:
+            _ERR('%s file not found' % args.spec_file)
+            quit_program(WRONG_PARAMETER)
+
+    if args.build_path != BUILD_DIR:
+        set_build_path(args)
+
+    args.output_dir = st_command.real_path(args.output_dir)
+    return (args)
+
+
+if __name__ == '__main__':
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        sys.exit(-1)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        sys.exit(-1)
+
+
+

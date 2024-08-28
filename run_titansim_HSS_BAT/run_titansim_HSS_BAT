@@ -1,0 +1,934 @@
+#!/usr/bin/python2.7
+
+
+import os
+CWD = os.getcwd()
+import os.path
+import sys
+import json
+import time
+import tempfile
+import atexit
+import socket
+import random
+import hashlib
+import argparse
+
+import getpass
+import traceback
+import threading
+import subprocess
+from optparse import OptionParser
+from distutils.spawn import find_executable
+import shlex
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+from hss_utils.st_command import *
+import hss_utils.node.cloud
+from shared import *
+import shared
+from components import *
+from scenario.config_handler import *
+from scenario.cabinet import Cabinet_TSP, Cabinet_CBA, Cabinet_CNHSS
+from scenario.cabinet import REQUIRED_IP
+
+from components import DEFAULT_LOADPLOTTER_PORT
+from components.mc_host import *
+from components.hc_host import *
+from components.loadplotter import *
+from components.conkepper import *
+from components.diaproxy import *
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+            formatter_class=argparse.RawTextHelpFormatter,
+            description=textwrap.dedent('''\
+                Automation tool for running HSS traffic
+                Actions:
+                    - Prepare configuration file in real time
+                    - Configure, start and stop Diaproxy if needed
+                    - Start and stop LoadPlotter and conkeeper if needed
+                    - Start and stop Titan components: GUI, MC and HCs
+                    - Run traffic and collect logs
+                '''),
+            epilog=textwrap.dedent(get_exit_status()))
+    scenario_params = parser.add_argument_group('Define SUT, Titan components and auxiliary tools ')
+    scenario_params.add_argument('-6',
+                        default=False, action='store_true',
+                        dest='ipv6',
+                        help='Select IPv6.')
+
+    scenario_params.add_argument('-V', '--cabinet-ip',
+                      action='store', default='',
+                      help='''Set the IP list of the cabinet and the ExtDB IP. Format is [OAM[:DIA_TCP:DIA_SCTP:RADIUS:CONTROL:EXT_DB:SOAP:UDM:SOAP_LDAP]]
+    If argument is ommitted then the local hostname will be used to find env information in rosetta
+    If you set the IP list the first one (OAM) is mandatory
+    If you set only the OAM the rest of information will be fetched automatically from the HSS.
+    OAM, RADIUS and CONTROL shall be always IPv4 format even if IPv6 is selected (-6 parameter)
+    When IPv6 is selected (-6 parameter) the DIA_TCP, DIA_SCTP, EXT_DB, SOAP, UDM and SOAP_LDAP, if provided, shall be in square brackets.
+
+    The CONTROL (if defined) shall be the primary IO for TSP and the OAM IP for CBA
+
+''',
+                      dest='vip_data')
+
+    scenario_params.add_argument('-R', '--secondary-cabinet-ip',
+                      action='store', default=None,
+                      help='''Set the IP list of the secondary cabinet. Format is [OAM[:DIA_TCP:DIA_SCTP:RADIUS:CONTROL]]
+    This argument only applies in GEORED scenario (IMS-R or EPC-R)
+    If argument is ommitted then the local hostname will be used to find env information in rosetta
+    If you set the IP list the first one (OAM) is mandatory
+    If you set only the mandatory one (OAM) the rest of information will be fetched automatically from the HSS.
+    This option is not allowed when IPv6 is selected (-6 parameter)
+
+    The CONTROL (if defined) shall be the primary IO for TSP
+
+''',
+                      dest='sec_traffic_vip')
+
+    scenario_params.add_argument('-o', '--mc-host',
+                      action='store', default=shared.HOSTNAME,
+                      help='Set specific traffic generator as MC. By default is "%(default)s"\n',
+                      dest='mc_host')
+
+    scenario_params.add_argument('--mc-port',
+                      action='store', type=int, default=None,
+                      help='Set the TCP port used by MC for waiting HC connections. By default a random value will be found.',
+                      dest='mc_port')
+
+    scenario_params.add_argument('-g', '--generators',
+                      action='store', default=None,
+                      help='''Set a list of CS-admins. 
+By default N instances (max %s) will be started in %s.
+    In Sync mode    N = 1 + Num_of_PTCs/%s
+    In Async mode   N = 1 + Num_of_PTCs/%s
+
+''' % (shared.MAX_NUM_LGEN, shared.HOSTNAME, shared.RATIO_PTC_SYNC, shared.RATIO_PTC_ASYNC),
+                      dest='generators')
+
+    scenario_params.add_argument('-p', '--proxies',
+                      action='store', default=None,
+                      help='''Diaproxy definitions in the format "[[HOST]:[PORT]:[NC]]...[[HOSTx]:[PORTx]:[NCx]]"
+Where
+    HOSTx   Hostname where Diaproxy is running. By default is "%s"
+    PORTx   TCP port where Diaproxy is listening for client (BAT PTCs) connections. By default a free port is randonmly selected
+    NCx     Number of connections from Diaproxy to HSS. By default is 1
+
+DiaProxy will be configued, started and stopped automatically unless you define as HOST:PORT 
+
+''' % shared.HOSTNAME,
+                      dest='proxies')
+
+    scenario_params.add_argument('--dia-port-offset',
+                      action='store', type=int, default=None,
+                      help='Offset used for selecting diaproxy ports (-li and -udp). If no set a randon values will be used',
+                      dest='dia_port_offset')
+
+    scenario_params.add_argument('-k', '--conkeeper',
+                      action='store', nargs='?', default='',
+                      help='''ConKeeper definition in the format [HOST[:PORT]]
+Where
+    HOST    Hostname where ConKeeper is running. By default is "%s"
+    PORT    UDP port where ConKeeper is listening for remote control. By default is %s
+
+This option is not allowed when IPv6 is selected (-6 parameter)
+
+''' % (shared.HOSTNAME,shared.DEFAULT_CONKEEPER_PORT),
+                      dest='conkeeper')
+
+    scenario_params.add_argument('-N', '--loadplotter-port',
+                      action='store', type=int, default=DEFAULT_LOADPLOTTER_PORT,
+                      help='Set the remote port used for configuring the loadplotter tool. By default is %(default)s.',
+                      dest='loadplotter_port')
+
+    execution_params = parser.add_argument_group('Configure Titansim application execution')
+    execution_params.add_argument('-Z', '--enable-asyncmode',
+                      action='store_true', default=False,
+                      help='Enable asynchronous mode in BAT execution.',
+                      dest='async_mode')   
+    execution_params.add_argument('-G', '--gui-mode',
+                      action='store_true', default=False,
+                      help='TitanSim GUI mode set and launched automatically.',
+                      dest='gui_mode')
+    execution_params.add_argument('-K', '--keep-graph',
+                      action='store_true', default=False,
+                      help='TitanSim GUI is kept open after terminating the command execution. NOTE: It makes sense only if option -G is set.',
+                      dest='gui_kept')
+    execution_params.add_argument('-A', '--automatic',
+                      action='store_true', default=False,
+                      help='Automatic BAT execution mode.',
+                      dest='mode_automatic')
+    execution_params.add_argument('-M', '--manual',
+                      action='store_true', default=False,
+                      help='Manual BAT execution mode. If no mode is selected, default execution mode is Automatic.',
+                      dest='mode_manual')
+    execution_params.add_argument('-S', '--semi-automatic',
+                      action='store_true', default=False,
+                      help='Semiautomatic BAT execution mode, which starts in manual mode but finishes in automatic mode. If no mode is selected, default execution mode is Automatic.',
+                      dest='mode_semiautomatic')
+    execution_params.add_argument('-t', '--time',
+                      action='store', type=int, default=0,
+                      help='Set execution mode to "by time" setting it to TIME seconds.',
+                      dest='time')
+    execution_params.add_argument('-r', '--range',
+                      action='store', type=int, default=0,
+                      help='Set execution mode to "by range" setting it to RANGE_LOOPS number.',
+                      dest='range_loops')
+    execution_params.add_argument('-T', '--timeout',
+                      action='store', type=int, default=None,
+                      help='TIMEOUT, in seconds. Aborts execution if it expires after mctr is executed and traffic has not finished.',
+                      dest='titansim_timeout')
+
+
+    traffic_params = parser.add_argument_group('Configure scenario and traffic mix')
+    traffic_params.add_argument('-C', '--config-scenario',
+                      action='store', default=None,
+                      choices = ['IMS', 'IMS-SLF', 'IMS-SLFr', 'IMS-R', 'EPC', 'EPC-SLF', 'EPC-R', 'OAM', 'WLAN'],
+                      help='''Set the scenario under test.
+Only IMS and EPC values are allowed when IPv6 is selected (-6 parameter)
+''',
+                      dest='scenario')
+    traffic_params.add_argument('-m', '--scenario-type',
+                      action='store', default='',
+                      help='''Set specific properties for the scenario under test.
+Allowed values are %s
+NOTE: DO NOT use it. Maintained only for being backward compatible
+
+''' % ','.join(shared.TRAFFIC_TYPES),
+                      dest='modules')
+
+    traffic_params.add_argument('--node-type',
+                      action='store', default=None,
+                      choices = ['TSP','CBA','CNHSS'],
+                      help='''Set node type.
+''',
+                      dest='node_type')
+
+    traffic_params.add_argument('-x', '--set-traffic-mix',
+                      action='append',default=[], 
+                      help='''Set the traffic cases to run, defined by the TRAFFIC_CASE_NAME:WEIGHT:SUBSCRIBER_OFFSET:SUBSCRIBER_COUNT
+TRAFFIC_CASE_NAME may be a substring in the available traffic cases names, selecting more than one traffic case.
+If any of those values do not want to be changed, just write no value for it
+
+''',
+                      dest='set_traffic_mix')
+
+    traffic_params.add_argument('-X', '--add-traffic-mix',
+                      action='append',default=[], 
+                      help='''Set the traffic cases to be added/modified to the current traffic mix.
+Its syntax is equal to the defined one by -x parameter
+
+''',
+                      dest='add_traffic_mix')
+
+    traffic_params.add_argument('-Y', '--disable-scripts',
+                      action='append',default=[], 
+                      help='''Set the traffic cases to be disabled in the traffic mix. NOTE: For a same traffic case defined at the same time
+in option -Y and -x or -X, disabling action in option -Y has a higher priority than the enabling action defined by options -x and -X
+
+''',
+                      dest='disabled_scripts')
+
+    traffic_params.add_argument('-u', '--trafficmix-preffix',
+                      action='store', default='',
+                      help='''Set an specific TrafficMix file that shall be stored on $BAT_CFG_PATH/traffic_<type>/
+If traffic-mix is not set the application will search the right one based on HSS_VERSION got from the cabinet
+and if not found the default one will be used
+
+''',
+                      dest='trafficmix_preffix')
+
+    traffic_params.add_argument('--appid', default=None,
+                      action='store', choices=hss_utils.node.cloud.DIA_SERVICES.keys(),
+                      help='''Specific Diameter application name.
+''',
+                      dest='appid')
+
+    traffic_params.add_argument('--hss_version',
+                      action='store', default=None,
+                      help='''Force an specific HSS version used for selecting the TrafficMix file that shall be stored on $BAT_CFG_PATH/traffic_<type>/
+
+''',
+                      dest='hss_version')
+
+    traffic_params.add_argument('--set-traffic-group',
+                      action='append',default=[],
+                      help='''Select from traffic-mix all the traffic cases belonging to the specifed group(s).
+If node-type is CNHSS and -x option is not used this parameter will be initialized to ['CLOUD']
+''',
+                      dest='traffic_groups')
+
+    traffic_params.add_argument('-B', '--remove-traffic-mix',
+                      action='append',default=[],
+                      help='Remove from traffic-mix all the traffic cases belonging to the specifed group(s).',
+                      dest='remove_groups')
+
+    traffic_params.add_argument('-D', '--subs-range',
+                      action='append',default=[], 
+                      help='''Modify subcriber ranges for an specific type in format SUBSCRIBER_TYPE:SUBSCRIBER_BASE:SUBSCRIBER_COUNT.
+If any of those values do not want to be changed, just write no value for it. 
+
+''',
+                      dest='subs_ranges')
+
+
+    misc_params = parser.add_argument_group('Generic parameters')
+    misc_params.add_argument('-l', '--load-parameters',
+                      action='store', default='',
+                      help='''Set CPU load parameters. Format: CPU_LOAD:CPU_LOAD_PRE:CPU_LOAD_POST:GRAPH_SCAN_SIZE:LOAD_TYPE.
+If any of those values do not want to be changed, just write no value for it. 
+Allowed values for LOAD_TYPE: traffic, oam, system, all
+
+''',
+                      dest='load_parameters')
+
+    misc_params.add_argument('-s', '--wanted-load',
+                      action='store', default='',
+                      help='''Set the wanted CPU load for the cabinet when traffic runs the execution stage along time.
+The initial wanted CPU load is set by -l parameter, and the -s parameter defines the wanted CPU load along time
+by a list of pair of numbers which consists of the wanted CPU load and the time to start that wanted value. 
+Both numbers are separated by the colon character.
+
+''',
+                      dest='load_schemes')
+
+    misc_params.add_argument('-z', '--traffic_settings',
+                      action='store', default='',
+                      help='''Set PTCs:CPS:CPSDeltaLoad:CPSDeltaPre:CPSDeltaPost
+Where:
+    PTCs            The number of Parallel Test Components 
+    CPS             Calls Per Second
+    CPSDeltaLoad    Value used for reaching the load level during LOAD phase in load regulation mode
+    CPSDeltPre      Value used for reaching the load level during PRE phase in load regulation mode
+    CPSDeltaPost    Value used for reaching the load level during POST phase in load regulation mode
+
+If any of those values do not want to be changed, just write no value for it.
+
+''',
+                      dest='traf_settings')
+
+    misc_params.add_argument('-L', '--logmask',
+                      action='store', default='ERROR',
+                      help='''Set, using quottes, the File Log Mask that will be added to default value %s
+ERROR will be added automatically if parameter is omitted.
+For removing ERROR from logmask set the parameter value to empty: -L ""
+
+''' % '|'.join( shared.FILE_MASK),
+
+                      dest='file_mask')
+
+    misc_params.add_argument('-E', '--extra-parameters',
+                      action='append',default=[], 
+                      help='''Modify a set of parameters included on DEFINE configuration file section.
+Format is TYPE:PARAM_NAME:PARAM_VALUE. Allowed values for TYPE: "q" to add quotes to parameter value or any other value to avoid them
+
+''',
+                      dest='extra_parameters')
+
+    misc_params.add_argument('-d', '--dicos',
+                      action='store', default='',
+                      help='''Set the dicos in TSP or PL in CBA processor list to be used for load regulation.
+If this option is not included the list will be fetched automatically by LoadPlotter
+
+''',
+                      dest='dicos')
+
+    behaviour_params = parser.add_argument_group('Configure tool behaviour')
+    behaviour_params.add_argument('-b', '--bat-binary',
+                      action='store', default=None,
+                      help='''Set BAT binary file to a different one than official one (stable versions). Useful for bat development/testing.
+Notice Path including name must be given and accesible from each traffic generator if keep locally.
+
+''',
+                      dest='bat_binary')
+
+    behaviour_params.add_argument('-f', '--output-config-file',
+                      action='store', default=None,
+                      help='Creates the BAT configuration file OUTPUT_CONFIGURATION_FILE instead of running traffic',
+                      dest='output_config_file')
+
+    behaviour_params.add_argument('-F', '--force-config',
+                      action='store', default=None,
+                      help='Forces the BAT configuration files are used to generate the traffic without any modification.',
+                      dest='force_config_file')
+
+    behaviour_params.add_argument('--set-java-path',
+                      action='store', default=shared.JAVA,
+                      help='Set specific JAVA path. By default is "%(default)s".',
+                      dest='java_path')
+
+    behaviour_params.add_argument('--set-ttcn-version',
+                      action='store', default=shared.TTCN_VERSION,
+                      help='Set specific TTCN version. By default is "%(default)s".',
+                      dest='ttcn_version')
+
+    behaviour_params.add_argument('--force-tmp',
+                      action='store', default=shared.EXECUTION_PATH,
+                      help='Set specific TMP working directory. By default is "%(default)s".',
+                      dest='tmp_path')
+
+    behaviour_params.add_argument('--use-nodename',
+                      action='store', default=shared.NODENAME,
+                      help='Set specific node name for LDAP query. By default is "%(default)s".',
+                      dest='node_name')
+
+    behaviour_params.add_argument('-a', '--alias',
+                      action='store', default=DEFAULT_ALIAS_FILE,
+                      help='Set alias definition file.',
+                      dest='alias')
+
+    behaviour_params.add_argument('--set-bat-cfg-path',
+                      action='store', default=shared.BAT_CONFIG_FOLDER,
+                      help='Set specific BAT CONFIGURATION path. By default is "%(default)s"',
+                      dest='bat_cfg_path')
+
+    behaviour_params.add_argument('-v', '--verbose',
+                      action='store_true', default=False,
+                      help='verbose. Prints internal input/output from command.',
+                      dest='verbose')
+
+    behaviour_params.add_argument('-P', '--password',
+                      action='store', default=None,
+                      help='Set password. NOTE: DO NOT use it. Maintained only for being backward compatible ',
+                      dest='password')
+
+    behaviour_params.add_argument('--force_manual',
+                      action='store_true', default=False,
+                      help='Discard -G and -S . Use always manual mode ',
+                      dest='force_manual')
+
+    behaviour_params.add_argument('--cliss-user',
+                      action='store', default=shared.CLISS_USER,
+                      help='Set user in CBA when A&A is disabled. By default is "%(default)s".',
+                      dest='cliss_user')
+
+    behaviour_params.add_argument('--eccd-type',
+                        action='store', default=None,
+                        choices = ['IBD', 'ANS'],
+                        help='Eccd type used in cloud access for CNHSS node type',
+                        dest='eccd_type')
+
+    behaviour_params.add_argument('--ssh-key',
+                      action='store', default=None,
+                      help='Full path of the ssh id_rsa key file used for IBD access in CLOUD. If omitted local hostname will be used to find env in rosetta',
+                      dest='ssh_key')
+
+    behaviour_params.add_argument('--kubeconfig',
+                      action='store', default=None,
+                      help='Full path of the configuration file to be set as KUBECONFIG in CLOUD. If omitted local hostname will be used to find env in rosetta',
+                      dest='kubeconfig')
+
+    behaviour_params.add_argument('--disable_graph',
+                      action='store_true', default=False,
+                      help='Disabled all the graphics.',
+                      dest='disable_graph')
+
+    logging=e3utils.log.add_logging_options(parser)
+    logging.add_argument('--set-working-path',
+                      action='store', default=None,
+                      help='Set specific working path. Default is "%s"' % shared.CWD,
+                      dest='working_path')
+
+    options = parser.parse_args()
+
+    if options.verbose:
+        options.e3utils_log_debug = options.verbose
+        options.e3utils_log_debug_internal = options.verbose
+
+    if options.working_path is not None and options.log_file is not None:
+        _ERR('Error: --log_file and --set-working-path can not be used at the same time' )
+        quit_program(CMDLINE_ERROR)
+
+    e3utils.log.CONSOLE_PREFIX='(HSSBatTitanSim_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(options)
+
+    if options.working_path is None:
+        options.working_path = shared.CWD
+
+    if options.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(options.working_path, 'HSSBatTitanSim_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+    os.chdir(options.working_path)
+    shared.set_cwd(os.getcwd())
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+    _INF('Working path %s' % options.working_path)
+
+    # Some sanity checks
+    if options.bat_cfg_path != shared.BAT_CONFIG_FOLDER:
+        if os.path.isdir(options.bat_cfg_path):
+            shared.set_bat_config_folder(options.bat_cfg_path)   
+        else:
+            _ERR('%s is not valid for --set-bat-cfg-path' % options.bat_cfg_path)
+            quit_program(CMDLINE_ERROR)
+
+    # if -F is set, user cannot change some default values
+
+    if options.force_config_file:
+        allowed_options = ['-v', '-T', '-P', '-F', '-b', '--set-java-path', '--set-ttcn-version', '--force-tmp']
+        for option_name in sys.argv:
+            if not option_name.startswith('-'):
+                continue
+
+            if option_name not in allowed_options:
+                _ERR('Command line option %s not allowed with -F' % option_name)
+                _ERR('Only the following options are available: %s' %  ' '.join(allowed_options))
+                quit_program(CMDLINE_ERROR)
+
+    else:
+        if not options.scenario:
+            _ERR('Option "-C SCENARIO" is mandatory when not forcing a cfg')
+            quit_program(CMDLINE_ERROR)
+
+        if options.vip_data == '':
+            try:
+                config = shared.get_env_data()
+                if config.is_cloud:
+                    options.node_type = 'CNHSS'
+                    options.eccd_name = config.get_eccd_name()
+                    options.eccd_type = config.raw['eccds'][0]['type']
+                    if config.raw['eccds'][0]['type'] == 'IBD':
+                        options.eccd_type = 'IBD'
+                        options.vip_data = config.get_eccd_cloud_vip(eccd=0)
+                    else:
+                        options.eccd_type = 'ANS'
+                else:
+                    options.vip_data = config.get_cabinet_oam_vip(cabinet=0)
+                    _INF('Node         :%s' % options.vip_data)
+                    if config.raw['cabinets'][0]['type'] in ['CBA','VNF']:
+                        options.node_type = 'CBA'
+                    elif config.raw['cabinets'][0]['type'] in ['TSP']:
+                        options.node_type = 'TSP'
+
+                _INF('Node type    :%s' % options.node_type)
+
+            except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, hss_utils.rosetta.InfoNotFound), e:
+                _ERR('Error: %s. Use command line parameter -V' % str(e))
+                quit_program(ROSETTA_ERROR)
+
+        elif options.node_type == 'CNHSS':
+            if not options.eccd_type:
+                _ERR('Using command line parameter -V in CNHSS scenario disable rosetta so eccd type shall be specified by user')
+                quit_program(ROSETTA_ERROR)
+
+            if options.eccd_type == 'ANS' and not options.kubeconfig:
+                _ERR('Using command line parameter -V in CNHSS scenario disable rosetta so kubeconfig file shall be specified by user')
+                quit_program(ROSETTA_ERROR)
+
+            if options.eccd_type == 'IBD' and not options.ssh_key:
+                _ERR('Using command line parameter -V in CNHSS scenario disable rosetta so ssh_key file shall be specified by user')
+                quit_program(ROSETTA_ERROR)
+
+        elif not options.ipv6:
+            if len(options.vip_data.split(':'))==1:
+                options.vip_data += '::::::%s:' % options.vip_data
+
+        shared.set_cliss_user(options.cliss_user)
+
+        if not options.node_type:
+            options.node_type = check_node_type(options.vip_data.split(':')[0], cba_user = shared.CLISS_USER)
+            if options.node_type == 'TSP':
+                _INF('Discovered %s node is TSP' % options.vip_data.split(':')[0])
+            elif options.node_type == 'CBA':
+                _INF('Discovered %s node type is CBA' % options.vip_data.split(':')[0])
+            else:
+                _ERR('The "%s" node type can not be discovered. Use --node-type command line parameter for setting TSP or CBA or CNHSS.' % options.vip_data.split(':')[0]) 
+                quit_program(CMDLINE_ERROR)
+
+
+        if options.node_type == 'CNHSS':
+            if not options.set_traffic_mix:
+                options.traffic_groups.append('CLOUD')
+
+            if options.scenario not in ['IMS', 'EPC']:
+                _ERR('Only IMS or EPC are allowed in -C when node-type is CMHSS')
+                quit_program(CMDLINE_ERROR)
+
+            if options.load_parameters:
+                _ERR('For CNHSS node -l parameter is not allowed')
+                quit_program(CMDLINE_ERROR)
+
+            if options.modules:
+                _ERR('For CNHSS node -m parameter is not allowed')
+                quit_program(CMDLINE_ERROR)
+
+            if options.sec_traffic_vip:
+                _ERR('For CNHSS node -R parameter is not allowed')
+                quit_program(CMDLINE_ERROR)
+
+            if options.eccd_type == 'IBD':
+                options.access_config = {'host':options.vip_data.split(':')[0],'port':22, 'user':'eccd'}
+
+                if not options.ssh_key:
+                    options.ssh_key = os.path.join(hss_utils.st_command.real_path(hss_utils.node.cloud.IBD_CREDENTIAL_PATH),
+                                            'id_rsa_%s' % options.eccd_name)
+
+                    if not os.path.isfile(options.ssh_key):
+                        cmd = 'mkdir -p %s' % hss_utils.st_command.real_path(hss_utils.node.cloud.IBD_CREDENTIAL_PATH)
+                        stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                        if returncode:
+                            _ERR('Error executing "%s": %s' % (cmd, stderr_value))
+                            quit_program(CONFIGURATION_ERROR)
+
+                        try:
+                            config = shared.get_env_data()
+                            file_content = hss_utils.rosetta.get_file_from_rosetta('credentials/%s/download_ssh_key_file/ ' % config.get_director_credential())
+                        except Exception as e:
+                            _ERR('Error: %s. The TG shall belong to a cloud environment that is well configured in Rosetta' % str(e))
+                            quit_program(ROSETTA_ERROR)
+
+                        with open(options.ssh_key,'w') as fd:
+                            fd.write(file_content)
+
+                        cmd = 'chmod 600 %s' % options.ssh_key
+                        stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                        if returncode:
+                            _ERR('Error executing "%s": %s' % (cmd, stderr_value))
+                            quit_program(CONFIGURATION_ERROR)
+
+                options.access_config.update({'credential_file':hss_utils.st_command.real_path(options.ssh_key)})
+
+            elif options.eccd_type == 'ANS':
+                if not options.kubeconfig:
+                    options.kubeconfig = os.path.join(hss_utils.st_command.real_path(hss_utils.node.cloud.ANS_CREDENTIAL_PATH),
+                                            '%s.conf' % options.eccd_name)
+
+                    if not os.path.isfile(options.kubeconfig):
+                        cmd = 'mkdir -p %s' % hss_utils.st_command.real_path(hss_utils.node.cloud.ANS_CREDENTIAL_PATH)
+                        stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                        if returncode:
+                            _ERR('Error executing "%s": %s' % (cmd, stderr_value))
+                            quit_program(CONFIGURATION_ERROR)
+
+                        try:
+                            file_content = hss_utils.rosetta.get_file_from_rosetta('eccds/%s/download_config_file/ ' % options.eccd_name)
+                        except Exception as e:
+                            _ERR('Error: %s. The TG shall belong to a cloud environment that is well configured in Rosetta' % str(e))
+                            quit_program(ROSETTA_ERROR)
+
+                        with open(options.kubeconfig,'w') as fd:
+                            fd.write(file_content)
+
+                options.access_config = {'credential_file':hss_utils.st_command.real_path(options.kubeconfig)}
+
+            else:
+                _ERR('Undefined Eccd type. Use --eccd-type for setting a value')
+                quit_program(CMDLINE_ERROR)
+
+
+        if options.ipv6:
+            if options.sec_traffic_vip is not None:
+                _ERR('-R, --secondary-cabinet-ip parameters are not allowed when IPv6 is selected (-6 parameter)')
+                quit_program(CMDLINE_ERROR)
+
+            if options.scenario in ['IMS-SLFr', 'IMS-R', 'EPC-R', 'OAM', 'WLAN']:
+                _ERR('%s value is not allowed as scenario when IPv6 is selected (-6 parameter)' % options.scenario)
+                quit_program(CMDLINE_ERROR)
+
+            if options.conkeeper != '':
+                _ERR('-k, --conkeeper parameters are not allowed when IPv6 is selected (-6 parameter)')
+                quit_program(CMDLINE_ERROR)
+
+
+        if options.scenario in ['IMS-R', 'EPC-R'] and options.sec_traffic_vip is None:
+            try:
+                config = shared.get_env_data()
+                if len(config.raw['cabinets']) != 2:
+                    _ERR('There are not two cabinets. Be sure that you are in a GeoRed enviroment. Use command line parameter -R')
+                    quit_program(ROSETTA_ERROR)
+
+                options.sec_traffic_vip = config.get_cabinet_oam_vip(cabinet=1)
+                _INF('Sec. Node    :%s' % options.sec_traffic_vip)
+            except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+                _ERR('Error: %s. Use command line parameter -V' % str(e))
+                quit_program(ROSETTA_ERROR)
+
+        for module in options.modules.split():
+            if module not in shared.TRAFFIC_TYPES:
+                _ERR('Wrong value in -m parameter. Allowed values are %s' % ','.join(shared.TRAFFIC_TYPES))
+                quit_program(CMDLINE_ERROR)
+
+        if options.force_manual:
+            options.mode_semiautomatic = False
+            options.mode_automatic = False
+            options.mode_manual = True
+        elif options.mode_automatic:
+            if options.mode_semiautomatic or options.mode_manual:
+                _ERR('Cannot use -A with -M or -S')
+                quit_program(CMDLINE_ERROR)
+        elif options.mode_semiautomatic:
+            if options.mode_automatic or options.mode_manual:
+                _ERR('Cannot use -S with -A or -M')
+                quit_program(CMDLINE_ERROR)
+        elif options.mode_manual:
+            if options.mode_automatic or options.mode_semiautomatic:
+                _ERR('Cannot use -M with -A or -S')
+                quit_program(CMDLINE_ERROR)
+
+        if (options.set_traffic_mix  and options.add_traffic_mix ):
+            _ERR('Cannot use -x and -X at the same time')
+            quit_program(CMDLINE_ERROR)
+
+        if ((options.time > 0) and (options.range_loops > 0)):
+            _ERR('Execution modes "-r" and "-t" cannot be selected at the same time')
+            quit_program(CMDLINE_ERROR)
+
+        if options.disable_graph:
+            options.gui_mode = False
+            options.extra_parameters.append(' :REFRESH_PLOT_TIME:0')
+
+    # Command line parsing OK
+
+    return (options)
+
+
+def show_test_options(config_file, options):
+    # Final dual-check
+    out = '\n*** Test parameters ***\n\n'
+    out += ' Config file: "%s"\n' % config_file
+    out += 'BAT CFG path: "%s"\n' % shared.BAT_CONFIG_FOLDER
+    out += '  BAT binary: "%s"\n' % options.bat_binary
+    out += '   JAVA path: "%s"\n' % 'system default' if shared.JAVA is None else shared.JAVA
+    out += 'TTCN version: "%s"\n' % shared.TTCN_VERSION
+    out += '    TMP path: "%s"\n\n' % shared.EXECUTION_PATH
+
+    config = get_BAT_config(config_file)
+    out += 'Options analysis:\n'
+    out += '\t    ConKeeper: "%s"\n' % (config['conkeeper'],)
+    out += '\t  LoadPlotter: "%s"\n' % (config['loadplotter'],)
+    out += '\tManualControl: "%s"\n' % config['manual_control']
+    out += '\t     GUI Mode: "%s"' % config['gui_mode']
+    if config['gui_mode']:
+        out += ' (Host: %s:%s)' % (config['gui_host'],
+                                   config['port_gui'])
+    out += '\n\t   Layer mode: "%s"' % config['layer']
+    if config['layer']:
+        out += ' (ExternalDB: %s)' % (config['external_db'],)
+    out += '\n\t Asynchronous: "%s"\n' % config['asynchronous']
+    out += 'Cabinets:\n'
+    out += '\tPrimary: %s\n' % config['primary_cabinet']
+    out += '\tSecondary: %s\n' % config['secondary_cabinet']
+    out += 'DiaProxies:\n'
+    no_diaproxies = True
+    for proxy in config.get('diaproxies', []):
+        no_diaproxies = False
+        out += '\tDiaProxy definition: %s  Started by %s"\n' % (proxy, ('Application' if proxy[2] else 'User'))
+    if no_diaproxies:
+        out += '\tNo DiaProxies defined\n'
+    out += 'Generators:\n'
+    no_generators = True
+    for generator in config.get('generators', []):
+        no_generators = False
+        out += '\tCS Admins definition: "%s"\n' % (generator,)
+    if no_generators:
+        out += '\tNo CS Admins defined\n'
+
+    return out
+
+
+def run_titansim(config_file, options):
+    global RUNNING_COMPONENTS
+
+    _INF('Launching "%s"...' % config_file)
+    config = get_BAT_config(config_file)
+
+    overwrite={}
+    if options.mode_automatic:
+        _DEB("overwrite Automatic")
+        overwrite={'execution_mode':'Automatic'}
+    elif options.mode_semiautomatic:
+        _DEB("overwrite Semiautomatic")
+        overwrite={'execution_mode':'Semiautomatic'}
+    elif options.mode_manual:
+        _DEB("overwrite Manual")
+        overwrite={'execution_mode':'Manual'}
+
+    mc_host = options.mc_host
+    mc_port = config.get('tcp_port', None)
+    gui_kept = config.get('gui_mode', False) and options.gui_kept
+    gui_host = config.get('gui_host', None)
+    gui_port = config.get('port_gui', None)
+
+    # Create MC
+    mc = create_MC((mc_host, mc_port), config_file, options.password, overwrite)
+    RUNNING_COMPONENTS.append(mc)
+
+    # Load aliases
+    alias = {}
+
+    if options.alias == shared.DEFAULT_ALIAS_FILE:
+        alias_file = options.alias
+    else:
+        alias_file = options.alias
+
+    if not os.path.exists(alias_file):
+        _ERR('Cannot find aliases file: %s' % alias_file)
+        quit_program(CMDLINE_ERROR)
+    with file(alias_file, 'r') as fd:
+        try:
+            alias = json.load(fd)
+        except e:
+            _ERR('Cannot parse aliases file: %s' % alias_file)
+            quit_program(CONFIG_ERROR)
+
+    # Create and start Diaproxy
+    scenario_type = config.get('scenario_type', None)
+    if scenario_type in ['ISMSDA', 'ESM']:
+        instance = 0
+        for diaproxy in config['diaproxies']:
+            if diaproxy[2] == 0:
+                _INF('Diaproxy %s:%s should have been started by user' % (diaproxy[0], diaproxy[1]))
+            elif config['node_type'] == 'CNHSS' and not config['cnhss_appid']:
+                _INF('Diaproxy %s:%s should have been started by user in CNHSS when appid is not specified' % (diaproxy[0], diaproxy[1]))
+            else:
+                _INF('Diaproxy %s:%s will be started by application' % (diaproxy[0], diaproxy[1]))
+
+                component = Diaproxy(diaproxy,config_file, options.password, instance, options.dia_port_offset,
+                                     cnhss = (config['node_type'] == 'CNHSS'))
+                RUNNING_COMPONENTS.append(component)
+                component.start()
+                instance += 1
+
+    # Create GUI
+    gui = GUI((gui_host, gui_port), gui_kept, options.password)
+    RUNNING_COMPONENTS.append(gui)
+
+    # Create HCs
+    hc_pool = []
+    hc_added = []
+    instance = 0
+    for generator in config['generators']:
+        if generator in hc_added:
+            continue
+
+        instance += 1
+        hc = HC(generator, mc, options.bat_binary, options.password, instanceno=instance)
+        hc_pool.append(hc)
+        RUNNING_COMPONENTS.append(hc)
+        hc_added.append(generator)
+
+    if config['scenario_type'] not in REQUESTED_ALIASES.keys():
+        _WRN('No aliasses defined for scenario type "%s"' % config['scenario_type'])
+
+    for requested_alias in REQUESTED_ALIASES.get(config['scenario_type'], []):
+        try:
+            mc.load_alias(alias[requested_alias])
+        except KeyError:
+            _ERR('Requested alias group "%s" not found in alias file' % requested_alias)
+            quit_program(CONFIG_ERROR)
+
+
+    _INF('Starting all processes...')
+
+    # Start gui_host
+    gui.start()
+
+    # Create and start LoadPlotter
+    lp = LoadPlotter(config.get('loadplotter', None), options.password)
+    RUNNING_COMPONENTS.append(lp)
+    lp.start()
+
+    # Create and start ConKeeper 
+    ck = ConKeeper(config.get('conkeeper', None), options.password)
+    RUNNING_COMPONENTS.append(ck)
+    ck.start()
+
+    # Start MC
+    mc.set_mtc_host(hc_pool[0])
+    mc.start()
+
+    # Start HCs
+    first_started = False
+    for hc in hc_pool:
+        hc.start()
+        if not first_started:
+            time.sleep(2.0)
+            first_started = True
+
+    # Wait for termination
+    mc.wait_END(options.titansim_timeout)
+
+
+def main():
+
+    options = parse_commandline()
+
+    # Setup environment
+    shared.set_java_path(options.java_path)
+    shared.set_ttcn_version(options.ttcn_version)
+    shared.set_tmp_path(options.tmp_path)
+    shared.set_nodename(options.node_name)
+
+    # Build/get config file for BAT
+    if options.force_config_file is None:
+        try:
+            _INF('Building scenario config file...')
+            config_file = build_config_file(options)
+        except KeyboardInterrupt:
+            _ERR('Cancelled by user')
+            quit_program(USER_CANCEL)
+    else:
+        config_file = hss_utils.st_command.real_path(options.force_config_file)
+        # Check for config_file
+        if not os.path.exists(config_file):
+            _ERR('File "%s" not found!' % config_file)
+            quit_program(CMDLINE_ERROR)
+
+    if options.bat_binary:
+        if not os.path.exists(options.bat_binary):
+            _ERR('File not found: %s' % options.bat_binary)
+            quit_program(CMDLINE_ERROR)
+        _INF('Use BAT bin: %s' % options.bat_binary)
+    else:
+        options.bat_binary = find_executable('BAT_HSSTraffic')
+        if options.bat_binary == '':
+            _ERR('Binary not found: "BAT_HSSTraffic"')
+            quit_program(CMDLINE_ERROR)
+
+    # Run BAT
+    if options.output_config_file is None:
+        _INF(show_test_options(config_file, options))
+        run_titansim(config_file, options)
+    _INF('Program terminated successfully')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+
+    quit_program(0)

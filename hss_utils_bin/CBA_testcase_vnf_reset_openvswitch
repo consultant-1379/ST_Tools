@@ -1,0 +1,465 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services as rosetta_services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+env_name=''
+type_vnf=''
+list_vms=''
+user_config={}
+
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def compare_changes_after_restart(hypervisor_rebooted, vm_hypervisor_pre, vm_hypervisor_post):
+    _INF('Checking PRE configuration: %s\n ' %  vm_hypervisor_pre)
+    _INF('Checking POST configuration: %s\n ' %  vm_hypervisor_post)
+    _INF('Hypervisor rebooted: %s ' %  hypervisor_rebooted)
+    if 'Telco' in type_vnf:
+        _INF('Checking configuration after OpenvSwitch restart for a %s environment' % type_vnf)
+        for key_pre,val_pre in vm_hypervisor_pre.items():
+            for key_post,val_post in vm_hypervisor_post.items():
+                if key_pre == key_post:
+                    if 'sc_' in key_pre:
+                        if 'TelcoPersist' in type_vnf:
+                        # Telco with External Persistent storage: SC's will remain in the same compute
+                            if val_pre == val_post:
+                                _INF('OK: VM "%s" has same hypervisor "%s" after OpenvSwitch restart' % (val_pre, vm_hypervisor_post[key_post]))
+                            else:
+                                _ERR('VM "%s" has a new hypervisor after OpenvSwitch restart: Before: "%s"   After: "%s"' % (key_pre, val_pre, vm_hypervisor_post[key_post]))
+                        else:
+                        # Telco without External Persistent storage: SC's will move to another compute
+                            if val_pre == hypervisor_rebooted: 
+                            # SC was affected by the OpenvSwitch restart
+                                if val_pre == vm_hypervisor_post[key_post]:
+                                    _ERR('VM "%s" has same hypervisor "%s" after OpenvSwitch restart' % (key_pre, val_pre))
+                                else:
+                                    _INF('OK: VM "%s" has a new hypervisor after OpenvSwitch restart: Before: "%s"   After: "%s"' % (key_pre, val_pre, val_post))
+                            else: # SC was not affected by the OpenvSwitch restart
+                                if val_pre == val_post:
+                                    _INF('OK: VM "%s" has same hypervisor "%s" after OpenvSwitch restart' % (key_pre, val_pre))
+                                else:
+                                    _ERR('VM "%s" has a new hypervisor after OpenvSwitch restart: Before: "%s"   After: "%s"' % (key_pre, val_pre, val_post))
+                    else:
+                    # Telco Environment : PL's always move to another compute
+                        if val_pre == hypervisor_rebooted: 
+                            # PL was affected by the OpenvSwitch restart
+                            if val_pre == val_post:
+                                _ERR('VM "%s" has same hypervisor "%s" after OpenvSwitch restart' % (key_pre, val_pre))
+                            else:
+                                _INF('OK: VM "%s" has a new hypervisor after OpenvSwitch restart: Before: "%s"   After: "%s"' % (key_pre, val_pre, val_post))
+                        else: # PL was not affected by the OpenvSwitch restart
+                            if val_pre == val_post:
+                                _INF('OK: VM "%s" has same hypervisor "%s" after OpenvSwitch restart' % (key_pre, val_pre))
+                            else:
+                                _ERR('VM "%s" has a new hypervisor after OpenvSwitch restart: Before: "%s"   After: "%s"' % (key_pre, val_pre, val_post))
+
+    # Enterprise type. Same hypervisor for all the VMs's
+    else:
+        _INF('Checking configuration after OpenvSwitch restart for a Enterprise environment')
+        for key_pre,val_pre in vm_hypervisor_pre.items():
+            for key_post,val_post in vm_hypervisor_post.items():
+                if key_pre == key_post:
+                    if val_pre == val_post:
+                        _INF('OK: VM "%s" has same hypervisor "%s" after OpenvSwitch restart' % (key_pre, val_pre))
+                    else:
+                        _ERR('VM "%s" has a different hypervisor after OpenvSwitch restart: Before: "%s"   After: "%s"' % (key_pre, val_pre, val_post))
+
+
+def get_pl_all_albs_fee(fee_info):
+    pl_name = ''
+    albs_pl = 0
+    for line in fee_info.splitlines():
+        if 'PL-' in line:
+            if albs_pl == 3:
+                return pl_name
+            pl_name = line
+            albs_pl = 0
+        if 'ln_ldap_sc' in line:
+            albs_pl +=1
+        if 'ln_raddia_sc' in line:
+            albs_pl +=1
+        if 'ln_sig_sc' in line:
+            albs_pl +=1
+    return pl_name
+
+
+def is_telco(type_vnf):
+    if 'Telco' in type_vnf:
+        return True
+    else:
+        return False
+
+
+def restart_openv_switch(compute_name):
+
+    pod_name = env_name.split('-')[0]
+    vnf_name = env_name.split('-')[1]
+
+    answer = rosetta_services.vnf_restart_router_compute (pod_name,vnf_name,compute_name)
+    _DEB('restart_router answer:%s' % answer)
+    old_pid = answer['old_pid']
+    new_pid = answer['new_pid']
+    date_down = answer['killed_at']
+    date_up = answer['restarted']
+    _INF('Old "ovs-switchd" process with id %s was killed at %s' % (old_pid, date_down))
+    _INF('New "ovs-switchd" process with id %s was started at %s.' % (new_pid, date_up))
+
+    cee_alarms=rosetta_services.get_vnf_cee_list_alarms (pod_name)
+    if cee_alarms:
+        _INF('CEE alarms environment:\n%s' % cee_alarms)
+    else:
+        _INF('NO CEE alarms found')
+
+    return True
+
+
+def main():
+    global TC
+    global env_name
+    global type_vnf
+    global list_vms
+    global user_config
+
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+
+        TC.connect_to_node()
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        state=TC.controller_state('SC-1')
+        sc_standby = 'SC-1' if 'STANDBY' in state else 'SC-2'
+
+        _INF('Processors status')
+        TC.display_processors_state()
+        TC.start_alarm_monitoring()
+        TC.alarm_monitor.max_time_for_reconnection = user_config.max_time
+        time.sleep(float(5.0))
+
+        env, config = rosetta_services.get_env_for_localhost()
+        env_type = config.get_cabinet_type()
+        env_name = config.get_cabinet_name()
+        if (env_type != "VNF"):
+            error_info = 'Error: Environment %s is NOT VIRTUAL. This Test Case only applies to Virtual Environments' % env_name
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+        # Script to test TC CROB-0700 
+        _INF('Environment %s is virtual. Restarting the OpenvSwitch process' % env)
+        pod_name = env_name.split('-')[0]
+        vnf_name = env_name.split('-')[1]
+
+        rosetta_services.vnf_apis_rosetta()
+        hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+        list_vms = rosetta_services.get_hss_vnf_vms (hss_vnf_data)
+        type_vnf = rosetta_services.get_hss_vnf_type (hss_vnf_data,list_vms)
+
+    # Step 3: Check the list of computes of the environment 
+        compute_list = rosetta_services.get_vnf_computes_avzone(pod_name, vnf_name)
+        show_compute_list = ''
+        for compute in compute_list:
+            show_compute_list = show_compute_list + "\n" + compute
+        _INF('Computes nodes of the environment:%s' % show_compute_list)
+
+    # Step 5: Check status of VMs and the hosts (hypervisors)
+        _INF('Showing information for %s environment %s before OpenvSwitch restart' % (type_vnf, env_name))
+        show_params = ['status','ha-policy','hypervisor_id','hypervisor']
+        _INF('\n%s\n' % rosetta_services.display_hss_vnf_info(hss_vnf_data, list_vms, show_params))
+
+        vm_hypervisor_pre = {}
+        for key, vm in list_vms.items():
+            vm_info = rosetta_services.get_hss_vnf_info_params(hss_vnf_data, vm, ['hypervisor'])
+            vm_hypervisor_pre[vm] = vm_info.split()[1]
+
+    # Step 4: Check distribution of eVIP elements for Telco environments
+        _INF('Showing eVIP elements distribution:')
+        cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s' % (user_config.NODE,
+    		  	                         user_config.user, user_config.port)
+        stdout, stderr, returncode = TC.run_stFramework_command(cmd, check_result = False)
+        if returncode:
+            error_info = 'Error when executing command CBA_get_FEE_eVIP_elements'
+            _ERR(error_info)
+            _ERR(stderr)
+            quit_program(st_command.EXECUTION_ERROR, stderr)
+
+        _INF('FEE eVIP elements info:\n%s  ' % stdout)
+        pl_fe = get_pl_all_albs_fee(stdout)
+        if pl_fe:
+            _INF('Node %s has ALL the FEEs' % pl_fe)
+        else:
+            error_info = 'Not PL node found with ALL the FEEs'
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, stdout)
+
+    # Step 6: Check Diameter connections distribution for Telco environments
+        if is_telco(type_vnf):
+            _INF('Multi compute (Telco) environment: Checking Diameter connections distribution')
+            cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE,
+                                                     user_config.user, user_config.port)
+
+            (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+            if output_code:
+                error_info = 'Error when executing command CBA_check_diacc_dump_json'
+                quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+    # Step 7: Getting the compute node associated to the PL with ALL the FEEs running
+        node_uuid = TC.processor_uuid(pl_fe) 
+        vm_pl = list_vms[node_uuid]
+        _INF('Virtual machine for the node %s is %s' % (pl_fe,vm_pl))
+        compute_name = rosetta_services.get_hss_vnf_hypervisor(hss_vnf_data,vm_pl)
+        _INF('Virtual machine %s is running on compute node %s)' % (vm_pl,compute_name))
+
+    # Step 9: Restarting the OpenvSwitch 
+        _INF('OpenvSwitch is going to be restarted for compute %s ...)' % compute_name)
+        restart_openv_switch(compute_name)
+
+
+    # Step 11: waiting to the node to recover
+        timeout = user_config.max_time
+        _INF('Waiting for system to recover ...')
+        reload_time = TC.wait_for_node_reload(timeout, reconnect=True)
+        _INF('cluster recovering time: %s' % reload_time)
+        TC.release_node()
+        TC.connect_to_node()
+
+    # Step 12: Checking VM distribution after OpenvSwitch restart
+        _INF('Showing information after OpenvSwitch restart for environment %s' % env_name)
+        hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+        show_params = ['status','ha-policy','hypervisor_id','hypervisor']
+        _INF('\n%s\n' % rosetta_services.display_hss_vnf_info(hss_vnf_data, list_vms, show_params))
+
+        vm_hypervisor_post = {}
+        for key, vm in list_vms.items():
+            vm_info = rosetta_services.get_hss_vnf_info_params(hss_vnf_data, vm, ['hypervisor'])
+            vm_hypervisor_post[vm] = vm_info.split()[1]
+
+        compare_changes_after_restart (compute_name, vm_hypervisor_pre, vm_hypervisor_post)
+
+    # Step 13: Check alarms both in CEE and HSS-FE
+        cee_alarms=rosetta_services.get_vnf_cee_list_alarms (pod_name)
+        if cee_alarms:
+            _INF('CEE alarms environment:\n%s' % cee_alarms)
+        else:
+            _INF('NO CEE alarms found')
+
+
+    # Step 14: Check distribution of eVIP elements and Check Diameter connections for Telco environments
+        _INF('Showing eVIP elements distribution after OpenvSwitch restart')
+        cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s' % (user_config.NODE, user_config.user, user_config.port)
+        TC.run_stFramework_command(cmd, check_result = True)
+
+        if is_telco(type_vnf):
+            _INF('Multi compute (Telco) environment: Checking Diameter connections distribution after OpenvSwitch restart')
+            cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE, user_config.user, user_config.port)
+
+            (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+            if output_code:
+                error_info = 'Error when executing command CBA_check_diacc_dump_json'
+                quit_program(st_command.EXECUTION_ERROR, error_info)
+
+        _INF('Waiting %s seconds for next action' % user_config.wait_time)
+        time.sleep(float(user_config.wait_time))
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError as e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, hss_utils.rosetta.InfoNotFound) as e:
+        error_info = 'Error: %s. Use command line parameter -V' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.ROSETTA_ERROR,error_info)
+
+    except (hss_utils.rosetta.ActionFailure) as e:
+        error_info = 'Error when executing E3cloud action: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Execute a OpenvSwitch restart on the compute node where the PL with the 3 FEEs running ',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-t', '--time',
+                        default=60, type=int, action='store', dest='wait_time',
+                        help='Waiting time for action. By default is "%(default)s"')
+
+    scenario_params.add_argument('--max-time',
+                        default=600, type=int, action='store', dest='max_time',
+                        help='Max time waiting after OpenvSwitch restart. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_vnf_reset_openvswitch_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_vnf_reset_openvswitch_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        env, config = rosetta_services.get_env_for_localhost()
+        _INF('Environment  : %s' % env)
+        args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+        _INF('Node         :%s' % args.NODE)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)

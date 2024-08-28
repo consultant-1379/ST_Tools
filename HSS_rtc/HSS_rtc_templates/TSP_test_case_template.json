@@ -1,0 +1,105 @@
+{
+    "name" : "DEFAULT_TEST_TSP",
+    "phases" : {
+                "CLEAN": {
+                        "enable":false,
+                        "steps": [
+                            {"id":"restore_hss_backup","enable":false,"stop_on_fail":true,"extra_parameters":""},
+                            {"id":"restore_extdb_backup","enable":false,"stop_on_fail":true,"extra_parameters":""},
+                            {"id":"clean_app_logs","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"clean_pmf_logs","enable":false,"stop_on_fail":false,"extra_parameters":""}
+                        ]
+                    },
+                "PRE": {
+                        "enable":true,
+                        "steps": [
+                            {"id":"health_check","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_alarms","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_capsule_dumps","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_processors_info","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_dynamic_process","enable":false,"stop_on_fail":false,"extra_parameters":""}
+                        ]
+                    },
+                "POST": {
+                        "enable":false,
+                        "steps": [
+                            {"id":"health_check","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_alarms","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_capsule_dumps","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_processors_info","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_dynamic_process","enable":false,"stop_on_fail":false,"extra_parameters":""}
+                        ]
+                    },
+                "COLLECT": {
+                        "enable":false,
+                        "steps": [
+                            {"id":"collect_logs","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"pmf_counter_sum","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"pmf_counter_to_csv","enable":false,"stop_on_fail":false,"extra_parameters":""}
+                        ]
+                    },
+                "CHECK": {
+                        "enable":false,
+                        "steps": [
+                            {"id":"check_alarms","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_capsule_dumps","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_processors_info","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_traffic","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":"max_error_rate=0.2"},
+                            {"id":"check_epm","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":"id='EPM_EPC',tolerance=2"},
+                            {"id":"check_load_stability","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_scenario_error_rate","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""}
+                        ]
+                    },
+                "EXECUTION":{
+                        "enable":true,
+                        "instances": {
+                                "BAT_EPC": {
+                                    "enable":false,
+                                    "parameters" : "-MGZ -C EPC-SLF -z 100 -t 3600 -E :SYNC:5 -l 20:::5",
+                                    "cps_scheduler":{
+                                        "enable":false,
+                                        "preexec":[{"value":200,"time":-1}],
+                                        "loadgen":[{"value":200,"time":90},{"value":300,"time":90},{"value":200,"time":90},{"value":300,"time":-1}],
+                                        "postexec":[{"value":200,"time":-1}]
+                                    }
+                                }
+                            },
+                        "configuration": {
+                            "manual_control" : false,
+                            "wait_pmf_counters_update" : false,
+                            "skip_postexec":true,
+                            "display_cps":{"enable":true,"samples":5,"sampling_time":5,"refresh_time":10,"real_time_enabled":true},
+                            "monitor_error":{
+                                "enable":{"preexec":true,"loadgen":true,"postexec":true},
+                                "default_error_rate":0.1,
+                                "sampling_time":10,
+                                "display":true
+                            },
+                            "monitor_load":{
+                                "enable":true,
+                                "slots":[
+                                    {"target_load":18,"time":-1,"variance":5,"transition":10}
+                                ]
+                            },
+                            "diaproxy_reports":{
+                                "latency":{"enable":false,"samples":1,"time":30,"target_load":10,"wait":10,
+                                           "only_when_load_stable":true,"stop_loadgen_when_finish":true
+                                },
+                                "result_codes":{"enable":false}
+                            },
+                            "action":[
+                                {
+                                    "id":"Action_id","enable":false,"cmd":"action cmd",
+                                    "trigger":{"load":30,"time":300},
+                                    "stop_on_fail":false,
+                                    "add_to_verdict":true,
+                                    "display_execution":true,
+                                    "time_running_traffic_after_execution":600,
+                                    "disable_load_monitor":true,
+                                    "stop_error_scenario_register":true
+                                }
+                            ]
+                        }
+                    }
+        }
+}

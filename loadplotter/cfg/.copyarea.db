@@ -1,0 +1,8 @@
+ClearCase CopyAreaDB|4
+vobs/ste/ste_code/system_test_tools/loadplotter/cfg
+2
+4
+15:load_plotter_help.txt|1|14fd504e158|90a|e6d9d578|f8cc113e2bb311e589a31cc1dee5e5d8|0
+24:load_plotter_processors_template.cfg|1|14fd504e158|358|1508d851|8d13e68da8e611e39b54000185a4cc64|0
+22:load_plotter_cabinets_template.cfg|1|14fd504e158|37b|7798d9d6|8c63e689a8e611e39b54000185a4cc64|0
+14:command_examples.txt|1|14fd504e158|429|c01422df|82a3e681a8e611e39b54000185a4cc64|0

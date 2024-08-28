@@ -1,0 +1,342 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.tsp
+import hss_utils.st_command
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+NODE=None
+
+def quit_program(exit_code):
+    global NODE
+
+    if NODE is not None:
+        NODE.release()
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+def main():
+
+    global NODE
+    user_config = parse_commandline()
+    try:
+        if hss_utils.st_command.get_ip(user_config.NODE) is None:
+            _ERR('Node value %s is not valid' % user_config.NODE)
+            quit_program(hss_utils.st_command.WRONG_PARAMETER)
+
+        NODE = hss_utils.node.tsp.Tsp(config = {'host':user_config.NODE})
+        interface_list = []
+        allowed_interfaces = NODE.network_interfaces
+        if user_config.interface is None:
+            interface_list = ','.join(allowed_interfaces)
+        else:
+            for interface in user_config.interface:
+                if interface not in allowed_interfaces:
+                    _ERR('Network Interface %s not valid. Allowed values are: %s' % (interface, ' '.join(allowed_interfaces)))
+                    quit_program(WRONG_PARAMETER)
+
+            interface_list = ','.join(user_config.interface)
+
+        _INF('Network_interfaces: %s' % interface_list)
+
+        loader = NODE.primary_loader
+        if loader is None:
+            _ERR('There is not a loader enabled')
+            quit_program(EXECUTION_ERROR)
+
+        cmd = 'eptsptcpdump -P /data -o %s -i %s -s 0' % (loader, interface_list)
+        _INF('Executing: %s' % cmd)
+        NODE.run_command_async(cmd, 'tcpdump', {'Type "yes" to continue' : 'yes', 'Capturing ... Elapsed time' : ''}, timeout = 60) 
+
+    except connection.Unauthorized, e: 
+        _DEB('Error: %s' % str(e))
+        quit_program(AUTHENTICATION_ERROR)
+
+    except connection.ConnectionFailed, e: 
+        output = NODE.get_output_command_async('tcpdump')
+        if 'eptsptcpdump already running' in output:
+            _ERR('There is an eptsptcpdump already running. Connect to node and stop it. Be sure that /tmp/tsptcpdump_lock does not exist ')
+            quit_program(EXECUTION_ERROR)
+
+        _DEB('Error: %s' % str(e))
+        quit_program(CONNECTION_ERROR)
+
+    except connection.ConnectionFailed, e: 
+        _DEB('Error: %s' % str(e))
+        quit_program(AUTHENTICATION_ERROR)
+
+    except connection.ConnectionTimeout, e: 
+        _DEB('Error: %s' % str(e))
+        quit_program(TIMEOUT)
+
+    except Exception, e:
+        _ERR('Error: %s' % str(e))
+        quit_program(IMPLEMENTATION_ERROR)
+
+    try:
+        if user_config.capture_time is None:
+            _DEB('Capturing......Press ctrl-c to stop')
+            print '\n\nCapturing......Press ctrl-c to stop'
+            signal.pause()
+        else:
+            _DEB('Capture will take %s seconds. Press ctrl-c to stop' % user_config.capture_time)
+            print '\n\nCapture will take %s seconds. Press ctrl-c to stop' % user_config.capture_time
+            time.sleep(float(user_config.capture_time))
+
+    except KeyboardInterrupt:
+        _DEB('Capture stopped by user!')
+        print '\n Capture stopped by user!'
+
+    output = NODE.stop_command_async('tcpdump')    
+    _DEB('output %s' % output)
+    dump_file = re.search(r'\/opt\/telorb\/axe\/tsp\/dump_\d+\.tgz',output).group()
+    _INF( 'dump_file: %s' % dump_file)
+
+    try:
+        NODE.download(dump_file, CWD, timeout = user_config.max_time)
+        cmd = 'rm  %s' % dump_file
+        _INF('Executing: %s' % cmd)
+        NODE.run_command(cmd)
+
+    except IOError, e:
+        _ERR('Error copying %s : %s' % (dump_file, str(e)))
+        quit_program(EXECUTION_ERROR)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed), e: 
+        _ERR('Error copying %s : %s' % (dump_file, str(e)))
+        quit_program(CONNECTION_ERROR)
+
+    try:
+        cmd = 'tar xvf %s > /dev/null' % os.path.basename(dump_file)
+        _INF('Executing: %s' % cmd)
+        os.system(cmd)
+
+        wildcard_file = 'opt/telorb/axe/tsp/%s/*.pcap' % os.path.basename(dump_file).split('.')[0]
+        cmd = 'ls -ls %s' % wildcard_file
+        _INF('Executing: %s' % cmd)
+        list_of_files, error_code = hss_utils.st_command.execute_cmd(cmd) 
+        if error_code != 0:
+            _ERR('There is not pcap file to merge')
+            quit_program(EXECUTION_ERROR)
+
+        list_of_files = list_of_files.split('\n')
+
+        file_to_merge = ''
+        empty_file = ''
+        for line in list_of_files:
+            if len(line) > 0:
+                searchObj = re.search(r'opt/telorb/axe/tsp/%s/.*\.pcap' % os.path.basename(dump_file).split('.')[0],line)
+                if searchObj:
+                    if int(line.split()[0]) != 0:
+                        file_to_merge += '%s ' % searchObj.group()
+                    else:
+                        empty_file += '%s ' % searchObj.group()
+
+        if len(empty_file):
+            _WRN('Empty pcap file: %s' % empty_file)
+            cmd = 'rm %s' % empty_file
+            _INF('Executing: %s' % cmd)
+            os.system(cmd)
+
+        if len(file_to_merge):
+            cmd = 'mergecap -w %s %s' % (user_config.output_file , file_to_merge)
+            _INF('Executing: %s' % cmd)
+            os.system(cmd)
+            cmd = 'rm %s' % file_to_merge
+            _INF('Executing: %s' % cmd)
+            os.system(cmd)        
+        else:
+            _WRN('All the pcap files are empty')
+
+        cmd = 'rm -rf opt %s' % os.path.basename(dump_file)
+        _INF('Executing: %s' % cmd)
+        os.system(cmd)
+
+        quit_program(SUCCESS)
+
+    except KeyboardInterrupt:
+        _WRN('\n Execution stopped by user!')
+        quit_program(SUCCESS)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Get a network capture in a TSP node',
+                        epilog=textwrap.dedent(get_exit_status())
+    )
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='Primary IO  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    scenario_params.add_argument('-t', '--time',
+                        default=None, action='store', dest='capture_time',
+                        help='Duration of the capture in sec')
+
+    scenario_params.add_argument('-i', '--interface', nargs='+',
+                        default=None, action='store', dest='interface',
+                        help='List of processor:interface')
+
+    scenario_params.add_argument('-o', '--output',
+                        default=os.path.join(CWD, 'TSP_dump_%s.pcap' % os.getpid())    , action='store', dest='output_file',
+                        help='Output network capture file name. Default: %(default)s')
+
+    scenario_params.add_argument('--max-time',
+                        default=None, action='store', dest='max_time',
+                        help='Max time waiting for dowloading pcap files. Default: No max timer is used')
+
+    logging=e3utils.log.add_logging_options(parser)
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(TSP_run_tcpdump_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    e3utils.log.add_file_logging(os.path.join(CWD, 'TSP_run_tcpdump_%s.log' % os.getpid()),
+                                    level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_cc2(cabinet=0)
+            _INF('Node         :%s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+            _ERR('Error: %s. Use command line parameter --node' % str(e))
+            quit_program(ROSETTA_ERROR)
+
+    try:
+        if args.output_file != os.path.join(CWD, 'TSP_dump_%s.pcap' % os.getpid()):
+            log_dir = os.path.dirname(args.output_file)
+            if log_dir != '':
+                if not os.path.exists(log_dir):
+                    os.makedirs(log_dir)
+    except Exception, e:
+        _DEB('Exception: %s' % str(e))
+        _ERR('output file value %s is not valid' % args.output_file)
+
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+
+    signal.signal(signal.SIGINT, quit_gracefully)
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

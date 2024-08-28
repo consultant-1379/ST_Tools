@@ -1,0 +1,14 @@
+[Unit]
+Description=HSS build handler service
+After=syslog.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/rtc_build_handler --log-file /var/log/rtc_service/build_handler.log --debug
+StandardOutput=syslog
+StandardError=syslog
+
+[Install]
+WantedBy=multi-user.target

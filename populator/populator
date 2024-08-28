@@ -1,0 +1,1259 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import sys
+import hss_utils
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+import traceback
+import argparse
+import subprocess
+import cmd
+from optparse import OptionParser
+from datetime import datetime
+
+from hss_utils.st_command import *
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+SUPPORTTED_VERSION = ''
+DEFAULT_IMSILEN = 15
+DEFAULT_MSISDNLEN = 12
+DEFAULT_LDAPPORT = 7323
+DEFAULT_LDAPORDER = 'ldap:'
+TOOL_LOG_PREFIX = os.path.join(CWD, ('tool_log/'))
+LDAP_LOG_PREFIX = os.path.join(CWD, ('ldap_erros/'))
+
+ENV_VAR_FILE_TEMP = None
+LDAPORDER='ldap:'
+LDAPPORT=7323
+
+def set_env_var(var_name, var_value):
+    global ENV_VAR
+    ENV_VAR[var_name] = var_value
+
+
+ENV_NAME = None
+ENV_CONFIG = None
+def get_env_data():
+    global ENV_NAME
+    global ENV_CONFIG
+    if ENV_CONFIG is None:
+        _INF('Using rosetta for getting enviroment info')
+        env, config = hss_utils.rosetta.services.get_env_for_localhost()
+        _INF('Environment  :%s' % env)
+        ENV_NAME = env
+        ENV_CONFIG = config
+
+    return ENV_CONFIG
+
+
+
+
+ENV_VAR = {
+# 
+# HSS CABINET
+# 
+'HSS_TSP' : '',
+'HSS_OAM_VIP' : '',
+'HSS_TRAFFIC_VIP' : '',
+'HSS_IO2_IP' : '',
+'HSS_URI' : '',
+# 
+# SLF CABINET
+# 
+'SLF_TSP' : '',
+'SLF_OAM_VIP' : '',
+'SLF_TRAFFIC_VIP' : '',
+'SLF_IO2_IP' : '',
+'SLF_URI' : '',
+# 
+# REDUNDANCY SECONDARY CABINET
+# 
+'SECONDARY_TSP' : '',
+'SECONDARY_OAM_VIP' : '',
+'SECONDARY_TRAFFIC_VIP' : '',
+'SECONDARY_IO2_IP' : '',
+'SECONDARY__URI' : '',
+# 
+# EXTDB
+# 
+'EXT_DB_IP' : '',
+'EXT_DB_OAM_IP' : '',
+'EXT_DB_PORT' : '',
+'EXT_DB_URI' : '',
+# 
+# COMMON
+# 
+'MO_LA' : '',
+'IMSILEN' : DEFAULT_IMSILEN,
+'MSISDNLEN' : DEFAULT_MSISDNLEN
+}
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Command line error',
+2: 'Population script failed',
+50:'Source code error'
+}
+
+# Exit status
+EXIT_CODE = 0    
+SUCCESS = 0    
+CMDLINE_ERROR = 1
+
+
+def quit_program(exit_code):
+    global EXIT_CODE
+    global ENV_VAR_FILE_TEMP
+    if ENV_VAR_FILE_TEMP is not None:
+        os.remove(ENV_VAR_FILE_TEMP.name)
+
+    EXIT_CODE = exit_code
+    _DEB('Exit code: %s (%s)' % (EXIT_CODE, EXIT_ERRORS.get(EXIT_CODE, 'unknown error code')))
+    sys.exit(EXIT_CODE)
+
+
+VIP_SUFFIXES = ['vipt', 'vipo', '2']
+
+USE_NIS = True # Only in reverse nslookups!!
+
+# This method is missing in Python 2.6 but present in 2.7
+# Workarround found in: 
+#  https://stackoverflow.com/questions/4814970/subprocess-check-output-doesnt-seem-to-exist-python-2-6-5
+#
+if "check_output" not in dir( subprocess ):
+    def my_check_output(*popenargs, **kwargs):
+        if 'stdout' in kwargs:
+            raise ValueError('stdout argument not allowed, it will be overridden.')
+        process = subprocess.Popen(stdout=subprocess.PIPE,
+                                   *popenargs, **kwargs)
+        output, unused_err = process.communicate()
+        retcode = process.poll()
+        if retcode:
+            cmd = kwargs.get("args")
+            if cmd is None:
+                cmd = popenargs[0]
+            raise subprocess.CalledProcessError(retcode, cmd)
+        return output
+    subprocess.check_output = my_check_output
+
+class ShellOptionParser(OptionParser):
+    def error(self, msg):
+        print msg
+    def exit(self, code=0, msg=None):
+        if msg is not None:
+            print msg
+
+class PopulatorShellClient(object):
+    def __init__(self):
+        self.__radius_client_list = ''
+        self.__backup = ''
+        self.__stop_on_error = True
+        self.__stop_on_ladp_error = False
+        self.__data_env_file = '' 
+        self.__list_of_cmd = False
+        self.__verbose = False
+        self.__max_threads = 1
+
+    @property
+    def list_of_cmd(self):
+        return self.__list_of_cmd
+
+    def set_list_of_cmd(self, value):
+        self.__list_of_cmd = value
+
+    @property
+    def radius_client_list(self):
+        return self.__radius_client_list
+
+    def set_radius_client_list(self, generators):
+        clients = ''
+        for generator in generators:
+           clients += '%s,' % generator
+
+        self.__radius_client_list = clients[:-1]
+
+    @property
+    def data_env_file(self):
+        return self.__data_env_file
+
+    def set_data_env_file(self, value):
+        self.__data_env_file = value
+
+    @property
+    def backup(self):
+        return self.__backup
+
+    def set_backup(self, value):
+        self.__backup = value
+
+    @property
+    def verbose(self):
+        return self.__verbose
+
+    def set_verbose(self, value):
+        self.__verbose = value
+
+    @property
+    def max_threads(self):
+        return self.__max_threads
+
+    def set_max_threads(self, value):
+        self.__max_threads = value
+
+    @property
+    def stop_on_error(self):
+        return self.__stop_on_error
+
+    def set_stop_on_error(self, value):
+        self.__stop_on_error = value
+
+    @property
+    def stop_on_ldap_error(self):
+        return self.__stop_on_ldap_error
+
+    def set_stop_on_ldap_error(self, value):
+        self.__stop_on_ldap_error = value
+
+    @property
+    def just_show_cmd(self):
+        return self.__just_show_cmd
+
+    def set_just_show_cmd(self, value):
+        self.__just_show_cmd = value
+
+    def execute_cmd(self, cmd):
+
+        if self.just_show_cmd:
+            _INF(' %s' % repr(cmd))
+            return
+
+        _INF('Running %s' % repr(cmd))
+        try:
+            proc = subprocess.Popen(cmd,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    shell=True)
+
+        except Exception, e:
+            _ERR('Cmd result error : %s' % repr(str(e)))
+            if self.stop_on_error is True:
+                quit_program(2)
+
+        try:
+            stdout_value, stderr_value = proc.communicate() 
+
+            if proc.returncode == 0:
+                _INF('Cmd ok')
+            else:
+                _ERR('Cmd return code %s' % proc.returncode)
+                if stderr_value != '':
+                    _ERR('%s' % repr(stderr_value))
+                if self.stop_on_error is True:
+                    quit_program(2)                    
+
+        except KeyboardInterrupt:
+            if self.list_of_cmd:
+                _WRN('User send Ctrl-C. Stopped cmd execution')
+                print '\n\tPress Enter to continue or Ctrl-C to quit list of cmd execution'
+                try:
+                    raw_input()
+                except KeyboardInterrupt:
+                    _WRN('Stopped list of cmd execution')
+                    quit_program(0)
+
+                proc.terminate()
+
+            else:
+                _WRN('User send Ctrl-C, Stopped cmd execution')
+                proc.terminate()
+        except OverflowError, e:
+            _ERR('Cmd result error : %s' % repr(str(e)))
+            if self.stop_on_error is True:
+                quit_program(2)
+        except Exception, e:
+            _ERR('Cmd result error : %s' % repr(str(e)))
+            if self.stop_on_error is True:
+                quit_program(2)
+
+
+    def wait(self, seconds):
+        print '\t Waiting.....'
+        try:
+            time.sleep(float(seconds))
+        except KeyboardInterrupt:
+            _WRN('User send Ctrl-C, Stop waiting')
+
+        return
+
+class PopulatorShell(cmd.Cmd):
+    intro = 'Welcome to Populator shell. Type help or ? to list commands.\n'
+    prompt = 'Populator> '
+    client = PopulatorShellClient()
+
+    def default(self, line):
+        # Ignore comments
+        line = line.strip()
+        for begin in ['#', '//']:
+            if line.startswith(begin):
+                return
+        _ERR('*** Unknown syntax: %s' % line)
+        return
+
+    def emptyline(self):
+        pass
+
+    def do_EOF(self, line):
+        print ""
+        return True
+
+    def do_shutdown(self, line):
+        return True
+
+    def check_data_files(self, data_files):
+        data_files = data_files.split()
+        for fname in data_files:
+            fname = fname.replace('$POPULATION_REPO_PATH', os.environ['POPULATION_REPO_PATH'])
+            if os.path.isfile(fname) == False:
+                _ERR('***  %s file not found' % fname)
+                return False
+        return True
+
+    def help_CONFIGURE_MODULE(self):
+        print '''\nCONFIGURE_MODULE <node> <module_data_file> [--file <file_name>]
+\n\tConfigure module in SLF|HSS node
+\n\t--file    Store in file the ldif instead of send it to ldap server
+'''
+
+    def _parse_CONFIGURE_MODULE_args_(self, args):
+        parser = ShellOptionParser()
+
+        parser.add_option('--file',
+                          action='store', default=None,
+                          dest='ldif')
+
+        return parser.parse_args(args.split())
+
+    def do_CONFIGURE_MODULE(self, arg):
+        options, args = self._parse_CONFIGURE_MODULE_args_(arg)
+        _INF ('CONFIGURE_MODULE %s' % arg)
+        if len(args) < 2:
+            _ERR('*** Cmd requires <node> <module_data_file>')
+            return
+
+        if args[0] not in ['HSS','SLF']:
+            _ERR('*** <%s> not valid. Allowed values are HSS|SLF' % args[0])
+            return
+
+        if options.ldif is not None:
+            uri ='file://%s' % options.ldif
+        else:
+            uri = ENV_VAR['%s_URI' % args[0]]
+            if uri == '':
+                _ERR('*** %s_URI not configured' % args[0])
+                return
+
+        data_files = ' '.join(args[1:])
+        data_files += ' %s' %  self.client.data_env_file
+        if self.check_data_files(data_files):
+            cmd = 'ldif_builder %s %s --log-ldap-prefix %s --log-prefix %s' % (uri,data_files, LDAP_LOG_PREFIX, TOOL_LOG_PREFIX)
+            cmd += '%s' % ' --stop-on-error' if self.client.stop_on_ldap_error else ''
+            cmd += '%s' % ' --verbose' if self.client.verbose else ''
+            self.client.execute_cmd(cmd)
+        return
+
+    def help_CONFIGURE_BACKEND(self):
+        print '''\nCONFIGURE_BACKEND <data_file> [--file <file_name>] 
+\n\tLoad in Back End the common objects from provided data_file.
+\n\t--file    Store in file the ldif instead of send it to ldap server
+'''
+
+    def _parse_CONFIGURE_BACKEND_args_(self, args):
+        parser = ShellOptionParser()
+
+        parser.add_option('--file',
+                          action='store', default=None,
+                          dest='ldif')
+
+        return parser.parse_args(args.split())
+
+    def do_CONFIGURE_BACKEND(self, arg):
+        options, args = self._parse_CONFIGURE_BACKEND_args_(arg)
+        _INF ('CONFIGURE_BACKEND %s' % arg)
+        if len(args) != 1:
+            _ERR('***  Cmd requires a data_file.')
+            return
+
+        if options.ldif is not None:
+            uri ='file://%s' % options.ldif
+        else:
+            uri = ENV_VAR['EXT_DB_URI']
+            if uri == '':
+                _ERR('*** EXT_DB_URI not configured')
+                return
+
+        data_files = args[0]
+        data_files += ' %s' %  self.client.data_env_file
+        if self.check_data_files(data_files):
+            cmd = 'ldif_builder %s %s --log-ldap-prefix %s --log-prefix %s' % (uri,data_files, LDAP_LOG_PREFIX, TOOL_LOG_PREFIX)
+            cmd += '%s' % ' --stop-on-error' if self.client.stop_on_ldap_error else ''
+            cmd += '%s' % ' --verbose' if self.client.verbose else ''
+            self.client.execute_cmd(cmd)
+        return
+
+
+    def help_BACKUP_CREATE(self):
+        print '''\nBACKUP_CREATE <node> [<backupName>] [--timestamp]
+\n\tCreate a backup in SLF|HSS|SECONDARY|EXT_DB node
+\n\t--timestamp    Add the current timestamp to backupName
+'''
+    def _parse_BACKUP_CREATE_args_(self, args):
+        parser = ShellOptionParser()
+
+        parser.add_option('--timestamp',
+                          action='store_true', default=False,
+                          dest='timestamp')
+
+        return parser.parse_args(args.split())
+
+    def do_BACKUP_CREATE(self, arg):
+
+        options, args = self._parse_BACKUP_CREATE_args_(arg)
+        _INF ('BACKUP_CREATE %s' % arg)
+        if len(args) < 1:
+            _ERR('*** Cmd requires <node> [<backupName>]')
+            return
+
+        backup = self.client.backup
+        if len(args) > 1:
+            backup = args[1]
+
+        if options.timestamp:
+            timestamp = datetime.now()
+            backup += timestamp.strftime('_%Y-%m-%d_%H_%M')
+
+        self.client.set_backup(backup) 
+
+        if args[0] in ['HSS','SLF','SECONDARY']:
+            if ENV_VAR['%s_IO2_IP' % args[0]] == '':
+                _ERR('*** %s_IO2_IP not configured' % args[0])
+                return
+
+            cmd = 'TSP_create_backup --node %s %s' % ( ENV_VAR['%s_IO2_IP' % args[0]],self.client.backup)
+
+        elif args[0] in ['EXT_DB']:    
+            if ENV_VAR['EXT_DB_OAM_IP'] == '':
+                _ERR('*** EXT_DB_OAM_IP not configured')
+                return
+
+            cmd = 'GTLA_create_backup --node %s %s' % (ENV_VAR['EXT_DB_OAM_IP'], self.client.backup)
+        else:
+            _ERR('*** <%s> not valid. Allowed values are HSS|SLF|SECONDARY|EXT_DB' % args[0])
+            return
+
+        self.client.execute_cmd(cmd)
+        return
+
+    def help_BACKUP_ACTIVATE(self):
+        print '''\nBACKUP_ACTIVATE <node> <backupName>
+\n\tActivate a backup in SLF|HSS|SECONDARY|EXT_DB node'''
+
+    def _parse_BACKUP_ACTIVATE_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_BACKUP_ACTIVATE(self, arg):
+
+        options, args = self._parse_BACKUP_ACTIVATE_args_(arg)
+        _INF ('BACKUP_ACTIVATE %s' % arg)
+        if len(args) != 2:
+            _ERR('*** Cmd requires <node> <backupName>')
+            return
+        cmd =''
+        if args[0] in ['HSS','SLF','SECONDARY']:
+            if ENV_VAR['%s_IO2_IP' % args[0]] == '':
+                _ERR('*** %s_IO2_IP not configured' % args[0])
+                return
+
+            cmd += 'TSP_activate_backup --node %s %s' % ( ENV_VAR['%s_IO2_IP' % args[0]],args[1])
+
+        elif args[0] in ['EXT_DB']:    
+            if ENV_VAR['EXT_DB_OAM_IP'] == '':
+                _ERR('*** EXT_DB_OAM_IP not configured')
+                return
+
+            cmd += 'GTLA_restore_backup --node %s -b %s' % (ENV_VAR['EXT_DB_OAM_IP'], args[1])
+        else:
+            _ERR('*** <%s> not valid. Allowed values are HSS|SLF|SECONDARY|EXT_DB' % args[0])
+            return
+
+        self.client.execute_cmd(cmd)
+        return
+
+    def help_ADD_RADIUS_CLIENTS(self):
+        print '''\nADD_RADIUS_CLIENTS <node> <radius_clients_file> [--file <file_name>] 
+\n\tAdd radius clients defined in <radius_clients_file> in SLF|HSS node
+\n\t--file    Store in file the ldif instead of send it to ldap server
+'''
+
+    def _parse_ADD_RADIUS_CLIENTS_args_(self, args):
+        parser = ShellOptionParser()
+
+        parser.add_option('--file',
+                          action='store', default=None,
+                          dest='ldif')
+
+        return parser.parse_args(args.split())
+
+    def do_ADD_RADIUS_CLIENTS(self, arg):
+        options, args = self._parse_ADD_RADIUS_CLIENTS_args_(arg)
+        _INF ('ADD_RADIUS_CLIENTS %s' % arg)
+        if len(args) < 2:
+            _ERR('*** Cmd requires <node> <radius_clients_file>')
+            return
+
+        if args[0] not in ['HSS','SLF']:
+            _ERR('*** <%s> not valid. Allowed values are HSS|SLF' % args[0])
+            return
+
+        if options.ldif is not None:
+            uri ='file://%s' % options.ldif
+        else:
+            uri = ENV_VAR['%s_URI' % args[0]]
+            if uri == '':
+                _ERR('*** %s_URI not configured' % args[0])
+                return
+
+        if self.client.radius_client_list != '':
+            file_name =  os.path.join(CWD, 'Radius_Clients.data')
+            try:
+                origin_file_name = args[1].replace('$POPULATION_REPO_PATH', os.environ['POPULATION_REPO_PATH'])
+                shutil.copy (origin_file_name, file_name)
+            except IOError:
+                _ERR('*** %s file NOT found' % origin_file_name)
+                return
+
+            fd = open(file_name, 'a')
+            fd.write('HOST_LIST %s\n' % self.client.radius_client_list)
+            fd.close()
+        else :
+            file_name = args[1]
+
+        data_files = file_name
+        data_files += ' %s' %  self.client.data_env_file
+        if self.check_data_files(data_files):
+            cmd = 'ldif_builder %s %s --log-ldap-prefix %s --log-prefix %s' % (uri,data_files, LDAP_LOG_PREFIX, TOOL_LOG_PREFIX)
+            cmd += '%s' % ' --stop-on-error' if self.client.stop_on_ldap_error else ''
+            cmd += '%s' % ' --verbose' if self.client.verbose else ''
+            self.client.execute_cmd(cmd)
+        return
+
+
+    def help_DISPLAY_SCENARIO_VAR(self):
+        print '''\nDISPLAY_SCENARIO_VAR 
+\n\tDisplay sceanrio variables set by populator.'''
+
+
+    def do_DISPLAY_SCENARIO_VAR(self, arg):
+
+        for key in sorted(ENV_VAR):
+            if ENV_VAR[key] == '':
+                continue    
+            print '   %s = %s' % (key, ENV_VAR[key])
+
+        return
+
+    def parse_specific(self, specific):
+        specific = specific.split(':')
+        cmd_add_options = ''
+        allowed_options =['-f','-c']
+
+        for option in specific:
+            if option != '':
+                cmd_add_options += ' %s %s' % (allowed_options[specific.index(option)], option)
+
+        return cmd_add_options
+
+    def help_ADD_SUBS(self):
+        print '''\nADD_SUBS <node> <subscriber_data_file> [ file] [--range values][--clients int_value]
+\n\tAdd subcribers in SLF|HSS|EXT_DB node
+\n\t--range     Overwrite values in subcribers data file. Format FIRST:COUNT
+\n\t--file      Store in file the ldif instead of send it to ldap server
+\n\t--clients   Max number of ldap clients
+'''
+
+    def _parse_ADD_SUBS_args_(self, args):
+        parser = ShellOptionParser()
+
+        parser.add_option('--range',
+                          action='store', default=None,
+                          dest='specific')
+
+        parser.add_option('--file',
+                          action='store', default=None,
+                          dest='ldif')
+
+        parser.add_option('--clients',
+                          action='store', default=None,
+                          dest='clients')
+
+        return parser.parse_args(args.split())
+
+    def do_ADD_SUBS(self, arg):
+        options, args = self._parse_ADD_SUBS_args_(arg)
+        _INF ('ADD_SUBS %s' % arg)
+        if len(args) < 2:
+            _ERR('*** Cmd requires <node> <subscriber_data_file>')
+            return
+
+        if args[0] not in ['HSS','SLF','EXT_DB']:
+            _ERR('*** <%s> not valid. Allowed values are HSS|SLF|EXT_DB' % args[0])
+            return
+
+        if options.ldif is not None:
+            uri ='file://%s' % options.ldif
+        else:
+            uri = ENV_VAR['%s_URI' % args[0]]
+            if uri == '':
+                _ERR('*** %s_URI not configured' % args[0])
+                return
+
+        if options.clients is not None:
+            clients = options.clients
+        else:
+            clients = self.client.max_threads
+
+        cmd_add_options= ''
+        if options.specific is not None:
+            cmd_add_options = self.parse_specific(options.specific)
+
+        data_files = ' '.join(args[1:])
+        data_files += ' %s' %  self.client.data_env_file
+        if self.check_data_files(data_files):
+            cmd = 'ldif_builder %s %s %s --log-ldap-prefix %s --log-prefix %s --max-threads %s' % (uri,data_files,cmd_add_options, LDAP_LOG_PREFIX, TOOL_LOG_PREFIX, clients)
+            cmd += '%s' % ' --stop-on-error' if self.client.stop_on_ldap_error else ''
+            cmd += '%s' % ' --verbose' if self.client.verbose else ''
+            self.client.execute_cmd(cmd)
+        return
+
+    def help_DELETE_SUBS(self):
+        print '''\nDELETE_SUBS <node> <subscriber_data_file> [--file <file_name>] [--range values][--clients int_value]
+\n\tDelete subcribers in SLF|HSS|EXT_DB node
+\n\t--range     Overwrite values in subcribers data file. Format FIRST:COUNT
+\n\t--file      Store in file the ldif instead of send it to ldap server
+\n\t--clients   Max number of ldap clients
+'''
+
+    def _parse_DELETE_SUBS_args_(self, args):
+        parser = ShellOptionParser()
+
+        parser.add_option('--range',
+                          action='store', default=None,
+                          dest='specific')
+
+        parser.add_option('--file',
+                          action='store', default=None,
+                          dest='ldif')
+
+        parser.add_option('--clients',
+                          action='store', default=None,
+                          dest='clients')
+
+        return parser.parse_args(args.split())
+
+    def do_DELETE_SUBS(self, arg):
+        options, args = self._parse_DELETE_SUBS_args_(arg)
+        _INF ('DELETE_SUBS %s' % arg)
+        if len(args) < 2:
+            _ERR('***  Cmd requires  <node> <subscriber_data_file>')
+            return
+
+        if args[0] not in ['HSS','SLF','EXT_DB']:
+            _ERR('*** <%s> not valid. Allowed values are HSS|SLF|EXT_DB' % args[0])
+            return
+
+        if options.ldif is not None:
+            uri ='file://%s' % options.ldif
+        else:
+            uri = ENV_VAR['%s_URI' % args[0]]
+            if uri == '':
+                _ERR('*** %s_URI not configured' % args[0])
+                return
+
+        if options.clients is not None:
+            clients = options.clients
+        else:
+            clients = self.client.max_threads
+
+        cmd_add_options= ''
+        if options.specific is not None:
+            cmd_add_options = self.parse_specific(options.specific)
+
+        data_files = ' '.join(args[1:])
+        data_files += ' %s' %  self.client.data_env_file
+        if self.check_data_files(data_files):
+            cmd = 'ldif_builder %s --delete %s %s --log-ldap-prefix %s --log-prefix %s --max-threads %s' % (uri,data_files,cmd_add_options, LDAP_LOG_PREFIX, TOOL_LOG_PREFIX, clients)
+            cmd += '%s' % ' --stop-on-error' if self.client.stop_on_ldap_error else ''
+            cmd += '%s' % ' --verbose' if self.client.verbose else ''
+            self.client.execute_cmd(cmd)
+        return
+
+    def help_ADD_MME(self):
+        print '''\nADD_MME <mme_data_file> [--file <file_name>] [--range values]
+\n\tAdd MMes in ESM module
+\n\t--range    Overwrite values in mme data file. Format FIRST:COUNT
+\n\t--file    Store in file the ldif instead of send it to ldap server
+'''
+
+    def _parse_ADD_MME_args_(self, args):
+        parser = ShellOptionParser()
+
+        parser.add_option('--range',
+                          action='store', default=None,
+                          dest='specific')
+
+        parser.add_option('--file',
+                          action='store', default=None,
+                          dest='ldif')
+
+        return parser.parse_args(args.split())
+
+    def do_ADD_MME(self, arg):
+        options, args = self._parse_ADD_MME_args_(arg)
+        _INF ('ADD_MME %s' % arg)
+        if len(args) < 1:
+            _ERR('*** Cmd requires <mme_data_file>')
+            return
+
+        if options.ldif is not None:
+            uri ='file://%s' % options.ldif
+        else:
+            uri = ENV_VAR['HSS_URI']
+            if uri == '':
+                _ERR('*** HSS_URI not configured')
+                return
+
+        cmd_add_options= ''
+        if options.specific is not None:
+            cmd_add_options = self.parse_specific(options.specific)
+
+        data_files = args[0]
+        data_files += ' %s' %  self.client.data_env_file
+        if self.check_data_files(data_files):
+            cmd = 'ldif_builder %s %s %s --log-ldap-prefix %s --log-prefix %s ' % (uri,data_files,cmd_add_options, LDAP_LOG_PREFIX, TOOL_LOG_PREFIX)
+            cmd += '%s' % ' --stop-on-error' if self.client.stop_on_ldap_error else ''
+            cmd += '%s' % ' --verbose' if self.client.verbose else ''
+            self.client.execute_cmd(cmd)
+        return
+
+    def help_WAIT(self):
+        print '''\nWAIT <time>
+\n\tKeep waiting for <time> seconds'''
+
+    def _parse_WAIT_args_(self, args):
+        parser = ShellOptionParser()
+        return parser.parse_args(args.split())
+
+    def do_WAIT(self, arg):
+        options, args = self._parse_WAIT_args_(arg)
+        _INF ('WAIT %s' % arg)
+        if len(args) < 1:
+            _ERR('*** Cmd requires <time>')
+            return
+
+        try:
+            time = int(args[0])
+        except:
+            _ERR('*** <time> shall be an integer')
+            return
+        self.client.wait(time)
+        return
+
+
+class Cabinet(object):
+    def __init__(self, name):
+        assert(isinstance(name, str) )
+        self.__name = name
+        self.__vip_data = {}
+        for vip in VIP_SUFFIXES:
+            self.__vip_data[vip] = resolve_hostname('%s%s' % (self.name, vip))
+
+    @property
+    def name(self):
+        return self.__name
+
+    @property
+    def vip_data(self):
+        return self.__vip_data
+
+    def set_env_var(self, prefix = ''):
+        global ENV_VAR
+
+        set_env_var(prefix ,self.name)
+        set_env_var(prefix + '_OAM_VIP',self.__vip_data['vipo'])
+        set_env_var(prefix + '_TRAFFIC_VIP',self.__vip_data['vipt'])
+        set_env_var(prefix + '_IO2_IP',self.__vip_data['2'])
+        set_env_var(prefix + '_URI','%s//%s:%s' % (LDAPORDER,ENV_VAR[prefix + '_OAM_VIP'],LDAPPORT))
+
+    def set_vip(self, vip_name, new_address):
+
+        assert(isinstance(vip_name, str) and (isinstance(new_address, str) or isinstance(new_address, unicode)))
+        if vip_name not in VIP_SUFFIXES:
+            raise KeyError(vip_name)
+        else:
+            # Do nothing if address is empty
+            if (new_address is None) or (new_address == ''):
+                return
+            self.__vip_data[vip_name] = new_address
+
+
+import socket
+HOSTNAME = socket.gethostname()
+
+def get_cabinet(machine, secondary=False):
+
+    vip_info=[]
+    if len(machine):
+        data = parse_vip_parameter(machine[0])
+        if len(data) == 3:
+            vip_info = data
+        else:
+            _ERR('Wrong IP list %s. It shall be VIPT:VIPO:IO2"' % machine)
+            quit_program(1)
+
+    else:
+        try:
+            config = get_env_data()
+            cabinet = 1 if secondary else 0
+            vip_info.append(config.get_cabinet_vip_raddia(cabinet=cabinet))
+            vip_info.append(config.get_cabinet_oam_vip(cabinet=cabinet))
+            vip_info.append(config.get_cabinet_cc2(cabinet=cabinet))
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+            _ERR('Error: %s. Use IP values' % str(e))
+            quit_program(1)
+        except IndexError:
+            _ERR('Error: data from rosetta has less cabinets than expected')
+            quit_program(1)
+
+    cabinet = Cabinet('')
+    for vip in vip_info:
+        if validate_ip(vip,IPv6=False):
+            cabinet.set_vip(VIP_SUFFIXES[vip_info.index(vip)], vip)
+        else:
+            _ERR('Missing/wrong %s in IP list %s. It shall be VIPT:VIPO:IO2"' % (VIP_SUFFIXES[vip_info.index(vip)], machine))
+            quit_program(1)
+    return cabinet
+
+
+def get_radius_client_ip(client):
+    if validate_ip(client,IPv6=False):
+        return client
+    else:
+        return resolve_hostname(client)
+
+def get_latest_version():
+
+    global SUPPORTTED_VERSION 
+    versions = SUPPORTTED_VERSION.split(' ')
+    return versions[-1]
+
+
+def show_brief(args):
+
+    global LDAP_LOG_PREFIX
+    global TOOL_LOG_PREFIX
+    global SUPPORTTED_VERSION 
+    out = '\n\n*** Supportted ldifgen version ***\n\n'
+    versions = SUPPORTTED_VERSION.split(' ')
+    for version in versions:
+        out += '  %s\n' % version
+
+    out += '\n*** Population parameters ***\n\n'
+    out += '  Macro file               : %s\n\n' % ('' if args.macro is None else args.macro)
+    out += '  Scenario                 : %s\n' % ('Monolithic' if ENV_VAR['MO_LA'] is 'MO' else 'Layer')
+    out += '  IMSI length              : %s\n' % DEFAULT_IMSILEN
+    out += '  MSISDN length            : %s\n\n' % DEFAULT_MSISDNLEN
+    out += '  Ldap log prefix          : %s\n' % LDAP_LOG_PREFIX
+    out += '  Tool log prefix          : %s\n' % TOOL_LOG_PREFIX
+    out += '  Stop on first error      : %s\n' % ('False' if args.force else 'True')
+    out += '  Stop on first LDAP error : %s\n' % ('True' if args.stop_on_ldap_error else 'False')
+    out += '  Execute cmd              : %s\n' % ('False' if args.show else 'True')
+    out += '  Max LDAP clients         : %s\n' % args.threads
+
+    out += '\n*** URI list ***\n\n'
+
+    if ENV_VAR['SLF_OAM_VIP'] != '':
+        out += '  SLF                      : %s\n' % (ENV_VAR['SLF_URI'])
+    else:
+        out += '  SLF                      : None\n'
+
+    if ENV_VAR['HSS_OAM_VIP'] != '':
+        out += '  HSS                      : %s\n' % (ENV_VAR['HSS_URI'])
+    else:
+        out += '  HSS                      : None\n'
+
+    if ENV_VAR['SECONDARY_OAM_VIP'] != '':
+        out += '  SECONDARY                : %s\n' % (ENV_VAR['SECONDARY_URI'])
+    else:
+        out += '  SECONDARY                : None\n'
+
+    if  ENV_VAR['EXT_DB_IP'] != '':
+        out += '  ExtDb                    : %s\n' % (ENV_VAR['EXT_DB_URI'])
+    else:
+        out += '  ExtDb                    : None\n'
+
+    print out
+    print '\n\n[Press Enter to continue or Ctrl-C to quit]'
+    try:
+        raw_input()
+    except KeyboardInterrupt:
+        print '\nCancelled!'
+        quit_program(0)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+            formatter_class=argparse.RawTextHelpFormatter,
+            description='Command shell for populating SLF|HSS|ExtDb'
+    )
+
+    scenario_params = parser.add_argument_group('Define population scenario ')
+    scenario_params.add_argument('--hss', nargs='*',
+                        default=None, action='store', dest='hss',
+                        help='''IP list (VIPT:VIPO:IO2) of the cabinet where HSS is installed.
+If ommitted local hostname will be used to find env in rosetta''')
+    scenario_params.add_argument('--slf', nargs='*',
+                        default=None, action='store', dest='slf',
+                        help='''IP list (VIPT:VIPO:IO2) of the cabinet where SLF is installed.
+If ommitted local hostname will be used to find env in rosetta''')
+
+    scenario_params.add_argument('--slf_hss', nargs='*',
+                        default=None, action='store', dest='slf_hss',
+                        help='''IP list (VIPT:VIPO:IO2) of the cabinet where both SLF and HSS are installed.
+If ommitted local hostname will be used to find env in rosetta''')
+
+    scenario_params.add_argument('--secondary', nargs='*',
+                        default=None, action='store', dest='secondary',
+                        help='''Needed in GeoRed scenario.IP list (VIPT:VIPO:IO2) of the secondary cabinet.
+If ommitted local hostname will be used to find env in rosetta''')
+
+    scenario_params.add_argument('--extdb', nargs='*',
+                        default=None, action='store', dest='extdb',
+                        help='''Set the ExtDb network data IP:PORT.
+If ommitted local hostname will be used to find env in rosetta''')
+
+    scenario_params.add_argument('-r', '--radius_clients', nargs='*',
+                        action='store', default=None,
+                        help='''Set a list of traffic generators that need to be populated as Radius Clients.
+If ommitted local hostname will be used to find env in rosetta''',
+                        dest='generators')
+
+    population_params = parser.add_argument_group('Tune population parameter')
+    population_params.add_argument('-m', '--macro',
+                      action='store', default=None,
+                      help='Set the absolute path of macro file',
+                      dest='macro')
+
+    population_params.add_argument('--ldap_port',
+                        default=LDAPPORT, type=int, action='store', dest='ldap_port',
+                        help='LDAP port to be used for node population (SLF|HSS). Allowed values 7323(ldap) or 7423(ldaps). By Default is %(default)s.')
+
+    population_params.add_argument('--imsi_len',
+                        default=DEFAULT_IMSILEN, type=int, action='store', dest='imsi_len',
+                        help='Set the length of IMSI. By Default is %(default)s.')
+
+    population_params.add_argument('--msisdn_len',
+                        default=DEFAULT_MSISDNLEN, type=int, action='store', dest='msisdn_len',
+                        help='Set the length of MSISDN. By Default is %(default)s.')
+
+    program_params = parser.add_argument_group('Program behaviour options')
+    program_params.add_argument('-f', '--force',
+                      action='store_true', default=False,
+                      help='Force DO NOT Stop execution on the first NO LDAP error',
+                      dest='force')
+
+    program_params.add_argument('--stop-on-ldap-error',
+                      action='store_true', default=False,
+                      help='Force STOP execution on the first LDAP error',
+                      dest='stop_on_ldap_error')
+
+    program_params.add_argument('--skip-brief',
+                        default=False, action='store_true', dest='skip_brief',
+                        help='Skip brief presentation and do not ask for execution confirmation')
+
+    program_params.add_argument('-s', '--show',
+                        default=False, action='store_true', dest='show',
+                        help='Show but NOT execute commands')
+
+    program_params.add_argument('--max-ldap-clients', type=int, default=10,
+                        action='store', dest='threads',
+                        help='Max number of ldap clients')
+
+    program_params.add_argument('-l', '--ldap-log-prefix',
+                        default=LDAP_LOG_PREFIX, action='store', dest='ldap_log_prefix',
+                        help='Set an specific prefix for LDAP logs. Default is CWD/ldap_erros/')
+
+    program_params.add_argument('-v', '--verbose',
+                      action='store_true', default=False,
+                      help='Verbose. Prints internal input/output from command.',
+                      dest='verbose')
+
+
+    logging=e3utils.log.add_logging_options(parser)
+    logging.add_argument('--tool-log-prefix',
+                        default=TOOL_LOG_PREFIX, action='store', dest='tool_log_prefix',
+                        help='Set an specific prefix for tool logs. Default is CWD/tool_log/')
+
+    args = parser.parse_args() 
+    if args.verbose:
+        args.e3utils_log_debug = args.verbose
+        args.e3utils_log_debug_internal = args.verbose
+
+    if args.tool_log_prefix is not None and args.log_file is not None:
+        _ERR('Error: --log_file and --tool-log-prefix can not be used at the same time' )
+        quit_program(1)
+
+    e3utils.log.CONSOLE_PREFIX='(Populator_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+ 
+ 
+    if args.log_file is None:
+        e3utils.log.add_file_logging('%sPopulator_%s.log' % (args.tool_log_prefix, os.getpid()),
+                                     level=e3utils.log.DEBUG)
+ 
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+
+    if args.extdb is None and args.hss is None and args.slf is None and args.slf_hss is None:
+        _WRN('One of these args SHOULD be set --hss | --slf | --slf_hss | --extdb ')
+
+    return (args)
+
+def get_version():
+
+    cmd = 'ldif_builder --get-versions --log-prefix %s' % TOOL_LOG_PREFIX
+    try:
+        proc = subprocess.Popen(cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            shell=True)
+
+    except Exception, e:
+        _ERR('Get ldifgen library version fail: %s' % repr(str(e)))
+        quit_program(2)
+
+    try:
+        stdout_value, stderr_value = proc.communicate() 
+        return stderr_value.strip()
+
+    except Exception, e:
+        _ERR('Get ldifgen library version fail: %s' % repr(str(e)))
+        quit_program(2)
+
+def main():
+
+    global ENV_VAR_FILE_TEMP
+    global LDAPORDER
+    global LDAPPORT 
+    global LDAP_LOG_PREFIX 
+    global TOOL_LOG_PREFIX 
+    global SUPPORTTED_VERSION 
+
+    SUPPORTTED_VERSION = get_version() 
+
+    args = parse_commandline()
+
+    if args.macro is not None:
+
+        if not os.path.isfile(args.macro):
+            _ERR('File not found: %s' % args.macro)
+            quit_program(CMDLINE_ERROR)
+
+    if args.ldap_port in [7323, 7423]:
+
+        if args.ldap_port != 7323:
+            LDAPORDER='ldaps:'
+            LDAPPORT = args.ldap_port
+
+    else:
+        _ERR('Allowed values for --ldap_port are 7323 | 7423')
+        quit_program(CMDLINE_ERROR)
+
+    if args.slf_hss is not None:
+        hss = get_cabinet(args.slf_hss)
+        hss.set_env_var('HSS')
+        slf = get_cabinet(args.slf_hss)
+        slf.set_env_var('SLF')
+
+    if args.hss is not None:
+        hss = get_cabinet(args.hss)
+        hss.set_env_var('HSS')
+
+    if args.slf is not None:
+        slf = get_cabinet(args.slf)
+        slf.set_env_var('SLF')
+
+    if args.secondary is not None:
+        secondary =  get_cabinet(args.secondary, secondary=True)
+        secondary.set_env_var('SECONDARY')
+
+    if args.extdb is not None:
+
+        set_env_var('MO_LA', 'LA')
+        if args.extdb:
+            extDb = args.extdb[0].split(':')
+            extdb_ip = get_ip(extDb[0])
+            set_env_var('EXT_DB_IP', extdb_ip)
+            set_env_var('EXT_DB_OAM_IP', extdb_ip)
+
+            try:
+                port = int(extDb[1])
+            except:
+                _ERR('In option --extdb HOSTNAME|IP:PORT       PORT requires a integer port number')
+                quit_program(CMDLINE_ERROR)
+
+        else:
+            config = get_env_data()
+            if len(config.raw['extdbs']) == 0:
+                _ERR('There is not ExtDb in %s enviroment' % ENV_NAME)
+                quit_program(CMDLINE_ERROR)
+            elif len(config.raw['extdbs']) > 1:
+                _ERR('More than one ExtDb in %s enviroment. Use --extdb HOSTNAME|IP:PORT' % ENV_NAME)
+                quit_program(CMDLINE_ERROR)
+            else:
+                set_env_var('EXT_DB_IP', config.get_extdb_ldap_ip(extdb=0))
+                set_env_var('EXT_DB_OAM_IP', config.get_extdb_oam_ip(extdb=0))
+                port = 389
+
+        set_env_var('EXT_DB_PORT', port)
+        set_env_var('EXT_DB_URI','ldap://%s:%s' % (ENV_VAR['EXT_DB_IP'],ENV_VAR['EXT_DB_PORT']))
+
+    else:
+        set_env_var('MO_LA', 'MO')
+
+
+    if args.ldap_log_prefix is not None:
+        LDAP_LOG_PREFIX = args.ldap_log_prefix
+
+    output = subprocess.check_output('mkdir -p %s' % LDAP_LOG_PREFIX, shell=True)
+
+    if args.tool_log_prefix is not None:
+        TOOL_LOG_PREFIX= args.tool_log_prefix
+
+    output = subprocess.check_output('mkdir -p %s' % TOOL_LOG_PREFIX, shell=True)
+
+    if args.imsi_len != DEFAULT_IMSILEN:
+        set_env_var('IMSILEN', args.imsi_len)
+
+    if args.msisdn_len != DEFAULT_MSISDNLEN:
+        set_env_var('MSISDNLEN', args.msisdn_len)
+
+    ENV_VAR_FILE_TEMP = tempfile.NamedTemporaryFile(delete=False)
+    _INF('scenario var_file name: %s' % ENV_VAR_FILE_TEMP.name)
+
+    for key in sorted(ENV_VAR):
+        if ENV_VAR[key] == '':
+            continue    
+        ENV_VAR_FILE_TEMP.write('%s %s\n' % (key, str(ENV_VAR[key]))) 
+        _DEB('Store scenario variable %s = %s' % (key,str(ENV_VAR[key])))
+
+    ENV_VAR_FILE_TEMP.close()
+
+    if not args.skip_brief:
+        show_brief(args)
+
+    client = PopulatorShellClient()
+    client.set_data_env_file(ENV_VAR_FILE_TEMP.name)
+    client.set_max_threads(args.threads)
+
+    if args.macro is None:
+        client.set_stop_on_error(False)    
+    else:
+        client.set_stop_on_error(not args.force)
+
+    client.set_stop_on_ldap_error(args.stop_on_ldap_error)
+    client.set_verbose(args.verbose)
+
+    if  args.generators is not None:
+
+        if not len(args.generators):
+            try:
+                config = get_env_data()
+
+                args.generators = config.active_generators
+                _INF('Generators   :%s' % ' '.join(args.generators))
+            except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+                _ERR('Error: %s. Use values' % str(e))
+                quit_program(1)
+
+        client.set_radius_client_list(args.generators)
+
+
+    client.set_backup('%s_%s' % (get_latest_version(), ENV_VAR['MO_LA']))
+    client.set_just_show_cmd(args.show)
+
+    try:
+        if args.macro is None:
+            shell = PopulatorShell(stdin=sys.stdin)
+            shell.client = client
+            shell.cmdloop()
+        else:    
+            fd = open(args.macro, 'r')
+            shell = PopulatorShell(stdin=fd)
+            shell.use_rawinput = False
+            shell.client = client
+            shell.client.set_list_of_cmd(True)
+            shell.cmdloop()
+            fd.close()
+
+    except KeyboardInterrupt:
+        _INF('User send Ctrl-C')
+        quit_program(0)
+
+if __name__ == '__main__':
+    # Start log session
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+
+    quit_program(SUCCESS)

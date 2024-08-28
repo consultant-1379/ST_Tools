@@ -1,0 +1,125 @@
+#!/usr/bin/env python
+#
+
+import os
+import sys
+import hss_utils.st_command as st_command
+import subprocess
+import argparse
+
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='''Display ST gif stored in an specific directory
+Images will remain open until user press ctrl-c. This behavior can be skipped
+User can select the gif to be displayed using optional parameters
+'''
+    )
+
+    parser.add_argument('DIRECTORY',nargs='?',
+                        help='Directory where gif files are stored')
+
+    behavior_params = parser.add_argument_group('Define behavior ')
+    behavior_params.add_argument('--keep_open',
+                      action='store_true', default=False,
+                      help='Keep images open without waiting for user',
+                      dest='keep_open')
+
+    behavior_params.add_argument('-l',
+                      action='store_true', default=False,
+                      help='Display Load graphs.',
+                      dest='load')
+
+    behavior_params.add_argument('-c',
+                      action='store_true', default=False,
+                      help='Display CPS graphs.',
+                      dest='cps')
+
+    behavior_params.add_argument('-d',
+                      action='store_true', default=False,
+                      help='Display Diaproxy graphs.',
+                      dest='diaproxy')
+
+    behavior_params.add_argument('-m',
+                      action='store_true', default=False,
+                      help='Display Memory graphs.',
+                      dest='memory')
+
+    behavior_params.add_argument('-e',
+                      action='store_true', default=False,
+                      help='Display Error graphs.',
+                      dest='error')
+
+    args = parser.parse_args()
+
+    if not (args.load or args.cps or args.memory or args.diaproxy or args.error):
+        args.load = True
+        args.cps = True
+        args.diaproxy = True
+        args.memory = True
+        args.error = True
+
+    if args.DIRECTORY is None:
+        args.DIRECTORY = os.getcwd()
+
+    return (args)
+
+
+user_config = parse_commandline()
+
+cmd = 'find  %s -name "*.gif"' % user_config.DIRECTORY
+stdout, stderr, returncode = st_command.execute_cmd(cmd ,stderr = True)
+stdout = stdout.split('\n')
+
+processes=[]
+
+def display(line, keep_open=False):
+    if keep_open:
+        cmd = 'display %s &' % line
+        print cmd
+        os.system(cmd)
+    else:
+        global processes
+        print 'display %s' % line
+        proc = subprocess.Popen(['display', line])
+        processes+= [proc]
+
+for line in stdout:
+    if line != '':
+        if user_config.load and 'load' in line:
+            display(line, user_config.keep_open)
+            continue
+
+        if user_config.cps and 'CPS' in line:
+            display(line, user_config.keep_open)
+            continue
+
+        if user_config.diaproxy and ('absolute' in line or 'percentage' in line):
+            display(line, user_config.keep_open)
+            continue
+
+        if user_config.memory and 'free_memory' in line:
+            display(line, user_config.keep_open)
+            continue
+
+        if user_config.error and 'total_error' in line:
+            display(line, user_config.keep_open)
+            continue
+
+if processes:
+    print '\nPress ctrl-c to finish'
+    while True:
+        try:
+            raw_input()
+            continue
+        except KeyboardInterrupt:
+            for process in processes:
+                process.kill()
+            break
+
+
+
+
+

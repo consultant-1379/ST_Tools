@@ -1,0 +1,136 @@
+{
+    "name" : "ROB_FULL_TEST",
+    "phases" : {
+                "CLEAN": {
+                        "enable":false,
+                        "steps": [
+                            {"id":"restore_hss_backup","enable":false,"stop_on_fail":true,"extra_parameters":"-b 19089CXR10122571-R3A02_20170323_TRUE"},
+                            {"id":"restore_extdb_backup","enable":false,"stop_on_fail":true,"extra_parameters":""},
+                            {"id":"clean_alarms","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"clean_alerts","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"clean_app_logs","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"clean_console_logs","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"clean_pmf_logs","enable":false,"stop_on_fail":false,"extra_parameters":""}
+                        ]
+                    },
+                "PRE": {
+                        "enable":false,
+                        "steps": [
+                            {"id":"health_check","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_last_pl_reboot","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_alarms","enable":false,"stop_on_fail":false,"extra_parameters":"\"Diameter Link Failure\""},
+                            {"id":"get_nbi_alarms","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_node_status","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_repository_list","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_capsule_dumps","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_free_memory","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_ExtDb_connections","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_all_processes","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_processes_list","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_dynamic_process","enable":false,"stop_on_fail":false,"extra_parameters":""}
+                        ]
+                    },
+                "POST": {
+                        "enable":false,
+                        "steps": [
+                            {"id":"health_check","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_last_pl_reboot","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_alarms","enable":false,"stop_on_fail":false,"extra_parameters":"\"Diameter Link Failure\""},
+                            {"id":"get_nbi_alarms","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_node_status","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_repository_list","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_capsule_dumps","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_free_memory","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_ExtDb_connections","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_all_processes","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_processes_list","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"get_dynamic_process","enable":false,"stop_on_fail":false,"extra_parameters":""}
+                        ]
+                    },
+                "COLLECT": {
+                        "enable":false,
+                        "steps": [
+                            {"id":"cmw_collect_info","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"diacc_collect_info","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"collect_logs","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"pmf_counter_sum","enable":false,"stop_on_fail":false,"extra_parameters":""},
+                            {"id":"pmf_counter_to_csv","enable":false,"stop_on_fail":false,"extra_parameters":""}
+                        ]
+                    },
+                "CHECK": {
+                        "enable":false,
+                        "steps": [
+                            {"id":"check_pl_reboot","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_free_memory","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_capsule_dumps","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_list_processes","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_all_processes","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_alarms","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_nbi_alarms","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_node_status","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_repository_list","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_ExtDb_connections","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_traffic","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":"max_error_rate=0.2"},
+                            {"id":"check_epm","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":"id='EPM_EPC',tolerance=2"},
+                            {"id":"check_load_stability","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""},
+                            {"id":"check_scenario_error_rate","enable":false,"stop_on_fail":false,"add_to_verdict":true,"extra_parameters":""}
+                        ]
+                    },
+                "EXECUTION":{
+                        "enable":true,
+                        "instances": {
+                                "BAT_EPC_EPM": {
+                                    "enable":true,
+                                    "parameters" : "-MGZ -C EPC -t 6000 -z 100 -l :::5 -p \"::2 ::2\"",
+                                    "cps_scheduler":{
+                                        "enable":true,
+                                        "preexec":[{"value":200,"time":-1}],
+                                        "loadgen":[{"value":1000,"time":-1}],
+                                        "postexec":[{"value":200,"time":-1}]
+                                    }
+                                }
+                            },
+                        "configuration": {
+                            "manual_control" : false,
+                            "wait_pmf_counters_update" : false,
+                            "skip_postexec":true,
+                            "display_cps":{"enable":true,"samples":5,"sampling_time":5,"refresh_time":10,"real_time_enabled":true},
+                            "monitor_error":{
+                                "enable":{"preexec":true,"loadgen":true,"postexec":true},
+                                "default_error_rate":0.1,
+                                "sampling_time":10,
+                                "display":false
+                            },
+                            "monitor_memory":{
+                                "enable": false,
+                                "cpu_load_enabled":false,"sampling_time":10,"refresh_time":10,"real_time_enabled":false,"processors":""
+                            },
+                            "monitor_alarm":{"enable": false,"sampling_time":1,"display":false},
+                            "monitor_load":{
+                                "enable":true,
+                                "slots":[
+                                    {"target_load":18,"time":-1,"variance":5,"transition":10}
+                                ]
+                            },
+                            "diaproxy_reports":{
+                                "latency":{"enable":false,"samples":3,"time":60,"target_load":21,"wait":10,
+                                           "only_when_load_stable":true,"stop_loadgen_when_finish":false
+                                },
+                                "result_codes":{"enable":false}
+                            },
+                            "action":[
+                                {
+                                    "id":"Action_id","enable":false,"cmd":"action cmd",
+                                    "trigger":{"load":30,"time":300},
+                                    "stop_on_fail":false,
+                                    "add_to_verdict":true,
+                                    "display_execution":true,
+                                    "time_running_traffic_after_execution":600,
+                                    "disable_load_monitor":true,
+                                    "stop_error_scenario_register":true
+                                }
+                            ]
+                        }
+                    }
+        }
+}

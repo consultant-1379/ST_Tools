@@ -1,0 +1,48 @@
+#################################
+# General Tool Parameters
+#################################
+# LOGMASK_ERROR		1
+# LOGMASK_WARNING	3
+# LOGMASK_CONNECTIONS	7
+# LOGMASK_EVENT		15
+# LOGMASK_INFO		31
+# LOGMASK_DEBUG		63
+# LOGMASK_ALL		255
+
+change LogMask:=63
+
+#--------------------------
+# FILE_MODE     0
+# STDOUT_MODE   1
+# MIXED_MODE    2
+
+change LogMode:=2
+
+#--------------------------
+# true
+# false
+
+change KeepGraphicAfterExecution:=true
+
+
+#############################################
+# Parameters for adding connection
+
+# Name
+# Platform
+# DestHostIP
+# DestHostIO2 | ProcFilter [ ,ProcFilter ]
+# [ CBA_UserId ]
+# [ CBA_Password ]
+# [ RefreshTime ]
+# [ GraphScanSize ]
+# [ MeasureTime ]
+# [ ProcFilter ]
+# [ RegulatedloadType ]
+# [ LoadTotalPlot ]
+
+#############################################
+# TSP
+addconnection Name:=tsp6002d_Proc_m0_s13 DestHostIP:=tsp6002dvipo Platform:=TSP GraphScanSize:=3 RefreshTime:=10 ProcFilter:=Proc_m0_s13 RegulatedloadType:=traffic
+# CBA
+addconnection Name:=tsp6140u DestHostIP:=tsp6140uvipo DestHostIO2:=tsp6140u2 Platform:=CBA MeasureTime:=3 GraphScanSize:=3

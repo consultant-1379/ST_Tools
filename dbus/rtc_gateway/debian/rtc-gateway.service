@@ -1,0 +1,17 @@
+[Unit]
+Description=RTC gateway service
+After=syslog.target rtc-build-handler.service
+Requires=rtc-build-handler.service
+PartOf=rtc-build-handler.service
+
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/rtc_gateway --log-file /var/log/rtc_service/gateway.log --debug
+StandardOutput=syslog
+StandardError=syslog
+
+[Install]
+WantedBy=multi-user.target

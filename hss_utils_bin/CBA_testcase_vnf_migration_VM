@@ -1,0 +1,636 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services as rosetta_services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+env_name=''
+type_vnf=''
+user_config={}
+
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def get_free_compute(pod_name, vnf_name):
+        _INF('Showing computes available for %s environment %s:' % (type_vnf, env_name))
+        free_computes = rosetta_services.get_vnf_free_computes (pod_name, vnf_name)
+        _INF('%s' % free_computes)
+        if free_computes:
+            return free_computes[0]
+        else:
+            error_info = 'Error: NOT Free computes available to perform the Live Migration of a VM\n'
+            _WRN(error_info)
+            return None
+            ##quit_program(st_command.RESOURCES_ERROR, error_info)
+
+
+def get_pl_only_ldap_fee(fee_info):
+    current_pl = 'PL-'
+    ldap_pl = ''
+    for line in fee_info.splitlines():
+        if 'PL-' in line:
+            new_pl = line
+            if current_pl == ldap_pl:
+                return ldap_pl
+            current_pl = line
+        if 'ln_ldap_sc' in line:
+            ldap_pl = current_pl
+        if 'ln_raddia_sc' in line:
+            ldap_pl = ''
+        if 'ln_sig_sc' in line:
+            ldap_pl = ''
+    return ldap_pl
+
+def get_pl_not_ldap_fee(fee_info):
+    current_pl = 'PL-'
+    no_ldap_pl = ''
+    for line in fee_info.splitlines():
+        if 'PL-' in line:
+            new_pl = line
+            if current_pl == no_ldap_pl:
+                return no_ldap_pl
+            current_pl = line
+            no_ldap_pl = line
+        if 'ln_ldap_sc' in line:
+            no_ldap_pl = ''
+    return no_ldap_pl
+
+def get_pl_all_fee(fee_info):
+    current_pl = 'PL-'
+    all_fee_pl = ''
+    num_fees = 0
+    for line in fee_info.splitlines():
+        if 'PL-' in line:
+            if num_fees == 3:
+                all_fee_pl = current_pl
+                return all_fee_pl
+            num_fees = 0
+            current_pl = line
+        if 'ln_ldap_sc' in line:
+            num_fees+=1
+        if 'ln_raddia_sc' in line:
+            num_fees+=1
+        if 'ln_sig_sc' in line:
+            num_fees+=1
+
+    return all_fee_pl
+
+
+def check_evip_cdiam ():
+    # Check distribution of eVIP elements for Telco environments
+    _INF('Multi compute (Telco) environment: Showing eVIP elements distribution:')
+    cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s --ip' % (user_config.NODE,
+                                                      user_config.user, user_config.port)
+    ##_DEB('Executing command:%s' % cmd)
+    TC.run_stFramework_command(cmd, check_result = True)
+
+    # Check Diameter connections distribution for Telco environments
+    _INF('Multi compute (Telco) environment: Checking Diameter connections distribution')
+    cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE, user_config.user, user_config.port)
+    (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+    if output_code:
+        error_info = 'Error when executing command CBA_check_diacc_dump_json'
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+def wait_for_status_vm(wait_status, vm):
+    pod_name = env_name.split('-')[0]
+    vnf_name = env_name.split('-')[1]
+    #timeout = user_config.max_time
+    timeout = float(1000)
+    while  True:
+        now = time.time()
+        time.sleep(float(1))
+        status = rosetta_services.get_hss_vnf_vms_status (pod_name, vnf_name, vm)
+        _INF('Expected status: %s    Current Status: %s' % (wait_status, status))
+        if wait_status in status:
+            break
+        timeout -= time.time() - now
+        if timeout < 0:
+            error_info = 'Timeout waiting for Status %s in VM %s' % (wait_status, vm)
+            _ERR(error_info)
+            quit_program(st_command.TIMEOUT, error_info)
+
+def migrate_vm (migration_type, vm, hypervisor_target):
+
+    pod_name = env_name.split('-')[0]
+    vnf_name = env_name.split('-')[1]
+
+    # Step 2: Check host allocation where VMs are running
+    _INF('Showing information for %s environment %s' % (type_vnf, env_name))
+    show_params = ['status','ha-policy','hypervisor_id','hypervisor']
+    hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+    list_vms = rosetta_services.get_hss_vnf_vms (hss_vnf_data)
+    _INF('\n%s\n' % rosetta_services.display_hss_vnf_info(hss_vnf_data, list_vms, show_params))
+
+    init_time = time.time()
+    _INF('Executing %s migration for %s' % (migration_type, vm))
+    if migration_type == 'HOT':
+        answer = rosetta_services.vnf_hot_migration(pod_name, vnf_name, vm)
+        answer_info = answer['infos']['sucess_migration']
+        if 'been properly done' in answer_info:
+            _INF('Migration successfully started ...')
+            _DEB('%s' % answer_info)
+        else:
+            _ERR('Error when executing %s migration:%s ' % (migration_type, answer_info))
+            answer_error = answer['errors']
+            error_info = 'Command Error message: %s ' % str(answer_error)
+            quit_program(EXECUTION_ERROR, error_info)
+
+        _INF('Waiting for STATUS VERIFY_RESIZE in VM %s' % vm)
+        wait_for_status_vm('VERIFY_RESIZE', vm)
+        status = rosetta_services.get_hss_vnf_vms_status (pod_name, vnf_name, vm)
+        _INF('Current Status: %s' % status)
+        answer= rosetta_services.vnf_migration_resize_confirm(pod_name, vnf_name, vm)
+        _INF(' ANSWER RESIZE for VM %s is:\n%s' % (vm, answer))
+        answer_info = answer['infos']['success_confirm']
+        sucess_pattern = 'confirm command succesfully executed'
+    else:
+        answer = rosetta_services.vnf_live_migration(pod_name, vnf_name, hypervisor_target, vm)
+        answer_info = answer['infos']
+        sucess_pattern = 'sucess_live_migration'
+
+    _DEB(' ANSWER INFO:\n%s' % answer_info)
+    _DEB(' SUCCESS PATTERN INFO:\n%s' % sucess_pattern)
+    answer_error = answer['errors']
+    if (sucess_pattern in answer_info):
+        _INF('VM %s Migrated successfully' % vm)
+        _DEB('%s' % answer_info)
+    else:
+        _ERR('Error when executing %s migration for virtual machine %s ' % (migration_type, vm))
+        error_info = 'Command Error message: %s ' % str(answer_error)
+        quit_program(EXECUTION_ERROR, error_info)
+
+    # Steps 8 - 13: Wait for VM to be ACTIVE
+    _INF('Waiting until migration is completed for VM %s' % vm)
+    wait_for_status_vm('ACTIVE', vm)
+    timestamp = datetime.now()
+    end_time = time.time()
+    _INF('%s Migration completed successfully. VM %s in status ACTIVE' % (migration_type, vm))
+    TC.send_test_case_info('%-*s Migration %-*s  completed at %s   Action time (sec) %.2f' % (15,migration_type,
+                                                                              6,vm,
+                                                                              timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                              float(end_time - init_time)))
+    _INF('%s Migration lasted: %.2f' % (migration_type, end_time - init_time ))
+
+    # Step 23: Check alarms both in CEE and HSS-FE
+    cee_alarms=rosetta_services.get_vnf_cee_list_alarms (pod_name)
+    if cee_alarms:
+        _INF('CEE alarms environment:\n%s' % cee_alarms)
+    else:
+        _INF('NO CEE alarms found')
+
+
+
+def main():
+    global TC
+    global env_name
+    global user_config
+    global type_vnf
+
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+
+        TC.connect_to_node()
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        state=TC.controller_state('SC-1')
+        vm_standby = 'sc_1' if 'STANDBY' in state else 'sc_2'
+        sc_standby = 'SC-1' if 'STANDBY' in state else 'SC-2'
+
+        _INF('Processors status')
+        TC.display_processors_state()
+        TC.start_alarm_monitoring()
+        TC.alarm_monitor.max_time_for_reconnection = user_config.max_time
+
+        env, config = rosetta_services.get_env_for_localhost()
+        env_type = config.get_cabinet_type()
+        env_name = config.get_cabinet_name()
+        if (env_type != "VNF"):
+            error_info = 'Error: Environment %s is NOT VIRTUAL. Test Case CROB-0706 only applies to Virtual Environments' % env_name
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+        pod_name = env_name.split('-')[0]
+        vnf_name = env_name.split('-')[1]
+
+        rosetta_services.vnf_apis_rosetta()
+        hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+        list_vms = rosetta_services.get_hss_vnf_vms (hss_vnf_data)
+        type_vnf = rosetta_services.get_hss_vnf_type (hss_vnf_data,list_vms)
+
+        if 'Enterprise' in type_vnf:
+            error_info = 'Error: Environment %s is %s. Test Case CROB-0706 only applies to Telco Environments' % (env_name,type_vnf)
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+        _INF('Showing relationship Nodes and Virtual Machines:')
+        processors = TC.processors
+        proc_vm_info = '\nNODE \t  VIRTUAL MACHINE\n'
+        proc_vm_info = proc_vm_info + '---- \t  ---------------\n'
+        for pl_name in processors:
+            node_uuid = TC.processor_uuid(pl_name)
+            vm = list_vms[node_uuid]
+            proc_vm_info = proc_vm_info + "\n" + pl_name + '\t' + vm
+
+        _INF('%s' %  proc_vm_info)
+
+        # Step 3: Check there are computes available for migration in Telco environments
+        list_computes = rosetta_services.get_vnf_computes_avzone (pod_name, vnf_name)
+        _INF('Current list of computes:\n\t%s' % list_computes)
+        hypervisor_target = get_free_compute(pod_name, vnf_name);
+        if hypervisor_target is not None:
+            _INF('Free compute to perform the migration: %s' % hypervisor_target)
+
+        # Step 4: Check distribution of eVIP elements for Telco environments
+        # Step 5: Check Diameter connections distribution for Telco environments
+        check_evip_cdiam()
+
+
+        # Step 6: Hot Migration PL VM
+        # Migration of a VM for a PL with ALL the FEEs running
+        _INF('Checking PLs with ALL  FEEs')
+        cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s' % (user_config.NODE,
+                                                user_config.user, user_config.port)
+        stdout, stderr, returncode = TC.run_stFramework_command(cmd, check_result = False)
+        if returncode:
+            error_info = 'Error when executing command CBA_get_FEE_eVIP_elements'
+            _ERR(error_info)
+            _ERR(stderr)
+            quit_program(st_command.EXECUTION_ERROR, stderr)
+
+        _INF('FEE eVIP elements info:\n%s  ' % stdout)
+        skip_evip_elements = True
+        migration_type = 'HOT'
+        pl_fe = get_pl_all_fee(stdout)
+        if pl_fe:
+            _INF('Migrating VM for %s that has ALL FEEs ' % pl_fe)
+            # Step 5: Check Diameter connections distribution for Telco environments
+            _INF('Checking Diameter connections distribution before Live Migration')
+            cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE, user_config.user, user_config.port)
+            (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+            if output_code:
+                error_info = 'Error when executing command CBA_check_diacc_dump_json'
+                quit_program(st_command.EXECUTION_ERROR, error_info)
+
+            node_uuid = TC.processor_uuid(pl_fe)
+            vm_pl = list_vms[node_uuid]
+            _INF('##################################################################################')
+            _INF('%s Migration for Virtual Machine %s' % (migration_type, vm_pl))
+            _INF('##################################################################################')
+            timestamp = datetime.now()
+            migrate_vm(migration_type,vm_pl,hypervisor_target)
+            skip_evip_elements = False
+
+            # Release connections after migration
+            TC.release_node()
+            TC.connect_to_node()
+            reopen_time = TC.wait_for_all_ExtDb_connections_up(pl_fe, user_config.max_time)
+            _INF('%s Migration Time for %s:    %s' % (migration_type, pl_fe, str(reopen_time)))
+            TC.send_test_case_info('%-*s Migration %-*s executed at %s   Action time (sec) %.2f' % (15,migration_type,
+                                                                                      6,pl_fe,
+                                                                                      timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                                      float(reopen_time)))
+
+            _INF('Waiting %s seconds for next action' % user_config.wait_time)
+            time.sleep(float(user_config.wait_time))
+        else:
+            _INF('NOT PLs with ALL FEEs')
+
+        # Migration of a VM for a PL with ONLY LDAP FEEs running
+        _INF('Checking PLs with only LDAP FEE')
+        if not skip_evip_elements:
+            hypervisor_target = get_free_compute(pod_name, vnf_name);
+            cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s' % (user_config.NODE,
+                                                            user_config.user, user_config.port)
+            stdout, stderr, returncode = TC.run_stFramework_command(cmd, check_result = False)
+            if returncode:
+                error_info = 'Error when executing command CBA_get_FEE_eVIP_elements'
+                _ERR(error_info)
+                _ERR(stderr)
+                quit_program(st_command.EXECUTION_ERROR, stderr)
+
+            _INF('FEE eVIP elements info:\n%s  ' % stdout)
+
+        skip_evip_elements = True
+        pl_fe = get_pl_only_ldap_fee(stdout)
+        if pl_fe:
+            _INF('Migrating VM for PL %s that has only LDAP FEEs ' % pl_fe)
+            # Step 5: Check Diameter connections distribution for Telco environments
+            _INF('Checking Diameter connections distribution before Live Migration')
+            cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE, user_config.user, user_config.port)
+            (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+            if output_code:
+                error_info = 'Error when executing command CBA_check_diacc_dump_json'
+                quit_program(st_command.EXECUTION_ERROR, error_info)
+
+            node_uuid = TC.processor_uuid(pl_fe)
+            vm_pl = list_vms[node_uuid]
+            _INF('##################################################################################')
+            _INF('%s Migration for Virtual Machine %s' % (migration_type, vm_pl))
+            _INF('##################################################################################')
+            timestamp = datetime.now()
+            migrate_vm(migration_type,vm_pl,hypervisor_target)
+            skip_evip_elements = False
+            TC.release_node()
+            TC.connect_to_node()
+            reopen_time = TC.wait_for_all_ExtDb_connections_up(pl_fe, user_config.max_time)
+            _INF('%s Migration Time for %s:    %s' % (migration_type, pl_fe, str(reopen_time)))
+            TC.send_test_case_info('%-*s Migration %-*s executed at %s   Action time (sec) %.2f' % (15,migration_type,
+                                                                                      6,pl_fe,
+                                                                                      timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                                      float(reopen_time)))
+            _INF('Waiting %s seconds for next action' % user_config.wait_time)
+            time.sleep(float(user_config.wait_time))
+        else:
+            _INF('NOT PLs with only LDAP FEEs')
+
+        # Migration of a VM for a PL with NOT LDAP FEEs running
+        _INF('Checking PLs with NOT ldap FEE')
+        if not skip_evip_elements:
+            hypervisor_target = get_free_compute(pod_name, vnf_name);
+            cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s' % (user_config.NODE,
+                                                        user_config.user, user_config.port)
+            stdout, stderr, returncode = TC.run_stFramework_command(cmd, check_result = False)
+            if returncode:
+                error_info = 'Error when executing command CBA_get_FEE_eVIP_elements'
+                _ERR(error_info)
+                _ERR(stderr)
+                quit_program(st_command.EXECUTION_ERROR, stderr)
+
+            _INF('FEE eVIP elements info:\n%s  ' % stdout)
+
+        pl_fe = get_pl_not_ldap_fee(stdout)
+        if pl_fe:
+            _INF('Migrating VM for PL %s that has NOT ldap FEEs ' % pl_fe)
+            # Step 5: Check Diameter connections distribution for Telco environments
+            _INF('Checking Diameter connections distribution before Live Migration')
+            cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE, user_config.user, user_config.port)
+            (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+            if output_code:
+                error_info = 'Error when executing command CBA_check_diacc_dump_json'
+                quit_program(st_command.EXECUTION_ERROR, error_info)
+
+            node_uuid = TC.processor_uuid(pl_fe)
+            vm_pl = list_vms[node_uuid]
+            _INF('##################################################################################')
+            _INF('%s Migration for Virtual Machine %s' % (migration_type, vm_pl))
+            _INF('##################################################################################')
+            timestamp = datetime.now()
+            migrate_vm(migration_type,vm_pl,hypervisor_target)
+            TC.release_node()
+            TC.connect_to_node()
+            reopen_time = TC.wait_for_all_ExtDb_connections_up(pl_fe, user_config.max_time)
+            _INF('%s Migration Time for %s:    %s' % (migration_type, pl_fe, str(reopen_time)))
+            TC.send_test_case_info('%-*s Migration %-*s executed at %s   Action time (sec) %.2f' % (15,migration_type,
+                                                                                      6,pl_fe,
+                                                                                      timestamp.strftime('%Y-%m-%dT%H:%M:%S'),
+                                                                                      float(reopen_time)))
+            _INF('Waiting %s seconds for next action' % user_config.wait_time)
+            time.sleep(float(user_config.wait_time))
+        else:
+            _INF('NOT PLs with NOT ldap FEEs')
+
+        # Migration of the VM with the Standby SC
+        _INF('Migrating VM for standby SC %s ' % sc_standby)
+        hypervisor_target = get_free_compute(pod_name, vnf_name);
+        node_uuid = TC.processor_uuid(sc_standby)
+        vm = list_vms[node_uuid]
+        _INF('##################################################################################')
+        _INF('%s Migration for Virtual Machine %s' % (migration_type, vm))
+        _INF('##################################################################################')
+        migrate_vm(migration_type,vm,hypervisor_target)
+        _INF('Waiting %s seconds for next action' % user_config.wait_time)
+        time.sleep(float(user_config.wait_time))
+
+        # Step 7: Check the location of the VM's and the compute nodes after Migration
+        hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+        _INF('Showing information for %s environment %s after Live Migration' % (type_vnf, env_name))
+        show_params = ['status','ha-policy','hypervisor_id','hypervisor','flavor']
+        _INF('\n%s\n' % rosetta_services.display_hss_vnf_info(hss_vnf_data, list_vms, show_params))
+
+        # Step 9.1: Check distribution of eVIP elements for Telco environments
+        _INF('Showing eVIP elements distribution:')
+        cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s --ip' % (user_config.NODE,
+							user_config.user, user_config.port)
+        _DEB('Executing command:%s' % cmd)
+        TC.run_stFramework_command(cmd, check_result = True)
+
+        # Step 9.2: Check Diameter connections distribution for Telco environments
+        _INF('Checking Diameter connections distribution')
+        cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE, user_config.user, user_config.port)
+
+        (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+        if output_code:
+            error_info = 'Error when executing command CBA_check_diacc_dump_json'
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+        # Waiting to system clear the alarms after Live Migration
+        time.sleep(float(30))
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError as e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, hss_utils.rosetta.InfoNotFound) as e:
+        error_info = 'Error: %s. Use command line parameter -V' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.ROSETTA_ERROR,error_info)
+
+    except (hss_utils.rosetta.ActionFailure) as e:
+        error_info = 'Error when executing E3cloud action: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Execute a live migration of a virtual machine to a free compute node',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-t', '--time',
+                        default=60, type=int, action='store', dest='wait_time',
+                        help='Waiting time for action. By default is "%(default)s"')
+
+    scenario_params.add_argument('--max_time',
+                        default=600, type=int, action='store', dest='max_time',
+                        help='Max time waiting for every single reboot. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_vnf_migration_VM_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_vnf_migration_VM_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        env, config = rosetta_services.get_env_for_localhost()
+        _INF('Environment  : %s' % env)
+        args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+        _INF('Node         :%s' % args.NODE)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

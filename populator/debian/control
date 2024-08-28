@@ -1,0 +1,12 @@
+Source: populator
+Section: python
+Priority: optional
+Maintainer: <mitxel.garcia@ericsson.com>
+Build-Depends: debhelper (>= 7),
+Standards-Version: 3.9.2
+
+Package: populator
+Architecture: all
+Section: python
+Depends: python, ${misc:Depends}, ${python:Depends}
+Description: Cmd shell for populating HSS

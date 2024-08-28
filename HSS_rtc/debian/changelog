@@ -1,0 +1,156 @@
+hss-rtc (4.28) UNRELEASED; urgency=medium
+
+  * User com-emergency by default (Jira HSSSTT-336)
+
+ -- Serafin Alonso Alonso  <serafin.alonso@capgemini.com>  Tue, 28 Apr 2024 13:00:00 +0200
+
+hss-rtc (4.27) UNRELEASED; urgency=medium
+
+  * Fix bug in memory monitor (Jira HSSSTT-283)
+
+ -- Serafin Alonso Alonso  <serafin.alonso@capgemini.com>  Wed, 31 May 2023 08:30:00 +0200
+
+hss-rtc (4.26) UNRELEASED; urgency=medium
+
+  * HSS_rtc updates requested by Jiras HSSSTT-269, HSSSTT-270
+
+ -- Serafin Alonso Alonso  <serafin.alonso@capgemini.com>  Mon, 08 May 2023 10:30:00 +0200
+
+hss-rtc (4.25) UNRELEASED; urgency=medium
+
+  * HSS_rtc updates requested by Jiras HSSSTT-269, HSSSTT-270
+
+ -- Serafin Alonso Alonso  <serafin.alonso@capgemini.com>  Wed, 22 Feb 2023 08:30:00 +0200
+
+hss-rtc (4.24) UNRELEASED; urgency=medium
+
+  * Update type of some variables to float (Jira HSSSTT-250)
+
+ -- Serafin Alonso Alonso  <serafin.alonso@capgemini.com>  Mon, 08 Aug 2022 08:30:00 +0200
+
+hss-rtc (4.19) UNRELEASED; urgency=medium
+
+  * Updates for CERT Test Cases and Jira HSSSTT-194
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 31 May 2021 12:00:00 +0200
+
+hss-rtc (4.18) UNRELEASED; urgency=medium
+
+  * Bugfix "list index out of range" in monitor error
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Tue, 30 Mar 2021 12:00:00 +0200
+
+hss-rtc (4.17) UNRELEASED; urgency=medium
+
+  * Minor update for certificates expiration TCs testing
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 01 Feb 2021 09:00:00 +0200
+
+hss-rtc (4.16) UNRELEASED; urgency=medium
+
+  * Allow macro for enabling actions.
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Mon, 18 Jan 2021 12:00:00 +0200
+
+hss-rtc (4.15) UNRELEASED; urgency=medium
+
+  * Bug fix.
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Tue, 12 Jan 2021 10:00:00 +0200
+
+hss-rtc (4.14) UNRELEASED; urgency=medium
+
+  * Close connection to PLs wether exception or wrong number connections
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 28 Dec 2020 17:00:00 +0200
+
+hss-rtc (4.13) UNRELEASED; urgency=medium
+
+  * Release extended connection to PLs when exception
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 28 Dec 2020 09:00:00 +0200
+
+hss-rtc (4.12) UNRELEASED; urgency=medium
+
+  * Inprovement: Allow execution Timing for users steps and actions
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Tue, 01 Dec 2020 10:00:00 +0200
+
+hss-rtc (4.10) UNRELEASED; urgency=medium
+
+  * Add info to summary from TCs executions
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Wed, 26 Nov 2020 10:00:00 +0200
+
+hss-rtc (4.9) UNRELEASED; urgency=medium
+
+  * Update ExtDB connections check
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Tue, 03 Nov 2020 13:00:00 +0200
+
+hss-rtc (4.8) UNRELEASED; urgency=medium
+
+  * Fix bug calling function payloads
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Thu, 03 Sep 2020 10:00:00 +0200
+
+hss-rtc (4.7) UNRELEASED; urgency=medium
+
+  * new functions for virtual test cases 
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Tue, 01 Sep 2020 10:00:00 +0200
+
+hss-rtc (4.6) UNRELEASED; urgency=medium
+
+  * connect_node with parameter force_primary
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Thu, 27 Aug 2020 12:00:00 +0200
+
+hss-rtc (4.5) UNRELEASED; urgency=medium
+
+  * Capture exception in controller_state
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 24 Aug 2020 12:00:00 +0200
+
+hss-rtc (4.4) UNRELEASED; urgency=medium
+
+  * Add get_ccd_version step for CLOUD
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Thu, 20 Aug 2020 08:00:00 +0200
+
+hss-rtc (4.3) UNRELEASED; urgency=medium
+
+  * Add Std Dev and Avg Dev to latency report
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Wed, 19 Aug 2020 12:30:00 +0200
+
+hss-rtc (4.2) UNRELEASED; urgency=medium
+
+  * Force primary connection 
+
+ -- Serafin Alonso Alonso <serafin.alonso@altran.com>  Mon, 17 Aug 2020 11:00:00 +0200
+
+hss-rtc (4.1) UNRELEASED; urgency=medium
+
+  * Bugfix wrong handling of disable_load_monitor in action handler
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Mon, 03 Aug 2020 09:00:00 +0200
+
+hss-rtc (4.0) UNRELEASED; urgency=medium
+
+  * HCR50
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Fri, 24 Jul 2020 10:00:04 +0200
+
+hss-rtc (3.15) UNRELEASED; urgency=medium
+
+  * Remove load monitor dependencies
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Thu, 09 Jul 20120 12:00:00 +0200
+ 
+hss-rtc (3.5) UNRELEASED; urgency=medium
+
+  * Initial release. (Closes: #XXXXXX)
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Mon, 02 Dec 2019 07:59:04 +0200
+

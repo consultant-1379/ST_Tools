@@ -1,0 +1,5 @@
+#!/usr/bin/make -f
+export GIT_PATH=/home/ecemit/GIT_repos
+export ST_TOOL_PATH=/opt/hss/system_test
+%:
+	dh $@

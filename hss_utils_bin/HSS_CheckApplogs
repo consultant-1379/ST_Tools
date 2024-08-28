@@ -1,0 +1,1295 @@
+#!/usr/bin/python
+# coding=iso-8859-1
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import hashlib
+import socket
+import traceback
+import argparse
+import re
+
+import signal
+import textwrap
+import getpass
+import json
+import pprint
+import random
+
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.gentraf
+import hss_utils.rosetta
+import hss_utils.rosetta.services
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+HOSTNAME = socket.gethostname()
+USER = getpass.getuser()
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+
+# Counters for the script. Global variables
+count_Total=0
+count_discarded=0
+count_discarded_1=0
+count_discarded_2=0
+count_discarded_3=0
+count_discarded_4=0
+count_failure_hss_message=0
+count_failure_hss_message_1=0
+count_out_period=0
+init_date_report=0
+end_date_report=0
+init_date=0
+end_date=time.time()
+reason=False
+message_type=False
+add_info=False
+
+# Dictionary where we are going to report the log messages
+report_err_dict = {}
+
+
+def quit_program(exit_code):
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+
+def display_key_val(key,val):
+
+        s_key = key.split(':',1)[1]
+        if 'add_info:' in s_key:
+            idx_add_info = s_key.index('add_info:')
+            info=s_key[0:idx_add_info]
+            add_info=s_key[idx_add_info:]
+            print('\t%s' % info)
+            if len(add_info) < 70:
+                print('\t\t%-*s     %-*d' % (70,add_info,8,val))
+            else:
+                print('\t\t%s     %-*d' % (add_info,8,val))
+
+        elif 'Reason=' in s_key:
+            idx_reason = s_key.index('Reason=')
+            info=s_key[0:idx_reason]
+            reason_info=s_key[idx_reason:]
+            print('\t%s' % info)
+            if 'Message Type=' in reason_info:
+                idx_mtype = reason_info.index('Message Type=')
+                info=reason_info[0:idx_mtype]
+                mtype_info=reason_info[idx_mtype:]
+                print('\t\t%s' % info)
+                if len(mtype_info) < 70:
+                    print('\t\t%-*s     %-*d' % (70,mtype_info,8,val))
+                else:
+                    print('\t\t%s     %-*d' % (mtype_info,8,val))
+            else:
+                if len(reason_info) < 70:
+                    print('\t\t%-*s     %-*d' % (70,reason_info,8,val))
+                else:
+                    print('\t\t%s     %-*d' % (reason_info,8,val))
+
+        elif 'Message Type=' in s_key:
+            idx_mtype = s_key.index('Message Type=')
+            info=s_key[0:idx_mtype]
+            mtype_info=s_key[idx_mtype:]
+            print('\t%s' % info)
+            if len(mtype_info) < 70:
+                print('\t\t%-*s     %-*d' % (70,mtype_info,8,val))
+            else:
+                print('\t\t%s     %-*d' % (mtype_info,8,val))
+        else:
+            if len(s_key) < 78:
+                print('\t%-*s     %-*d' % (78,s_key,8,val))
+            else:
+                print('\t%s     %-*d' % (s_key,8,val))
+
+def convert_date(date_message):
+        """ Convert the date in format of the Error messages to convert to seconds """
+        i_date=date_message.split(".")[0]
+
+        t_time = time.strptime(i_date,'%Y-%m-%dT%H:%M:%S')
+        ##print 'returned tuple = %s' % t_time
+
+        secs_message = time.mktime( t_time )
+        ##print 'secs_message = ' + str(secs_message)
+        return secs_message
+            
+def included_date(date_message):
+        """ Check if the date of the message in in the interval of the analysys """
+        global count_out_period
+
+        n_sec_message = convert_date (date_message) 
+        #_DEB('n_sec_message = %s' % n_sec_message)
+        #_DEB('initial date = %s' % init_date)
+        #_DEB('end_date = %s' % end_date)
+          
+        if n_sec_message >= init_date and n_sec_message <= end_date:
+            return 1
+        else:
+            count_out_period +=1
+            return 0
+
+def get_date_message(message):
+        """ Gets the string with the date from the message passed as parameter """
+
+        if "log:" in message:
+            #print 'line message with log=' + message
+            message=message.split("log:",1)[1]
+            date_message = re.sub('\s+', ' ', message)
+            #print 'line message without log=' + date_message
+            date_message=date_message.split(" ",3)[2]
+            #print 'line message=' + date_message
+        else:
+            #print 'line message with NO log=' + message
+            date_message = re.sub('\s+', ' ', message)
+            #print 'line message without log=' + date_message
+            if date_message[0] == " ":
+                date_message=date_message.split(" ",3)[2]
+            else:    
+                date_message=date_message.split(" ",3)[1]
+
+        date_message=date_message.split(".",1)[0]
+        ##print 'line messageOK=' + date_message
+        if "T" in date_message:
+            return date_message
+        else:    
+            _WRN('WARNING: line message with wrong format=%s' % date_message)
+            return "ERROR"
+          
+
+
+def remove_empty_files(log_files):
+        """ Obtain the initial date of the log messages for the files passed as parameter """
+        cmd = "ls -rt %s " % log_files
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        
+        # Removing empty files
+        for file_name in output.split('\n'):
+            if len(file_name) > 0:
+                if os.stat(file_name).st_size == 0:
+                    #print 'empty file  =' + file_name
+                    cmd = "rm -f %s " % file_name
+                    (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        # Checking again just in case all the files were empty
+        cmd = "ls -rt %s " % log_files
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+
+        return output_code
+
+def get_initial_date(log_files):
+        """ Obtain the initial date of the log messages for the files passed as parameter """
+        cmd = "cat `ls -rt %s | head -n 1` |head -n 1 | awk ' { print $2}' " % log_files
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        for line in output.split('\n'):
+            if len(line) > 0:
+                line=line.strip()
+                i_date=line.split(".")[0]
+
+                return i_date
+
+
+def get_end_date(log_files):
+        """ Obtain the final date of the log messages for the files passed as parameter """
+        if "RAD" in log_files:
+            cmd = "cat `ls -rt %s | tail -n 1` |grep vc_Application |tail -n 1 | awk ' { print $2}' " % log_files
+        else:
+            cmd = "cat `ls -rt %s | tail -n 1` |tail -n 1 | awk ' { print $2}' " % log_files
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        for line in output.split('\n'):
+            if len(line) > 0:
+                line=line.strip()
+                file_end_date=line.split(".")[0]
+                _DEB('file_end_date = ' + file_end_date)
+                return file_end_date
+
+
+def not_discarded(str_message):
+        """ check if the string passed as parameter is one of the error messages to discard """
+        global count_discarded
+        global count_discarded_1
+        global count_discarded_2
+        global count_discarded_3
+        global count_discarded_4
+
+        if "Identity alredy registered in different server" in str_message:
+            _DEB('discarded message=%s ' % str_message)
+            count_discarded += 1
+            count_discarded_1 += 1
+            return 0
+        if "Access Identifier unknown" in str_message:
+            _DEB('discarded message=%s ' % str_message)
+            count_discarded += 1
+            count_discarded_2 += 1
+            return 0
+        if "Dynamically Updated Data Not Sent To Mme" in str_message:
+            _DEB('discarded message=%s ' % str_message)
+            count_discarded += 1
+            count_discarded_3 += 1
+            return 0
+        if "Unable to get Active User Counters" in str_message:
+            _DEB('discarded message=%s ' % str_message)
+            count_discarded += 1
+            count_discarded_4 += 1
+            return 0
+        return 1
+
+def not_failure_hss_message(str_message):
+        """ check if the string passed as parameter is one of the error messages to report failure """
+        global count_failure_hss_message
+        global count_failure_hss_message_1
+
+        if "Cause: 20001 Unable to deliver message" in str_message:
+            _DEB('failure HSS message=%s ' % str_message)
+            count_failure_hss_message += 1
+            count_failure_hss_message_1 += 1
+            return 0
+        return 1
+
+
+
+def check_applogs(my_applogs_tar_file):
+        """ check applog messages in applog files """
+        global count_Total
+
+        # We uncompress the tar.gz file with the applogs files
+        _INF('Uncompressing tar file %s to analyze logs ...' % my_applogs_tar_file)
+        n_random=random.randint(1,10000)
+        dir_temp = '/opt/hss/temp_%d'% (n_random)
+        cmd = 'mkdir %s' % dir_temp
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR('\n Error when creating temporary directory')
+            _ERR(output_err)
+            quit_program(st_command.EXECUTION_ERROR)
+
+        cmd = 'tar -xzvf %s -C %s ' % (my_applogs_tar_file,dir_temp)
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR(output_err)
+            quit_program(st_command.EXECUTION_ERROR)
+
+        _INF('Checking and counting error message logs. It may take a while ...')
+
+        # "Checking and counting SERVICES message logs."
+        logs_to_check = "%s/Services*log" % dir_temp
+        cmd = 'ls %s' % logs_to_check
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            ##_INF('No SERVICES message logs in the tar file ')
+            print('TOTAL SERVICES message logs reported: 0 - Not SERVICES log files\n') 
+        else:
+            exit_code = remove_empty_files(logs_to_check)
+            if exit_code:
+                ##_INF('All the SERVICES message log files in the tar file are empty')
+                print('TOTAL SERVICES message logs reported: 0 - SERVICES log files empty\n') 
+            else:
+                if init_date_report == 0:
+                    init_date_services = get_initial_date(logs_to_check)
+                else:
+                    init_date_services = init_date_report
+
+                if end_date_report == 0:
+                    end_date_services = get_end_date(logs_to_check)
+                else:
+                    end_date_services = end_date_report
+                _DEB('init_date_services: %s ' % init_date_services)
+                _DEB('end_date_services: %s ' % end_date_services)
+
+                cmd = 'grep "vc_MessageInformation" %s' % logs_to_check
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                for line in output.split('\n'):
+                    if len(line) > 0:
+                        line=line.strip()
+                        count_Total += 1
+                        date_message=get_date_message(line)
+                        if "ERROR" in date_message:
+                            #If the line have some format error, we skip the line
+                            #print 'Skiping line= ' + date_message
+                            continue
+                        if included_date(date_message):
+                            message=line.split("vc_MessageInformation=",1)[1]
+                            err_message=message.split(";")[0]
+                            if not_discarded(err_message) and not_failure_hss_message(err_message):
+
+                                # Checking the Reason if it is ordered by parameter
+                                if reason :
+                                    if "Reason:" in line:
+                                        message=line.split("Reason:",1)[1]
+                                        reason_message='; Reason=' + message.split(",")[0]
+                                        _DEB('reason message=%s ' % reason_message)
+                                    else:
+                                        reason_message=""
+                                        _DEB('line with no reason:%s ' % line)
+                                else:
+                                    reason_message=""
+
+                                # Checking the Message Type if it is ordered by parameter
+                                if message_type :
+                                    if "Message Type:" in line:
+                                        message=line.split("Message Type:",1)[1]
+                                        mtype_message='; Message Type=' + message.split(",")[0]
+                                        ##print 'mtype message= ' + mtype_message
+                                    else:
+                                        mtype_message=""
+                                        ##print 'line with no message type:' + line
+                                else:
+                                    mtype_message=""
+
+                                # Getting the priority
+                                message=line.split("vc_Priority=",1)[1]
+                                prior_message=message.split(";")[0]
+                                ##print 'priority message= ' + prior_message
+
+                                err_message = 'SERV:' + prior_message + ': ' + err_message + reason_message + mtype_message
+                                if err_message in report_err_dict:
+                                    report_err_dict[err_message] += 1
+                                else: # We add new item to the dict
+                                    report_err_dict[err_message] = 1
+
+                cmd = 'rm -rf %s/Services*log' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+
+                ##_INF('SERVICES message logs report from %s to %s ' % (init_date_services,end_date_services))
+                print('SERVICES message logs report from %s to %s ' % (init_date_services,end_date_services))
+                count = 0
+                for key,val in sorted(report_err_dict.items()):
+                    if "SERV:" in key:
+                        display_key_val(key,val)
+                        ##_INF('%s => %s' % (key,val))
+                        count +=val
+                ##_INF('TOTAL SERVICES message logs reported: %s \n' % str(count))
+                total_msg = 'TOTAL SERVICES message logs reported:'
+                print('\t%-*s     %-*d' % (78,total_msg,8,count))
+
+
+        # "Checking and counting AUTHENTICATION message logs."
+        logs_to_check = "%s/Authentication*log" % dir_temp
+        cmd = 'ls %s' % logs_to_check
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            ##_INF('No AUTHENTICATION message logs in the tar file ')
+            print('TOTAL AUTHENTICATION message logs reported: 0 - Not AUTHENTICATION log files\n') 
+        else:
+            exit_code = remove_empty_files(logs_to_check)
+            if exit_code:
+                ##_INF('All the AUTHENTICATION message log files in the tar file are empty')
+                print('TOTAL AUTHENTICATION message logs reported: 0 - AUTHENTICATION log files empty\n') 
+            else:
+                if init_date_report == 0:
+                    init_date_Auth = get_initial_date(logs_to_check)
+                else:
+                    init_date_Auth = init_date_report
+                if end_date_report == 0:
+                    end_date_Auth = get_end_date(logs_to_check)
+                else:
+                    end_date_Auth = end_date_report
+                _DEB('init_date_Auth: %s ' % init_date_Auth)
+                _DEB('end_date_Auth: %s ' % end_date_Auth)
+
+                cmd = 'grep "vc_MessageInformation" %s/Authentication*log ' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                for line in output.split('\n'):
+                    if len(line) > 0:
+                        line=line.strip()
+                        count_Total += 1
+                        date_message=get_date_message(line)
+                        if "ERROR" in date_message:
+                            #If the line have some format error, we skip the line
+                            _DEB('Skiping line=%s ' % date_message)
+                            continue
+                        if included_date(date_message):
+                            message=line.split("vc_MessageInformation=",1)[1]
+                            err_message=message.split(";")[0]
+
+                            if not_discarded(err_message) and not_failure_hss_message(err_message):
+                                # Checking the Reason if it is ordered by parameter
+                                if reason :
+                                    if "Reason:" in line:
+                                        message=line.split("Reason:",1)[1]
+                                        reason_message='; Reason=' + message.split(",")[0]
+                                        ##print 'reason message= ' + reason_message
+                                    else:
+                                        ##print 'line with no reason:' + line
+                                        reason_message=""
+                                else:
+                                    reason_message=""
+
+                                # Checking the Message Type if it is ordered by parameter
+                                if message_type :
+                                    if "Message Type:" in line:
+                                        message=line.split("Message Type:",1)[1]
+                                        mtype_message='; Message Type=' + message.split(",")[0]
+                                        ##print 'mtype message= ' + mtype_message
+                                    else:
+                                        mtype_message=""
+                                        ##print 'line with no message type:' + line
+                                else:
+                                    mtype_message=""
+
+                                # Getting the priority
+                                message=line.split("vc_Priority=",1)[1]
+                                prior_message=message.split(";")[0]
+                                #_DEB('priority message=%s ' % prior_message)
+
+                                err_message = 'AUTH:' + prior_message + ': ' + err_message + reason_message + mtype_message
+                                if err_message in report_err_dict:
+                                    report_err_dict[err_message] += 1
+                                else: # We add new item to the dict
+                                    report_err_dict[err_message] = 1
+                                    #_DEB('AUTH err message=%s ' % err_message)
+
+                cmd = 'rm -rf %s/Authentication*log' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                ##_INF('AUTHENTICATION message logs report from %s to %s ' % (init_date_Auth,end_date_Auth))
+                print('AUTHENTICATION message logs report from %s to %s ' % (init_date_Auth,end_date_Auth))
+                count = 0
+                for key,val in sorted(report_err_dict.items()):
+                    if "AUTH:" in key:
+                        display_key_val(key,val)
+                        ##_INF('%s => %s' % (key,val))
+                        count +=val
+                ##_INF('TOTAL AUTHENTICATION message logs reported: %s \n' % str(count))
+                total_msg = 'TOTAL AUTHENTICATION message logs reported:'
+                print('\t%-*s     %-*d' % (78,total_msg,8,count))
+
+        # "Checking and counting EXT_DB message logs."
+        logs_to_check = "%s/ExtDb*log" % dir_temp
+        cmd = 'ls %s' % logs_to_check
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            ##_INF('No EXT_DB message logs in the tar file ')
+            print('TOTAL EXT_DB message logs reported: 0 - Not EXT_DB log files\n') 
+        else:
+            exit_code = remove_empty_files(logs_to_check)
+            if exit_code:
+                ##_INF('All the EXT_DB message log files in the tar file are empty\n')
+                print('TOTAL EXT_DB message logs reported: 0 - EXT_DB log files empty\n') 
+            else:
+                if init_date_report == 0:
+                    init_date_ExtDb = get_initial_date(logs_to_check)
+                else:
+                    init_date_ExtDb = init_date_report
+                if end_date_report == 0:
+                    end_date_ExtDb = get_end_date(logs_to_check)
+                else:
+                    end_date_ExtDb = end_date_report
+                _DEB('init_date_ExtDb: %s ' % init_date_ExtDb)
+                _DEB('end_date_ExtDb: %s ' % end_date_ExtDb)
+
+                cmd = 'grep "vc_MessageInformation" %s/ExtDb*log ' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                for line in output.split('\n'):
+                    if len(line) > 0:
+                        line=line.strip()
+                        count_Total += 1
+                        date_message=get_date_message(line)
+                        if "ERROR" in date_message:
+                            #If the line have some format error, we skip the line
+                            #print 'Skiping line= ' + date_message
+                            continue
+                        if included_date(date_message):
+                            message=line.split("vc_MessageInformation=",1)[1]
+                            err_message=message.split(";")[0]
+
+                            if not_discarded(err_message) and not_failure_hss_message(err_message):
+                                # Getting the priority
+                                message=line.split("vc_Priority=",1)[1]
+                                prior_message=message.split(";")[0]
+                                ##print 'priority message= ' + prior_message
+
+                                err_message = 'EXT_DB:' + prior_message + ': ' + err_message
+                                if err_message in report_err_dict:
+                                    report_err_dict[err_message] += 1
+                                else: # We add new item to the dict
+                                    report_err_dict[err_message] = 1
+
+                cmd = 'rm -rf %s/ExtDb*log' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                ##_INF('EXT_DB message logs report from %s to %s ' % (init_date_ExtDb,end_date_ExtDb))
+                print('EXT_DB message logs report from %s to %s ' % (init_date_ExtDb,end_date_ExtDb))
+                count = 0
+                for key,val in sorted(report_err_dict.items()):
+                    if "EXT_DB:" in key:
+                        display_key_val(key,val)
+                        ##_INF('%s => %s' % (key,val))
+                        count +=val
+                ##_INF('TOTAL EXT_DB message logs reported: %s \n' % str(count))
+                total_msg = 'TOTAL EXT_DB message logs reported:'
+                print('\t%-*s     %-*d' % (78,total_msg,8,count))
+
+        # "Checking and counting OAM message logs."
+        logs_to_check = "%s/OAM*log" % dir_temp
+        cmd = 'ls %s' % logs_to_check
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            ##_INF('No OAM message logs in the tar file ')
+            print('TOTAL OAM message logs reported: 0 - Not OAM log files\n')
+        else:
+            exit_code = remove_empty_files(logs_to_check)
+            if exit_code:
+                ##_INF('All the OAM message log files in the tar file are empty')
+                print('TOTAL OAM message logs reported: 0 - OAM log files empty\n')
+            else:
+                if init_date_report == 0:
+                    init_date_OAM = get_initial_date(logs_to_check)
+                else:
+                    init_date_OAM = init_date_report
+                if end_date_report == 0:
+                    end_date_OAM = get_end_date(logs_to_check)
+                else:
+                    end_date_OAM = end_date_report
+                _DEB('init_date_OAM: %s ' % init_date_OAM)
+                _DEB('end_date_OAM: %s ' % end_date_OAM)
+
+                cmd = 'grep "vc_MessageInformation" %s/OAM*log ' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                for line in output.split('\n'):
+                    if len(line) > 0:
+                        line=line.strip()
+                        count_Total += 1
+                        date_message=get_date_message(line)
+                        if "ERROR" in date_message:
+                            #If the line have some format error, we skip the line
+                            #print 'Skiping line= ' + date_message
+                            continue
+                        if included_date(date_message):
+                            message=line.split("vc_MessageInformation=",1)[1]
+                            err_message=message.split(";")[0]
+
+                            if not_discarded(err_message) and not_failure_hss_message(err_message):
+                                # Checking the Reason if it is ordered by parameter
+                                if reason :
+                                    if "Reason:" in line:
+                                        message=line.split("Reason:",1)[1]
+                                        reason_message='; Reason=' + message.split(",")[0]
+                                        ##print 'reason message= ' + reason_message
+                                    else:
+                                        reason_message=""
+                                        ##print 'line with no reason:' + line
+                                else:
+                                    reason_message=""
+
+                                # Checking the Message Type if it is ordered by parameter
+                                if message_type :
+                                    if "Message Type:" in line:
+                                        message=line.split("Message Type:",1)[1]
+                                        mtype_message='; Message Type=' + message.split(",")[0]
+                                        #print 'mtype message= ' + mtype_message
+                                    else:
+                                        mtype_message=""
+                                        ##print 'line with no message type:' + line
+                                else:
+                                    mtype_message=""
+
+                                # Getting the priority
+                                message=line.split("vc_Priority=",1)[1]
+                                prior_message=message.split(";")[0]
+                                ##print 'priority message= ' + prior_message
+
+                                err_message = 'OAM:' + prior_message + ': ' + err_message + reason_message + mtype_message
+                                if err_message in report_err_dict:
+                                    report_err_dict[err_message] += 1
+                                else: # We add new item to the dict
+                                    report_err_dict[err_message] = 1
+
+                cmd = 'rm -rf %s/OAM*log' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                ##_INF('OAM message logs report from %s to %s ' % (init_date_OAM,end_date_OAM))
+                print('OAM message logs report from %s to %s ' % (init_date_OAM,end_date_OAM))
+                count = 0
+                for key,val in sorted(report_err_dict.items()):
+                    if "OAM:" in key:
+                        display_key_val(key,val)
+                        ##_INF('%s => %s' % (key,val))
+                        count +=val
+                ##_INF('TOTAL OAM message logs reported: %s \n' % str(count))
+                total_msg = 'TOTAL OAM message logs reported:'
+                print('\t%-*s     %-*d' % (78,total_msg,8,count))
+
+        # "Checking RADIUS message logs."
+        logs_to_check = "%s/RAD*log" % dir_temp
+        cmd = 'ls %s' % logs_to_check
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            ##_INF('No RADIUS message logs in the tar file ')
+            print('TOTAL RADIUS message logs reported: 0 - Not RADIUS log files\n')
+        else:
+            exit_code = remove_empty_files(logs_to_check)
+            if exit_code:
+                ##_INF('All the RADIUS message log files in the tar file are empty')
+                print('TOTAL RADIUS message logs reported: 0 - RADIUS log files empty\n')
+            else:
+                if init_date_report == 0:
+                    init_date_RAD = get_initial_date(logs_to_check)
+                else:
+                    init_date_RAD = init_date_report
+                if end_date_report == 0:
+                    end_date_RAD = get_end_date(logs_to_check)
+                else:
+                    end_date_RAD = end_date_report
+                _DEB('init_date_RAD: %s ' % init_date_RAD)
+                _DEB('end_date_RAD: %s ' % end_date_RAD)
+
+                cmd = 'grep "vc_MessageInformation" %s/RAD*log ' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                for line in output.split('\n'):
+                    if len(line) > 0:
+                        line=line.strip()
+                        count_Total += 1
+                        date_message=get_date_message(line)
+                        if "ERROR" in date_message:
+                            #If the line have some format error, we skip the line
+                            #print 'Skiping line= ' + date_message
+                            continue
+                        if included_date(date_message):
+                            message=line.split("vc_MessageInformation=",1)[1]
+                            err_message=message.split(";")[0]
+
+                            if not_discarded(err_message) and not_failure_hss_message(err_message):
+                                # Checking the Reason if it is ordered by parameter
+                                if reason :
+                                    if "Reason:" in line:
+                                        message=line.split("Reason:",1)[1]
+                                        reason_message='; Reason=' + message.split(".")[0]
+                                        ##print 'reason message= ' + reason_message
+                                    else:
+                                        reason_message=""
+                                        ##print 'line with no reason:' + line
+                                else:
+                                    reason_message=""
+
+                                # Getting the priority
+                                message=line.split("vc_Priority=",1)[1]
+                                prior_message=message.split(";")[0]
+                                ##print 'priority message= ' + prior_message
+
+                                err_message = 'RADIUS:' + prior_message + ': ' + err_message + reason_message 
+                                if err_message in report_err_dict:
+                                    report_err_dict[err_message] += 1
+                                else: # We add new item to the dict
+                                    report_err_dict[err_message] = 1
+
+                cmd = 'rm -rf %s/RAD*log' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                ##_INF('RADIUS message logs report from %s to %s ' % (init_date_RAD,end_date_RAD))
+                print('RADIUS message logs report from %s to %s ' % (init_date_RAD,end_date_RAD))
+                count = 0
+                for key,val in sorted(report_err_dict.items()):
+                    if "RADIUS:" in key:
+                        display_key_val(key,val)
+                        ##_INF('%s => %s' % (key,val))
+                        count +=val
+                ##_INF('TOTAL RADIUS message logs reported: %s \n' % str(count))
+                total_msg = 'TOTAL RADIUS message logs reported:'
+                print('\t%-*s     %-*d' % (78,total_msg,8,count))
+
+        # "Checking HTTP message logs."
+        logs_to_check = "%s/HTTP*log" % dir_temp
+        cmd = 'ls %s' % logs_to_check
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            ##_INF('No HTTP message logs in the tar file ')
+            print('TOTAL HTTP message logs reported: 0 - Not HTTP log files\n')
+        else:
+            exit_code = remove_empty_files(logs_to_check)
+            if exit_code:
+                ##_INF('All the HTTP message log files in the tar file are empty')
+                print('TOTAL HTTP message logs reported: 0 - HTTP log files empty\n')
+            else:
+                if init_date_report == 0:
+                    init_date_HTTP = get_initial_date(logs_to_check)
+                else:
+                    init_date_HTTP = init_date_report
+                if end_date_report == 0:
+                    end_date_HTTP = get_end_date(logs_to_check)
+                else:
+                    end_date_HTTP = end_date_report
+                _DEB('init_date_HTTP: %s ' % init_date_HTTP)
+                _DEB('end_date_HTTP: %s ' % end_date_HTTP)
+
+                cmd = 'grep "vc_MessageInformation" %s/HTTP*log ' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                for line in output.split('\n'):
+                    if len(line) > 0:
+                        line=line.strip()
+                        count_Total += 1
+                        date_message=get_date_message(line)
+                        if "ERROR" in date_message:
+                            #If the line have some format error, we skip the line
+                            #print 'Skiping line= ' + date_message
+                            continue
+                        if included_date(date_message):
+                            message=line.split("vc_MessageInformation=",1)[1]
+                            err_message=message.split(";")[0]
+
+                            if not_discarded(err_message) and not_failure_hss_message(err_message):
+                                info_message=''
+                                if add_info:
+                                    if "vc_AdditionalInformation=" in line:
+                                        message=line.split("vc_AdditionalInformation=",1)[1]
+                                        ##type_message = message.split(":")[0]
+                                        ##if 'Http peer' in type_message:
+                                        type_message = message.split(";")[0]
+                                        info_message = ', add_info:' + type_message
+
+                                # Getting the priority
+                                message=line.split("vc_Priority=",1)[1]
+                                prior_message=message.split(";")[0]
+                                ##print 'priority message= ' + prior_message
+
+                                err_message = 'HTTP:' + prior_message + ': ' + err_message + info_message
+                                if err_message in report_err_dict:
+                                    report_err_dict[err_message] += 1
+                                else: # We add new item to the dict
+                                    report_err_dict[err_message] = 1
+
+                cmd = 'rm -rf %s/HTTP*log' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                ##_INF('HTTP message logs report from %s to %s ' % (init_date_HTTP,end_date_HTTP))
+                print('HTTP message logs report from %s to %s ' % (init_date_HTTP,end_date_HTTP))
+                count = 0
+                for key,val in sorted(report_err_dict.items()):
+                    if "HTTP:" in key:
+                        display_key_val(key,val)
+                        ##_INF('%s => %s' % (key,val))
+                        count +=val
+                ##_INF('TOTAL HTTP message logs reported: %s \n' % str(count))
+                total_msg = 'TOTAL HTTP message logs reported:'
+                print('\t%-*s     %-*d' % (78,total_msg,8,count))
+
+        # "Checking and counting MAP message logs."
+        logs_to_check = "%s/MPV*log" % dir_temp
+        cmd = 'ls %s' % logs_to_check
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            ##_INF('No MPV message logs in the tar file ')
+            print('TOTAL MAP message logs reported: 0 - Not MAP log files\n')
+        else:
+            exit_code = remove_empty_files(logs_to_check)
+            if exit_code:
+                ##_INF('All the MPV message log files in the tar file are empty')
+                print('TOTAL MAP message logs reported: 0 - MAP log files empty\n')
+            else:
+                if init_date_report == 0:
+                    init_date_MPV = get_initial_date(logs_to_check)
+                else:
+                    init_date_MPV = init_date_report
+                if end_date_report == 0:
+                    end_date_MPV = get_end_date(logs_to_check)
+                else:
+                    end_date_MPV = end_date_report
+                _DEB('init_date_MPV: %s ' % init_date_MPV)
+                _DEB('end_date_MPV: %s ' % end_date_MPV)
+
+                cmd = 'grep "vc_MessageInformation" %s/MPV*log ' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                for line in output.split('\n'):
+                    if len(line) > 0:
+                        line=line.strip()
+                        count_Total += 1
+                        date_message=get_date_message(line)
+                        if "ERROR" in date_message:
+                            #If the line have some format error, we skip the line
+                            ##print 'Skiping line= ' + date_message
+                            continue
+                        if included_date(date_message):
+                            message=line.split("vc_MessageInformation=",1)[1]
+                            err_message=message.split(";")[0]
+                            ##print 'error message= ' + err_message
+
+                            if not_discarded(err_message) and not_failure_hss_message(err_message):
+                                # Getting the priority
+                                message=line.split("vc_Priority=",1)[1]
+                                #prior_message=message.split(";")[0]
+                                prior_message=message.split(",")[0]
+                                ##print 'priority message= ' + prior_message
+
+                                err_message = 'MAP:' + prior_message + ': ' + err_message
+                                if err_message in report_err_dict:
+                                    report_err_dict[err_message] += 1
+                                else: # We add new item to the dict
+                                    report_err_dict[err_message] = 1
+
+                cmd = 'rm -rf %s/MPV*log' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                ##_INF('MAP message logs report from %s to %s ' % (init_date_MPV,end_date_MPV))
+                print('MAP message logs report from %s to %s ' % (init_date_MPV,end_date_MPV))
+                count = 0
+                for key,val in sorted(report_err_dict.items()):
+                    if "MAP:" in key:
+                        display_key_val(key,val)
+                        ##_INF('%s => %s' % (key,val))
+                        count +=val
+                ##_INF('TOTAL MAP message logs reported: %s \n' % str(count))
+                total_msg = 'TOTAL MAP message logs reported:'
+                print('\t%-*s     %-*d' % (78,total_msg,8,count))
+
+
+        # Checking the Load Regulation messages. Usually in vDicos log files
+        logs_to_check = "%s/vDicos*log" % dir_temp
+        cmd = 'ls %s' % logs_to_check
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            ##_INF('No VDICOS message logs in the tar file ')
+            print('TOTAL VDICOS message logs reported: 0 - Not VDICOS log files\n')
+        else:
+            exit_code = remove_empty_files(logs_to_check)
+            if exit_code:
+                ##_INF('All the VDICOS message log files in the tar file are empty')
+                print('TOTAL VDICOS message logs reported: 0 - VDICOS log files empty\n')
+            else:
+                if init_date_report == 0:
+                    init_date_vDicos = get_initial_date(logs_to_check)
+                else:
+                    init_date_vDicos = init_date_report
+                if end_date_report == 0:
+                    end_date_vDicos = get_end_date(logs_to_check)
+                else:
+                    end_date_vDicos = end_date_report
+                _DEB('init_date_vDicos: %s ' % init_date_vDicos)
+                _DEB('end_date_vDicos: %s ' % end_date_vDicos)
+
+                cmd = 'grep "LoadRegAlarm:" %s/vDicos*log ' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                for line in output.split('\n'):
+                    if len(line) > 0:
+                        line=line.strip()
+                        count_Total += 1
+                        date_message=get_date_message(line)
+                        if "ERROR" in date_message:
+                            #If the line have some format error, we skip the line
+                            #print 'Skiping line= ' + date_message
+                            continue
+                        if included_date(date_message):
+                            message=line.split("LoadRegAlarm:",1)[1]
+                            err_message=message.split(",")[0]
+                            #err_message = 'VDICOS:: PL-' + pl_number + ' LoadRegAlarm:' + err_message
+                            if "additional text" in line:
+                                message=line.split("additional text:",1)[1]
+                                add_text=message.split(",")[0]
+                                err_message = 'VDICOS:LoadRegAlarm:' + err_message + ', add_text:' + add_text
+                            else:
+                                err_message = 'VDICOS:LoadRegAlarm:' + err_message
+
+                            if add_info:
+                                if "additional info" in line:
+                                    message=line.split("additional info:",1)[1]
+                                    #add_text=message.split(",")[0]
+                                    err_message = err_message + ', add_info:' + message
+
+                            if not_failure_hss_message(err_message):
+                                if err_message in report_err_dict:
+                                    report_err_dict[err_message] += 1
+                                else: # We add new item to the dict
+                                    report_err_dict[err_message] = 1
+
+                cmd = 'rm -rf %s/vDicos*log' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                ##_INF('VDICOS message logs report from %s to %s ' % (init_date_vDicos,end_date_vDicos))
+                print('VDICOS message logs report from %s to %s ' % (init_date_vDicos,end_date_vDicos))
+                count = 0
+                for key,val in sorted(report_err_dict.items()):
+                    if "VDICOS:" in key:
+                        display_key_val(key,val)
+                        ##_INF('%s => %s' % (key,val))
+                        count +=val
+                ##_INF('TOTAL VDICOS message logs reported: %s \n' % str(count))
+                total_msg = 'TOTAL VDICOS message logs reported:'
+                print('\t%-*s     %-*d' % (78,total_msg,8,count))
+
+        # Checking the DIAMETER messages.
+        logs_to_check = "%s/DIAMETER*log" % dir_temp
+        cmd = 'ls %s' % logs_to_check
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            ##_INF('No DIAMETER message logs in the tar file ')
+            print('TOTAL DIAMETER message logs reported: 0 - Not DIAMETER log files\n')
+        else:
+            exit_code = remove_empty_files(logs_to_check)
+            if exit_code:
+                ##_INF('All the DIAMETER message log files in the tar file are empty')
+                print('TOTAL DIAMETER message logs reported: 0 - DIAMETER log files empty\n')
+            else:
+                if init_date_report == 0:
+                    init_date_DIAMETER = get_initial_date(logs_to_check)
+                else:
+                    init_date_DIAMETER = init_date_report
+                if end_date_report == 0:
+                    end_date_DIAMETER = get_end_date(logs_to_check)
+                else:
+                    end_date_DIAMETER = end_date_report
+                _DEB('init_date_DIAMETER: %s ' % init_date_DIAMETER)
+                _DEB('end_date_DIAMETER: %s ' % end_date_DIAMETER)
+
+                cmd = 'grep "StackId:" %s/DIAMETER*log | grep "Cause:" ' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                for line in output.split('\n'):
+                    if len(line) > 0:
+                        line=line.strip()
+                        count_Total += 1
+                        date_message=get_date_message(line)
+                        if "ERROR" in date_message:
+                            #If the line have some format error, we skip the line
+                            #print 'Skiping line= ' + date_message
+                            continue
+                        if included_date(date_message):
+                            message=line.split("StackId:",1)[1]
+                            ##print 'message= ' + message
+                            err_message=message.split(",")[0]
+                            ##print 'err_message= ' + err_message
+                            err_message = 'DIAMETER:StackId:' + err_message
+                            message=line.split("Cause:",1)[1]
+                            ##print 'message= ' + message
+                            cause_message=message.split(".")[0]
+                            ##print 'cause_message= ' + cause_message
+                            err_message = err_message + ', Cause:' + cause_message
+                            if not_failure_hss_message(err_message):
+                                if err_message in report_err_dict:
+                                    report_err_dict[err_message] += 1
+                                else: # We add new item to the dict
+                                    report_err_dict[err_message] = 1
+
+                cmd = 'rm -rf %s/DIAMETER*log' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                ##_INF('DIAMETER message logs report from %s to %s ' % (init_date_DIAMETER,end_date_DIAMETER))
+                print('DIAMETER message logs report from %s to %s ' % (init_date_DIAMETER,end_date_DIAMETER))
+                count = 0
+                for key,val in sorted(report_err_dict.items()):
+                    if "DIAMETER:" in key:
+                        display_key_val(key,val)
+                        ##_INF('%s => %s' % (key,val))
+                        count +=val
+                ##_INF('TOTAL DIAMETER message logs reported: %s \n' % str(count))
+                total_msg = 'TOTAL DIAMETER message logs reported:'
+                print('\t%-*s     %-*d' % (78,total_msg,8,count))
+
+        # Checking the CMF messages.
+        logs_to_check = "%s/CMF*log" % dir_temp
+        cmd = 'ls %s' % logs_to_check
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            ##_INF('No CMF message logs in the tar file ')
+            print('TOTAL CMF message logs reported: 0 - Not CMF log files\n')
+        else:
+            exit_code = remove_empty_files(logs_to_check)
+            if exit_code:
+                ##_INF('All the CMF message log files in the tar file are empty')
+                print('TOTAL CMF message logs reported: 0 - CMF log files empty\n')
+            else:
+                if init_date_report == 0:
+                    init_date_CMF = get_initial_date(logs_to_check)
+                else:
+                    init_date_CMF = init_date_report
+                if end_date_report == 0:
+                    end_date_CMF = get_end_date(logs_to_check)
+                else:
+                    end_date_CMF = end_date_report
+
+                cmd = 'grep "vc_requestType" %s/CMF*log ' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                for line in output.split('\n'):
+                    if len(line) > 0:
+                        line.strip()
+                        count_Total += 1
+                        date_message=get_date_message(line)
+                        if "ERROR" in date_message:
+                            #If the line have some format error, we skip the line
+                            #print 'Skiping line= ' + date_message
+                            continue
+                        if included_date(date_message):
+                            message=line.split("vc_requestType=",1)[1]
+                            err_message=message.split(";")[0]
+                            err_message = 'CMF:vc_requestType=' + err_message
+                            if not_failure_hss_message(err_message):
+                                if err_message in report_err_dict:
+                                    report_err_dict[err_message] += 1
+                                else: # We add new item to the dict
+                                    report_err_dict[err_message] = 1
+
+                cmd = 'rm -rf %s/CMF*log' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                ##_INF('CMF message logs report from %s to %s' % (init_date_CMF,end_date_CMF))
+                print('CMF message logs report from %s to %s' % (init_date_CMF,end_date_CMF))
+                count = 0
+                for key,val in sorted(report_err_dict.items()):
+                    if "CMF:" in key:
+                        display_key_val(key,val)
+                        ##_INF('%s => %s' % (key,val))
+                        count +=val
+                ##_INF('TOTAL CMF message logs reported: %s \n' % str(count))
+                total_msg = 'TOTAL CMF message logs reported:'
+                print('\t%-*s     %-*d' % (78,total_msg,8,count))
+
+        # "Checking OTHER message logs."
+        logs_to_check = "%s/*log" % dir_temp
+        cmd = 'ls %s' % logs_to_check
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            ##_INF('No OTHER message logs in the tar file \n')
+            print('TOTAL OTHER message logs reported: 0 - Not OTHER log files\n')
+        else:
+            exit_code = remove_empty_files(logs_to_check)
+            if exit_code:
+                ##_INF('All the OTHER message log files in the tar file are empty \n')
+                print('TOTAL OTHER message logs reported: 0 - OTHER log files empty\n')
+            else:
+                if init_date_report == 0:
+                    init_date_OTHER = get_initial_date(logs_to_check)
+                else:
+                    init_date_OTHER = init_date_report
+                if end_date_report == 0:
+                    end_date_OTHER = get_end_date(logs_to_check)
+                else:
+                    end_date_OTHER = end_date_report
+                _DEB('init_date_OTHER: %s ' % init_date_OTHER)
+                _DEB('end_date_OTHER: %s ' % end_date_OTHER)
+
+                cmd = 'grep "vc_MessageInformation" %s/*log ' % dir_temp
+                (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+                for line in output.split('\n'):
+                    if len(line) > 0:
+                        line=line.strip()
+                        count_Total += 1
+                        date_message=get_date_message(line)
+                        if "ERROR" in date_message:
+                            #If the line have some format error, we skip the line
+                            #print 'Skiping line= ' + date_message
+                            continue
+                        if included_date(date_message):
+                            message=line.split("vc_MessageInformation=",1)[1]
+                            err_message=message.split(";")[0]
+
+                            if not_discarded(err_message) and not_failure_hss_message(err_message):
+                                # Getting the priority
+                                message=line.split("vc_Priority=",1)[1]
+                                prior_message=message.split(";")[0]
+                                ##print 'priority message= ' + prior_message
+
+                                err_message = 'OTHER:' + prior_message + ': ' + err_message
+                                if err_message in report_err_dict:
+                                    report_err_dict[err_message] += 1
+                                else: # We add new item to the dict
+                                    report_err_dict[err_message] = 1
+
+                ##_INF('OTHER message logs report from %s to %s ' % (init_date_OTHER,end_date_OTHER))
+                print('OTHER message logs report from %s to %s ' % (init_date_OTHER,end_date_OTHER))
+                count = 0
+                for key,val in sorted(report_err_dict.items()):
+                    if "OTHER:" in key:
+                        display_key_val(key,val)
+                        ##_INF('%s => %s' % (key,val))
+                        count +=val
+                ##_INF('TOTAL OTHER message logs reported: %s \n' % str(count))
+                total_msg = 'TOTAL OTHER message logs reported:'
+                print('\t%-*s     %-*d' % (78,total_msg,8,count))
+
+
+        # We remove the temporary directory
+        cmd = 'rm -rf %s' % dir_temp
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+
+
+def parse_commandline():
+    global CWD
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description=textwrap.dedent('''
+	Script to count the applog messages from the <logs_tar_file> passed as parameter
+        or it will collect the applogs from the environment generating the file to analyze
+
+	The script will discard those applog messages that contain the following strings:
+		* Unable to get Active User Counters
+		* Dynamically Updated Data Not Sent To Mme
+		* Access Identifier unknown
+		* Identity alredy registered in different server
+
+        '''),
+        epilog=textwrap.dedent(st_command.get_exit_status()))
+
+    access_params = parser.add_argument_group('Access parameters')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='''OAM  IP address of the node.
+If ommitted local hostname will be used to find env in rosetta ''',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+    scenario_params = parser.add_argument_group('Filter Parameters')
+    scenario_params.add_argument('-a', '--applog_file',
+                        action='store', default=None,
+                        help='Optional. Compressed file (tar.gz) with the app log files to anaylze. \nIf not, it will collect the logs from the environment using the access parameters. ',
+                        dest='applogs_tar_file')
+    scenario_params.add_argument('--init_date',
+                        action='store', default=None,
+                        help='Optional. Initial date of the messages to analyze. Same format as in the applogs:2018-11-12T13:04:09 ',
+                        dest='init_date_report')
+    scenario_params.add_argument('--end_date',
+                        action='store', default=None,
+                        help='Optional. Initial date of the messages to analyze. Same format as in the applogs:2018-11-12T13:04:09 ',
+                        dest='end_date_report')
+    scenario_params.add_argument('--reason',
+                        default=False, action='store_true', dest='reason',
+                        help='Optional. It allows to filter by the reason of the message. ')
+    scenario_params.add_argument('--mtype',
+                        default=False, action='store_true', dest='message_type',
+                        help='Optional. It allows to filter by the message type. ')
+    scenario_params.add_argument('--addinfo',
+                        default=False, action='store_true', dest='add_info',
+                        help='Optional. It allows to filter vDicos and HTTP logs also by the additional info. ')
+
+    logging=e3utils.log.add_logging_options(parser)
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(HSS_CheckApplogs_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'HSS_CheckApplogs_%s.log' % os.getpid()),
+                                     level=e3utils.log.INFO)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    return (args)
+
+
+
+def main():
+
+    global init_date_report
+    global end_date_report
+    global init_date
+    global end_date
+    global reason
+    global message_type
+    global add_info
+
+    args = parse_commandline()
+
+    if args.applogs_tar_file is None:
+        #cmd = 'CBA_collect_logs --node 10.82.226.135 -s to_check --log_type applogs '
+        _INF('Collecting logs to generate the tar.gz file')
+        if args.NODE is None:
+            _INF('Collecting logs without node to generate the tar.gz file')
+            cmd = 'CBA_collect_logs --user %s --port %s -s to_check --log_type applogs ' % (args.user, args.port)
+            _DEB('Executing command: %s' % cmd)
+        else:
+            _INF('Collecting logs from the node %s to generate the tar.gz file' % args.NODE)
+            cmd = 'CBA_collect_logs -n %s  --user %s --port %s -s to_check --log_type applogs ' % (args.NODE, args.user, args.port)
+            _DEB('Executing command: %s' % cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR('Error when collecting the logs from the HSS environment')
+            _ERR(output_err)
+            quit_program(st_command.EXECUTION_ERROR)
+        args.applogs_tar_file = "applog_to_check.tgz"
+    else:
+        if ('tar.gz' in str(args.applogs_tar_file)) or ('tgz' in str(args.applogs_tar_file)):
+            _INF('Tar file to be analyzed is %s' % args.applogs_tar_file)
+        else:
+            _ERR('Tar file passed as parameter %s is not a compressed file' % args.applogs_tar_file)
+            quit_program(st_command.WRONG_PARAMETER)
+
+    if args.init_date_report is None:
+        init_date_report = 0
+    else:
+        init_date = convert_date(args.init_date_report)
+        init_date_report = args.init_date_report
+        _DEB('init_date global is: %s' % init_date)
+
+    if args.end_date_report is None:
+        end_date_report = 0
+    else:
+        end_date = convert_date(args.end_date_report)
+        end_date_report = args.end_date_report
+        _DEB('end_date global is: %s' % end_date)
+
+    if args.reason :
+        reason=True
+
+    if args.message_type :
+        message_type=True
+
+    if args.add_info :
+        add_info=True
+
+
+    if not os.path.exists(args.applogs_tar_file):
+        _ERR('\n Applogs file %s passed as parameter not found or permission denied' % args.applogs_tar_file)
+        quit_program(st_command.WRONG_PARAMETER)
+
+    check_applogs(args.applogs_tar_file)
+
+    print('%-*s %-*s' % (70,'TOTAL number of log messages:',8,str(count_Total)))
+    print('%-*s %-*s' % (70,'TOTAL number of log messages discarded:',8,str(count_discarded)))
+    if (count_discarded_1 != 0):
+        print('\t%-*s %-*s' % (70,'Messages "Identity alredy registered in different server" discarded:',8,str(count_discarded_1)))
+    if (count_discarded_2 != 0):
+        print('\t%-*s %-*s' % (70,'Messages "Access Identifier unknown" discarded:',8,str(count_discarded_2)))
+    if (count_discarded_3 != 0):
+        print('\t%-*s %-*s' % (70,'Messages "Dynamically Updated Data Not Sent To Mme" discarded:',8,str(count_discarded_3)))
+    if (count_discarded_4 != 0):
+        print('\t%-*s %-*s' % (70,'Messages "Unable to get Active User Counters" discarded:',8,str(count_discarded_4)))
+
+    if init_date_report != 0:
+        print('%-*s %-*s' % (70,'TOTAL number of log messages out of the period:',8,str(count_out_period)))
+
+    if count_failure_hss_message > 0:
+        print('%-*s %-*s' % (70,'TOTAL number of log messages indicate HSS failure:',8,str(count_failure_hss_message)))
+        print('\t%-*s %-*s' % (70,'Messages "Cause: 20001 Unable to deliver message":',8,str(count_failure_hss_message_1)))
+        _ERR('Detected log messages reporting HSS FAILURES')
+        quit_program(st_command.EXECUTION_ERROR)
+
+if __name__ == '__main__':
+    CWD = os.getcwd()
+    signal.signal(signal.SIGINT, quit_gracefully)
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+

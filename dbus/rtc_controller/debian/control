@@ -1,0 +1,13 @@
+Source: rtc-controller
+Section: python
+Priority: optional
+Maintainer: <PDLCCSMTOO@pdl.internal.ericsson.com>
+Build-Depends: debhelper , dh-python, dh-systemd, python-all, python-setuptools
+Standards-Version: 3.9.6
+X-Python-Version: >= 2.7
+
+Package: rtc-controller
+Architecture: any
+Section: python
+Depends: ${misc:Depends}, ${python3:Depends}
+Description: Service for RTC execution controller

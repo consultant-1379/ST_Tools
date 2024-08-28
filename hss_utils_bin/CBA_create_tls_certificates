@@ -1,0 +1,431 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import pexpect
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+import copy
+import json
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+NODE=None
+def quit_program(exit_code,message=''):
+    if NODE:
+        NODE.release()
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def convert_date_to_days(exp_date):
+        """ Convert the date in format yyyymmdd to seconds  to calculate the number of days"""
+
+        exp_time = time.strptime(exp_date,'%Y%m%d')
+        end_secs = time.mktime(exp_time)
+
+        timestamp = datetime.now()
+        init_date = timestamp.strftime('%Y%m%d')
+        init_time = time.strptime(init_date,'%Y%m%d')
+        init_secs = time.mktime(init_time)
+        durations_secs = end_secs - init_secs
+        if durations_secs <= 0:
+            _INF('Expiration date %s is before current date' % exp_date)
+            n_days = 365
+        else:
+            n_days = int(durations_secs / (24*3600))
+
+        _INF('Number of days for certificate expiration: %d ' % n_days)
+        return n_days
+
+# Function to get the IP from the TG from the bonf0.100 interface to execute the sftp 
+# during the TLS certificate creation
+def get_ip_gt_sftp():
+    ip_gt = None
+    cmd = 'ifconfig | grep -A2 bond0.100'
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        _ERR('Error executing cmd:\n%s' % cmd)
+        _INF('Output cmd:\n%s' % stdout_value)
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+
+    for line in stdout_value.splitlines():
+        if 'inet addr:' in line:
+            inet_addr = line.split(':')[1]
+            ip_gt = inet_addr.split()[0]
+
+    return ip_gt
+
+
+def test_tls_connection(ip_node, tls_port, input_file, cert_dir):
+    global NODE
+
+    tls_protocol = NODE.get_tls_protocol()
+    cmd = 'openssl s_client -connect %s:%s -quiet -%s -bugs -cert %s/gtserver-cert.pem -key %s/gtserver-key.pem -CAfile %s/ca-cert.pem  -verify_return_error -verify 3 <%s' % (ip_node, tls_port, tls_protocol, cert_dir, cert_dir, cert_dir, input_file)
+    _DEB('Executing cmd:\n%s' % cmd)
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        _ERR('Error executing cmd:\n%s' % cmd)
+        _INF('Output cmd:\n%s' % stdout_value)
+    return returncode
+
+
+def sign_tls_cert(num_days):
+    cmd = 'openssl x509 -req -in HSS.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out HSS-cert.pem -days %s' % num_days
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+
+    cmd = 'openssl dgst -c -hex -sha224 HSS-cert.pem'
+    _DEB('Executing cmd:\n%s' % cmd)
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+    for line in stdout_value.splitlines():
+        if '(HSS-cert.pem)=' in line:
+            return line.split('=')[-1]
+
+
+def sign_trusted_cert():
+    cmd = 'openssl dgst -c -hex -sha224 ca-cert.pem'
+    _DEB('Executing cmd:\n%s' % cmd)
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+    for line in stdout_value.splitlines():
+        if '(ca-cert.pem)=' in line:
+            return line.split('=')[-1]
+
+
+
+def create_tls_cert(num_days):
+    cmd = 'openssl genrsa -out ca-key.pem 4096'
+    _DEB('Executing cmd:\n%s' % cmd)
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+
+    cmd = 'echo -e "SP\nMadrid\n\nEricsson\nHSS\nEricsson\n\n\n\n" >cert.cfg'
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+
+    cmd = 'openssl req -new -x509 -key ca-key.pem -days %s -out ca-cert.pem <cert.cfg' % num_days
+    _DEB('Executing cmd:\n%s' % cmd)
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+
+    cmd = 'openssl genrsa -out gtserver-key.pem 4096'
+    _DEB('Executing cmd:\n%s' % cmd)
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+
+    HOSTNAME = socket.gethostname()
+    cmd = 'echo -e "SP\n%s\n\nEricsson\nHSS\n%s\n\n\n\n" >cert2.cfg' % (HOSTNAME,HOSTNAME)
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+    cmd = 'openssl req -new -key gtserver-key.pem -out gtserver.csr -days %s <cert2.cfg' % num_days
+    _DEB('Executing cmd:\n%s' % cmd)
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+
+    cmd = 'echo "subjectAltName = DNS:com-emergency" > san_extention.conf'
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+
+    cmd = 'openssl x509 -req -in gtserver.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out gtserver-cert.pem -days %s -extfile san_extention.conf' % num_days
+    _DEB('Executing cmd:\n%s' % cmd)
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+        raise st_command.CommandFailure('Error executing: %s' % cmd)
+
+    cmd = 'openssl x509 -in gtserver-cert.pem -noout -text'
+    _DEB('Executing cmd:\n%s' % cmd)
+    (stdout_value, stderr_value, returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if returncode:
+       raise st_command.CommandFailure('Error executing: %s' % cmd)
+    if not "DNS:com-emergency" in stdout_value:
+        raise st_command.CommandFailure('DNS different from com-emergency:\n%s' % stdout_value)
+
+
+
+def main():
+    global NODE
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+    working_directory = user_config.work_dir
+    try:
+
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+        TC.connect_to_node()
+        NODE = hss_utils.node.cba.Cba(config = access_config)
+
+        if not os.path.exists(working_directory):
+            os.makedirs(working_directory)
+        os.chdir(working_directory)
+        _INF('Generating TLS certificates on %s directory' % working_directory)
+
+        if user_config.exp_date is None:
+            exp_ndays = 365
+        else: 
+            exp_ndays = convert_date_to_days(user_config.exp_date)
+        create_tls_cert(exp_ndays)
+        NODE.add_csr_cert_cliss(user_config.NODE)
+        _INF('Certificate created.')
+
+        # Sign and Install Credential Certificate CSR
+        NODE.download('%s/HSS.csr' % NODE.certificates_path, working_directory)
+        finger_print = sign_tls_cert(exp_ndays)
+        cert_file = working_directory + '/HSS-cert.pem'
+        cmd = 'chmod 777 %s' % cert_file
+        st_command.execute_cmd(cmd)
+        ip_tg = get_ip_gt_sftp()
+        if ip_tg is None:
+            error_info = 'Error when getting the IP of the Traffic Generator.'
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+        NODE.inst_csr_cert_cliss(ip_tg, cert_file, finger_print)
+        _INF('Credential Certificate CSR installed and signed.')
+
+        # Install Trusted Certificate from CA
+        finger_print = sign_trusted_cert()
+        cert_file = working_directory + '/ca-cert.pem'
+        cmd = 'chmod 777 %s' % cert_file
+        st_command.execute_cmd(cmd)
+        NODE.inst_trusted_cert_cliss(ip_tg, cert_file, finger_print)
+        _INF('Trusted Certificate from CA installed.')
+
+        # Create Trust Category and Enable Trusted Certificate
+        NODE.create_trusted_category_cliss()
+        _INF('Trust Category created.')
+        NODE.enable_trusted_cert_cliss()
+        _INF('Trusted Certificate enabled.')
+
+        # Configure Netconf TLS
+        NODE.config_cli_tls_cliss()
+        NODE.config_netconf_tls_cliss()
+        flow_port_netconf=NODE.get_tls_port('netconf')
+        _INF('Netconf TLS configured with Port: %s' % flow_port_netconf)
+        _INF('Configuring tlsnetconf evip flow policy with Port: %s' % flow_port_netconf)
+        NODE.config_flow_policy_cliss("tlsnetconf", user_config.NODE, flow_port_netconf)
+
+        flow_port_cli=NODE.get_tls_port('cli')
+        _INF('ECLI TLS configured with Port: %s' % flow_port_cli)
+        _INF('Configuring tlsnetconf evip flow policy with Port: %s' % flow_port_cli)
+        NODE.config_flow_policy_cliss("tlscli", user_config.NODE, flow_port_cli)
+
+        # Checking connectivity
+        conn_check = True
+        input_file = working_directory + '/input_netconf'
+        cmd = 'echo -e "<rpc>\n<close-session/>\n</rpc>\n]]>]]>" > %s' % input_file
+        st_command.execute_cmd(cmd)
+        tls_protocol = NODE.get_tls_protocol()
+        returncode = test_tls_connection(user_config.NODE,flow_port_netconf,input_file,working_directory)
+        
+        if returncode:
+            _ERR('TLS connectivity to NETCONF FAILED.')
+            conn_check = False
+        else:
+            _INF('TLS connectivity to NETCONF successful.')
+
+        input_file = working_directory + '/input_ecli'
+        cmd = 'echo -e "exit\n" > %s' % input_file
+        st_command.execute_cmd(cmd)
+        returncode = test_tls_connection(user_config.NODE,flow_port_cli,input_file,working_directory)
+        if returncode:
+            _ERR('TLS connectivity to ECLI FAILED.')
+            conn_check = False
+        else:
+            _INF('TLS connectivity to ECLI successful.')
+
+        if not conn_check:
+           raise st_command.CommandFailure('TLS connectivity failed')
+
+
+    except IOError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (st_command.WrongParameter) as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.WRONG_PARAMETER, str(e))
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except test_cases.ClissError as e:
+        error_info = '%s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info.split('\n')[0])
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Update NTP servers in a CBA node',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    command_params = parser.add_argument_group('Specific command options')
+    command_params.add_argument('--dir',
+                      action='store', default="/opt/hss/",
+                      help='Specify the full path of the directory where to generate the certificates. If not defined, it will be created under "/opt/hss/"',
+                      dest='work_dir')
+    command_params.add_argument('--exp-date',
+                      action='store', default=None,
+                      help='Specify the expiration date in format "yyyymmdd" for the TLS certificate to be created. If not defined, it will be created by default for 365 days (one year)',
+                      dest='exp_date')
+
+    command_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_create_tls_certificates_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_create_tls_certificates_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable) as e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

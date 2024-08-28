@@ -1,0 +1,374 @@
+#!/usr/bin/python
+# coding=iso-8859-1
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+import traceback
+import argparse
+import re
+import pprint
+import pexpect
+
+import ntpath
+import signal
+import textwrap
+import socket
+import getpass
+import json
+
+#import Queue
+#import subprocess
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.gentraf
+import hss_utils.rosetta
+import hss_utils.rosetta.services
+
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt("Signal handler")
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+def quit_program(exit_code):
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+
+def get_name_environment(OAM_IP,USER,PORT):
+    """ Gets the name of the environment of the OAM IP passed as parameter """
+
+    # Getting name of the environments to check
+    cmd = '\"grep host /cluster/etc/cluster.conf | grep 199 | cut -d \\\\\\\" \\\\\\\" -f4 \"' 
+    cba_cmd = 'CBA_run_command --node %s --user %s --port %s %s' % (OAM_IP,USER,PORT,cmd)
+    _DEB('command:%s' % cba_cmd)
+
+    (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+    if output_code:
+        _ERR( '\n Error when getting access to IP %s' % OAM_IP)
+        quit_program(st_command.CONNECTION_ERROR)
+    else:
+        for env_name in output.split('\n'):
+            if len(env_name) > 0:
+                env_name=env_name.strip()
+                return env_name
+
+    return 'ERROR'
+
+
+def compress_info_hss_env(OAM_IP, DIR_DEST):
+        """ Compress the info files from the HSS environment on a tgz file to be compared later on """
+
+        cmd = 'cd %s; tar -czf config_info_env_%s.tgz *%s' % (DIR_DEST, OAM_IP, OAM_IP)
+        _INF('Executing: %s' % cmd)
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when compressing files on %s directory' % DIR_DEST)
+            quit_program(st_command.EXECUTION_ERROR)
+
+        cmd = 'cd %s; rm *%s' % (DIR_DEST, OAM_IP)
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            _WRN( '\n Error when removing files after being compressed.')
+
+
+def get_info_hss_env(OAM_IP, USER, PORT, DIR_DEST):
+        """ Get the info from the HSS environment and saved into different output files """
+
+        # We remove the possible files from previous executions
+        cmd = 'rm -f %s/*.%s' % (DIR_DEST,OAM_IP)
+        (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when removing previous files ')
+            quit_program(st_command.EXECUTION_ERROR)
+
+
+        # Checking if Authorization is LOCKED
+        cba_cmd = 'CBA_check_AandA_enabled --node %s --user %s --port %s' % (OAM_IP,USER,PORT)
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _INF( 'A&A not enabled. Using user root for ECLI commands ')
+            user_cliss="root"
+        else:
+            _INF( 'A&A enabled. Using user hssadministrator for ECLI commands ')
+            user_cliss="hssadministrator"
+
+        # "Getting cmw-repository-list info
+        _INF( 'Getting cmw-repository-list info ')
+        cmd = '\"cmw-repository-list\"'
+        cba_cmd = 'CBA_run_command --node %s --user %s --port %s --file %s/cba_repository_list.%s %s' % (OAM_IP,USER,PORT,DIR_DEST,OAM_IP,cmd)
+        _DEB('command:%s' % cba_cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting cmw-repository-list info ')
+            quit_program(st_command.EXECUTION_ERROR)
+
+        # "Getting rpms installed info
+        _INF( 'Getting rpms installed info ')
+        cmd = '\"cluster rpm -l -n 1 | grep -i hss\"'
+        cba_cmd = 'CBA_run_command --node %s --user %s --port %s --file %s/rpms_installed_n1.%s %s' % (OAM_IP,USER,PORT,DIR_DEST,OAM_IP,cmd)
+        _DEB('command:%s' % cba_cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting rpms installed info for node SC-1')
+            quit_program(st_command.EXECUTION_ERROR)
+
+        cmd = '\"cluster rpm -l -n 2 | grep -i hss\"'
+        cba_cmd = 'CBA_run_command --node %s --user %s --port %s --file %s/rpms_installed_n2.%s %s' % (OAM_IP,USER,PORT,DIR_DEST,OAM_IP,cmd)
+        _DEB('command:%s' % cba_cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting rpms installed info for node SC-2')
+            quit_program(st_command.EXECUTION_ERROR)
+
+        cmd = '\"cluster rpm -l -n 3 | grep -i hss\"'
+        cba_cmd = 'CBA_run_command --node %s --user %s --port %s --file %s/rpms_installed_n3.%s %s' % (OAM_IP,USER,PORT,DIR_DEST,OAM_IP,cmd)
+        _DEB('command:%s' % cba_cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting rpms installed info for node PL-3')
+            quit_program(st_command.EXECUTION_ERROR)
+
+        cmd = '\"cluster rpm -l -n 4 | grep -i hss\"'
+        cba_cmd = 'CBA_run_command --node %s --user %s --port %s --file %s/rpms_installed_n4.%s %s' % (OAM_IP,USER,PORT,DIR_DEST,OAM_IP,cmd)
+        _DEB('command:%s' % cba_cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting rpms installed info for node PL-4')
+            quit_program(st_command.EXECUTION_ERROR)
+
+        # "Getting HSS_VERSION  info
+        _INF( 'Getting HSS_VERSION  and release info ')
+        cmd = '\"vdicos-envdata-get HSS_VERSION\"'
+        cba_cmd = 'CBA_run_command --node %s --user %s --port %s --file %s/HSS_VERSION.%s %s' % (OAM_IP,USER,PORT,DIR_DEST,OAM_IP,cmd)
+        _DEB('command:%s' % cba_cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting HSS_VERSION info ')
+            quit_program(st_command.EXECUTION_ERROR)
+
+        cmd = '\"immlist -a release managedElementId=1\"'
+        cba_cmd = 'CBA_run_command --node %s --user %s --port %s --file %s/HSS_release.%s %s' % (OAM_IP,USER,PORT,DIR_DEST,OAM_IP,cmd)
+        _DEB('command:%s' % cba_cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting HSS release info ')
+            quit_program(st_command.EXECUTION_ERROR)
+
+        # "Getting Load Modules  info
+        _INF( 'Getting Load Modules  info ')
+        cmd = '\"clurun.sh list_loadmodules -n PL-3 -d lpmsv.agent.vm0| grep -i HSS\"'
+        cba_cmd = 'CBA_run_command --node %s --user %s --port %s --file %s/Load_Modules.%s %s' % (OAM_IP,USER,PORT,DIR_DEST,OAM_IP,cmd)
+        _DEB('command:%s' % cba_cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting Load Modules info ')
+            quit_program(st_command.EXECUTION_ERROR)
+
+        # "Getting Size of LM_HssAvgKeyGenerator Modules
+        _INF( 'Getting size of LM_HssAvgKeyGenerator Modules  info ')
+        cmd = '\"ssh PL-3 du -h /opt/lpmsv/codearchive/LM_HssAvgKeyGenerator*\"'
+        cba_cmd = 'CBA_run_command --node %s --user %s --port %s --file %s/HssAvgKeyGenerator_Size.%s %s' % (OAM_IP,USER,PORT,DIR_DEST,OAM_IP,cmd)
+        _DEB('command:%s' % cba_cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting size of LM_HssAvgKeyGenerator Modules info ')
+            quit_program(st_command.EXECUTION_ERROR)
+
+        # "Getting Load Modules info
+        _INF( 'Checking Warning-AVG messages in the logs. It may take several minutes ... ')
+        cmd = '\"grep -iR Warning-AVG /cluster/storage/no-backup/cdclsv/log/* \"'
+        cba_cmd = 'CBA_run_command --node %s --user %s --port %s --file %s/Warning_AVG.%s %s -t 900' % (OAM_IP,USER,PORT,DIR_DEST,OAM_IP,cmd)
+        _DEB( 'command:%s' % cba_cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when checking Warning-AVG messages')
+            quit_program(st_command.EXECUTION_ERROR)
+
+        # "Getting SW Inventory  info
+        _INF( 'Getting SW Inventory info ')
+        cmd = '\"show ManagedElement=1,SystemFunctions=1,SwM=1\"'
+        cba_cmd = 'CBA_run_cliss_command --node %s --user %s --port %s --cliss_user %s --file %s/SW_Inventory.%s %s' % (OAM_IP,USER,PORT,user_cliss,DIR_DEST,OAM_IP,cmd)
+        _DEB( 'command:%s' % cba_cmd)
+
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting SW Inventory info. Code:\n%' % str(output_code))
+            _INF( '%s' % output_err)
+            quit_program(st_command.EXECUTION_ERROR)
+
+        # "Getting SW Version  info
+        _INF( 'Getting SW Version info ')
+        cmd = '\"show-table ManagedElement=1,SystemFunctions=1,SwInventory=1 -m SwVersion -p swVersionId\"'
+        cba_cmd = 'CBA_run_cliss_command --node %s --user %s --port %s --cliss_user %s --file %s/SW_Version.%s %s' % (OAM_IP,USER,PORT,user_cliss,DIR_DEST,OAM_IP,cmd)
+        _DEB( 'command:%s' % cba_cmd)
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting SW Version info. Code:' + str(output_code))
+            _INF( '%s' % output_err)
+            quit_program(st_command.EXECUTION_ERROR)
+
+        # "Getting HSS Function configuration info
+        _INF( 'Getting HSS Function info ')
+        cmd = '\"show -r -v ManagedElement=1,HSS-Function=HSS_FUNCTION \"'
+        cba_cmd = 'CBA_run_cliss_command --node %s --user %s --port %s --cliss_user %s --file %s/HSS_FUNCTION_info.%s %s' % (OAM_IP,USER,PORT,user_cliss,DIR_DEST,OAM_IP,cmd)
+        _DEB( 'command:%s' % cba_cmd)
+        (output,output_err,output_code) = st_command.execute_cmd(cba_cmd, stdout=True, stderr=True)
+        if output_code:
+            _ERR( '\n Error when getting HSS FUNCTION info. Code:' + str(output_code))
+            _INF( '%s' % output_err)
+            quit_program(st_command.EXECUTION_ERROR)
+
+
+def parse_commandline():
+    global CWD
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description=textwrap.dedent('''
+        Script to get the configuration of an HSS environment. Useful to compare between 
+        different environments both Maiden and Upgraded.
+
+        '''),
+        epilog=textwrap.dedent(st_command.get_exit_status()))
+
+    scenario_params = parser.add_argument_group('Parameters ')
+    scenario_params.add_argument('--node',
+                        action='store', default=None,
+                        help='''IP address of the environment.''',
+                        dest='NODE')
+
+    scenario_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh to get connected to the environment. Default value is 22',
+                      dest='port')
+
+    scenario_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User used in ssh to get connected to the environment. Default value is "com-emergency"',
+                      dest='user')
+
+    scenario_params.add_argument('-o', '--output_dir',
+                        action='store', default=None, dest='DIR_DEST',
+                        help='Optional. Output directory with the full path. By default, the current working directory.')
+
+    logging=e3utils.log.add_logging_options(parser)
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(HSS_getConfigEnv%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'HSS_getConfigEnv%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        if sys.version_info[0] == 2:
+            _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+        else:
+            _DEB('** Binary MD5: %s' % hashlib.md5(str.encode(myself.read())).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable) as e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+
+    return (args)
+
+
+def main ():
+
+    args = parse_commandline()
+
+    env_name=get_name_environment(args.NODE,args.user,args.port)
+    if (env_name == "ERROR"):
+        _ERR( ' Problems to get the name of the environment with the IP %s' % args.NODE)
+        quit_program(st_command.EXECUTION_ERROR)
+
+    if (args.DIR_DEST is None):
+        args.DIR_DEST= "./"
+    else:
+        _INF( ' Logs will be saved under directory %s' % args.DIR_DEST)
+
+    _INF( 'Getting configuration for environment %s' %(env_name))
+    # We remove the possible files from previous executions
+    cmd = 'rm -rf %s*.DIFF' %(args.DIR_DEST)
+    (output,output_err,output_code) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+    if output_code:
+        _INF( '\n Error when removing DIFF files from previous executions ')
+
+    get_info_hss_env(args.NODE,args.user,args.port,args.DIR_DEST)
+    compress_info_hss_env(args.NODE,args.DIR_DEST)
+
+
+if __name__ == '__main__':
+    CWD = os.getcwd()
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+

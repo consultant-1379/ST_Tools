@@ -1,0 +1,16 @@
+[Unit]
+Description=RTC execution controller service
+After=syslog.target rtc_build_handler.service
+Requires=rtc_build_handler.service
+PartOf=rtc_build_handler.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/rtc_controller --log-file /var/log/rtc_service/controller.log --debug
+StandardOutput=syslog
+StandardError=syslog
+
+[Install]
+WantedBy=multi-user.target

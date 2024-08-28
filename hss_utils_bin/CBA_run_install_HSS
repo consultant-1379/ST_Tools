@@ -1,0 +1,1068 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+import traceback
+import argparse
+import re
+import pprint
+import pexpect
+
+import ntpath
+import signal
+import textwrap
+import socket
+import getpass
+
+import essclient
+import json
+import pprint
+
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.gentraf
+import hss_utils.rosetta
+import hss_utils.rosetta.services
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+HOSTNAME = socket.gethostname()
+USER = getpass.getuser()
+ESS_KEY = '/proj/hss_est/tcm_env/node_tools/generators/etc/id_rsa_ess'
+INSTALLATION_HELPER=None
+GENTRAF=None
+ESS_CLIENT = None
+DEPLOYMENT_ID = None
+BASELINE_ID = None
+HSS_PACKAGES=['HSS_Dump','HSS_FE_Tools']
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+
+def quit_program(exit_code):
+    if ESS_CLIENT:
+        try:
+            ESS_CLIENT.bsp_disconnect()
+        except Exception as e:
+            _WRN('Problem in ESS client bsp_disconnect: %s' % e)
+        try:
+            ESS_CLIENT.remove_deployment(DEPLOYMENT_ID)
+        except Exception as e:
+            _WRN('Problem in ESS client remove_deployment: %s' % e)
+
+        if BASELINE_ID:
+            try:
+                ESS_CLIENT.remove_baseline(BASELINE_ID)
+            except Exception as e:
+                _WRN('Problem in ESS client remove_baseline: %s' % e)
+
+    if INSTALLATION_HELPER:
+        try:
+            INSTALLATION_HELPER.release()
+        except Exception as e:
+            _WRN('Problem in release scenario: %s' % e)
+
+    if GENTRAF:
+        try:
+            GENTRAF.release()
+        except Exception as e:
+            _WRN('Problem in in release gentraf: %s' % e)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+_DEFAULT_MANIFEST_ = {
+    'appname': 'HSS',
+    'version': 'build_id', 
+    'required_packages': ['CXP9035082', 'CXP9035165']
+}
+
+DEFAULT_CLIENT_NETWORK = {
+    'CLIENT_DIA_NETMASK_1': '22',
+    'CLIENT_DIA_NETWORK_1': '10.82.248.0',
+    'CLIENT_LDAP_NETMASK_SITE_1': '24',
+    'CLIENT_LDAP_NETMASK_SITE_2': '24',
+    'CLIENT_LDAP_NETMASK_SITE_3': '24',
+    'CLIENT_LDAP_NETMASK_SITE_4': '22',
+    'CLIENT_LDAP_NETWORK_SITE_1': '10.82.141.0',
+    'CLIENT_LDAP_NETWORK_SITE_2': '10.82.152.0',
+    'CLIENT_LDAP_NETWORK_SITE_3': '10.82.155.0',
+    'CLIENT_LDAP_NETWORK_SITE_4': '10.82.232.0',
+    'CLIENT_MAP_NETMASK_1': '24',
+    'CLIENT_MAP_NETMASK_2': '24',
+    'CLIENT_MAP_NETWORK_1': '10.82.160.0',
+    'CLIENT_MAP_NETWORK_2': '10.82.161.0',
+    'CLIENT_RADDIA_NETMASK_1': '22',
+    'CLIENT_RADDIA_NETWORK_1': '10.82.244.0',
+    'CLIENT_SIGTRAN_NETWORK_2': '10.2.131.223',
+    'HLR_SIGTRAN_IP_2': '10.2.131.223',
+    'CLIENT_SIGTRAN_NETWORK_1': '10.2.131.222',
+    'HLR_SIGTRAN_IP_1': '10.2.131.222',
+
+    'REMOTE_SPC': '315',
+    'LOCAL_SPC':  '545',
+    'OWNGTADD' :  '35191115450'
+}
+
+DEFAULT_VALUES = {
+    'CROSSSHELF_LDAP_CMX_0_26': '192.168.207.13',
+    'CROSSSHELF_LDAP_CMX_0_28': '192.168.207.14',
+    'CROSSSHELF_LDAP_MASK': '30',
+    'CROSSSHELF_LDAP_TAG': '20',
+    'CROSSSHELF_OAM_CMX_0_26': '192.168.207.5',
+    'CROSSSHELF_OAM_CMX_0_28': '192.168.207.6',
+    'CROSSSHELF_OAM_MASK': '30',
+    'CROSSSHELF_OAM_TAG': '30',
+    'CROSSSHELF_RAD_CMX_0_26': '192.168.207.21',
+    'CROSSSHELF_RAD_CMX_0_28': '192.168.207.22',
+    'CROSSSHELF_RAD_MASK': '30',
+    'CROSSSHELF_RAD_TAG': '40',
+    'CROSSSHELF_SIG_CMX_0_26': '192.168.207.29',
+    'CROSSSHELF_SIG_CMX_0_28': '192.168.207.30',
+    'CROSSSHELF_SIG_MASK': '30',
+    'CROSSSHELF_SIG_TAG': '55',
+    'HSSFE_AIT_INSTALL_MASK': '24',
+    'HSSFE_AIT_INSTALL_NETWORK': '192.168.254.0',
+    'HSSFE_BOOT_LEFT_END': '169.254.71.232',
+    'HSSFE_BOOT_LEFT_MASK': '24',
+    'HSSFE_BOOT_LEFT_MIP': '169.254.71.130',
+    'HSSFE_BOOT_LEFT_NETWORK': '169.254.71.0',
+    'HSSFE_BOOT_LEFT_SC1': '169.254.71.1',
+    'HSSFE_BOOT_LEFT_SC2': '169.254.71.2',
+    'HSSFE_BOOT_LEFT_START': '169.254.71.200',
+    'HSSFE_BOOT_LEFT_TAG': '1002',
+    'HSSFE_BOOT_RIGHT_END': '169.254.72.232',
+    'HSSFE_BOOT_RIGHT_MASK': '24',
+    'HSSFE_BOOT_RIGHT_MIP': '169.254.72.130',
+    'HSSFE_BOOT_RIGHT_NETWORK': '169.254.72.0',
+    'HSSFE_BOOT_RIGHT_START': '169.254.72.200',
+    'HSSFE_BOOT_RIGHT_TAG': '1012',
+    'HSSFE_LDAP_FEE_CMX_0_26': '192.168.211.1',
+    'HSSFE_LDAP_FEE_CMX_0_28': '192.168.211.2',
+    'HSSFE_LDAP_FEE_IP1': '192.168.211.3',
+    'HSSFE_LDAP_FEE_IP2': '192.168.211.4',
+    'HSSFE_LDAP_FEE_IP3': '192.168.211.5',
+    'HSSFE_LDAP_FEE_IP4': '192.168.211.6',
+    'HSSFE_LDAP_FEE_MASK': '28',
+    'HSSFE_LDAP_FEE_OSPF_ID': '0.0.1.2',
+    'HSSFE_LDAP_FEE_TAG': '1092',
+    'HSSFE_LDE_CMX_0_26': '169.254.101.253',
+    'HSSFE_LDE_CMX_0_28': '169.254.101.254',
+    'HSSFE_LDE_MASK': '24',
+    'HSSFE_LDE_MIP_NFS': '169.254.101.101',
+    'HSSFE_LDE_MIP_SS7': '169.254.101.102',
+    'HSSFE_LDE_NETWORK': '169.254.101.0',
+    'HSSFE_LDE_NODENAME': '169.254.101.199',
+    'HSSFE_LDE_TAG': '1022',
+    'HSSFE_MIP_LA_LDAP': '169.254.101.130',
+    'HSSFE_NTP_PDL_MASK': '24',
+    'HSSFE_NTP_PDL_NETWORK': '169.254.10.0',
+    'HSSFE_NTP_PDL_SC1': '169.254.10.10',
+    'HSSFE_NTP_PDL_SC2': '169.254.10.30',
+    'HSSFE_NTP_PDL_SCXB': '169.254.10.1',
+    'HSSFE_NTP_PDL_TAG': '1052',
+    'HSSFE_NTP_PDR_MASK': '24',
+    'HSSFE_NTP_PDR_NETWORK': '169.254.12.0',
+    'HSSFE_NTP_PDR_SC1': '169.254.12.10',
+    'HSSFE_NTP_PDR_SC2': '169.254.12.30',
+    'HSSFE_NTP_PDR_SCXB': '169.254.12.1',
+    'HSSFE_NTP_PDR_TAG': '1062',
+    'HSSFE_OAM_FEE_CMX_0_26': '192.168.210.1',
+    'HSSFE_OAM_FEE_CMX_0_28': '192.168.210.2',
+    'HSSFE_OAM_FEE_IP1': '192.168.210.3',
+    'HSSFE_OAM_FEE_IP2': '192.168.210.4',
+    'HSSFE_OAM_FEE_MASK': '28',
+    'HSSFE_OAM_FEE_OSPF_ID': '0.0.1.1',
+    'HSSFE_OAM_FEE_TAG': '1112',
+    'HSSFE_RAD_FEE_CMX_0_26': '192.168.212.1',
+    'HSSFE_RAD_FEE_CMX_0_28': '192.168.212.2',
+    'HSSFE_RAD_FEE_IP1': '192.168.212.3',
+    'HSSFE_RAD_FEE_IP2': '192.168.212.4',
+    'HSSFE_RAD_FEE_MASK': '28',
+    'HSSFE_RAD_FEE_OSPF_ID': '0.0.1.4',
+    'HSSFE_RAD_FEE_TAG': '1072',
+    'HSSFE_SIG_FEE_1_CMX_0_26': '192.168.213.1',
+    'HSSFE_SIG_FEE_1_CMX_0_28': '192.168.213.2',
+    'HSSFE_SIG_FEE_1_IP': '192.168.213.3',
+    'HSSFE_SIG_FEE_1_MASK': '28',
+    'HSSFE_SIG_FEE_1_TAG': '1082',
+    'HSSFE_SIG_FEE_2_CMX_0_26': '192.168.213.17',
+    'HSSFE_SIG_FEE_2_CMX_0_28': '192.168.213.18',
+    'HSSFE_SIG_FEE_2_IP': '192.168.213.19',
+    'HSSFE_SIG_FEE_2_MASK': '28',
+    'HSSFE_SIG_FEE_2_TAG': '1182',
+    'HSSFE_SIG_FEE_3_CMX_0_26': '192.168.213.33',
+    'HSSFE_SIG_FEE_3_CMX_0_28': '192.168.213.34',
+    'HSSFE_SIG_FEE_3_IP': '192.168.213.35',
+    'HSSFE_SIG_FEE_3_MASK': '28',
+    'HSSFE_SIG_FEE_3_TAG': '1282',
+    'HSSFE_SIG_FEE_4_CMX_0_26': '192.168.213.49',
+    'HSSFE_SIG_FEE_4_CMX_0_28': '192.168.213.50',
+    'HSSFE_SIG_FEE_4_IP': '192.168.213.51',
+    'HSSFE_SIG_FEE_4_MASK': '28',
+    'HSSFE_SIG_FEE_4_TAG': '1382',
+    'HSSFE_SIG_FEE_OSPF_ID': '0.0.1.3',
+    'HSSFE_TIPC_PDL_TAG': '1032',
+    'HSSFE_TIPC_PDR_TAG': '1042',
+    'LDAP_LOOPBACK_CMX_0_26': '192.168.207.9',
+    'LDAP_LOOPBACK_CMX_0_28': '192.168.207.10',
+    'LDAP_VR_NAME': 'sig_data_sp',
+    'NTP1_SERVER': '10.36.146.36',
+    'OAM_LOOPBACK_CMX_0_26': '192.168.207.1',
+    'OAM_LOOPBACK_CMX_0_28': '192.168.207.2',
+    'OAM_VR_NAME': 'om_cn_sp',
+    'RAD_LOOPBACK_CMX_0_26': '192.168.207.17',
+    'RAD_LOOPBACK_CMX_0_28': '192.168.207.18',
+    'RAD_VR_NAME': 'sig_cn_sp',
+    'SIG_LOOPBACK_CMX_0_26': '192.168.207.25',
+    'SIG_LOOPBACK_CMX_0_28': '192.168.207.26',
+    'SIG_VR_NAME': 'sig_cn_sp',
+    'TIMEZONE_AREA': 'Europe',
+    'TIMEZONE_CITY': 'Stockholm'
+
+}
+
+DEFAULT_VALUES_NANO_RIGHT = {
+    'CROSSSHELF_LDAP_CMX_0_26': '192.168.207.13',
+    'CROSSSHELF_LDAP_CMX_0_28': '192.168.207.14',
+    'CROSSSHELF_LDAP_MASK': '30',
+    'CROSSSHELF_LDAP_TAG': '20',
+    'CROSSSHELF_OAM_CMX_0_26': '192.168.207.5',
+    'CROSSSHELF_OAM_CMX_0_28': '192.168.207.6',
+    'CROSSSHELF_OAM_MASK': '30',
+    'CROSSSHELF_OAM_TAG': '30',
+    'CROSSSHELF_RAD_CMX_0_26': '192.168.207.21',
+    'CROSSSHELF_RAD_CMX_0_28': '192.168.207.22',
+    'CROSSSHELF_RAD_MASK': '30',
+    'CROSSSHELF_RAD_TAG': '40',
+    'CROSSSHELF_SIG_CMX_0_26': '192.168.207.29',
+    'CROSSSHELF_SIG_CMX_0_28': '192.168.207.30',
+    'CROSSSHELF_SIG_MASK': '30',
+    'CROSSSHELF_SIG_TAG': '55',
+    'HSSFE_AIT_INSTALL_MASK': '24',
+    'HSSFE_AIT_INSTALL_NETWORK': '192.168.254.0',
+    'HSSFE_BOOT_LEFT_END': '169.254.81.232',
+    'HSSFE_BOOT_LEFT_MASK': '24',
+    'HSSFE_BOOT_LEFT_MIP': '169.254.81.130',
+    'HSSFE_BOOT_LEFT_NETWORK': '169.254.81.0',
+    'HSSFE_BOOT_LEFT_SC1': '169.254.81.1',
+    'HSSFE_BOOT_LEFT_SC2': '169.254.81.2',
+    'HSSFE_BOOT_LEFT_START': '169.254.81.200',
+    'HSSFE_BOOT_LEFT_TAG': '2002',
+    'HSSFE_BOOT_RIGHT_END': '169.254.82.232',
+    'HSSFE_BOOT_RIGHT_MASK': '24',
+    'HSSFE_BOOT_RIGHT_MIP': '169.254.82.130',
+    'HSSFE_BOOT_RIGHT_NETWORK': '169.254.82.0',
+    'HSSFE_BOOT_RIGHT_START': '169.254.82.200',
+    'HSSFE_BOOT_RIGHT_TAG': '2012',
+    'HSSFE_LDAP_FEE_CMX_0_26': '192.168.221.1',
+    'HSSFE_LDAP_FEE_CMX_0_28': '192.168.221.2',
+    'HSSFE_LDAP_FEE_IP1': '192.168.221.3',
+    'HSSFE_LDAP_FEE_IP2': '192.168.221.4',
+    'HSSFE_LDAP_FEE_IP3': '192.168.221.5',
+    'HSSFE_LDAP_FEE_IP4': '192.168.221.6',
+    'HSSFE_LDAP_FEE_MASK': '28',
+    'HSSFE_LDAP_FEE_OSPF_ID': '0.0.2.2',
+    'HSSFE_LDAP_FEE_TAG': '2092',
+    'HSSFE_LDE_CMX_0_26': '169.254.201.253',
+    'HSSFE_LDE_CMX_0_28': '169.254.201.254',
+    'HSSFE_LDE_MASK': '24',
+    'HSSFE_LDE_MIP_NFS': '169.254.201.101',
+    'HSSFE_LDE_MIP_SS7': '169.254.201.102',
+    'HSSFE_LDE_NETWORK': '169.254.201.0',
+    'HSSFE_LDE_NODENAME': '169.254.201.199',
+    'HSSFE_LDE_TAG': '2022',
+    'HSSFE_MIP_LA_LDAP': '169.254.201.130',
+    'HSSFE_NTP_PDL_MASK': '24',
+    'HSSFE_NTP_PDL_NETWORK': '169.254.20.0',
+    'HSSFE_NTP_PDL_SC1': '169.254.20.10',
+    'HSSFE_NTP_PDL_SC2': '169.254.20.30',
+    'HSSFE_NTP_PDL_SCXB': '169.254.20.1',
+    'HSSFE_NTP_PDL_TAG': '2052',
+    'HSSFE_NTP_PDR_MASK': '24',
+    'HSSFE_NTP_PDR_NETWORK': '169.254.22.0',
+    'HSSFE_NTP_PDR_SC1': '169.254.22.10',
+    'HSSFE_NTP_PDR_SC2': '169.254.22.30',
+    'HSSFE_NTP_PDR_SCXB': '169.254.22.1',
+    'HSSFE_NTP_PDR_TAG': '2062',
+    'HSSFE_OAM_FEE_CMX_0_26': '192.168.220.1',
+    'HSSFE_OAM_FEE_CMX_0_28': '192.168.220.2',
+    'HSSFE_OAM_FEE_IP1': '192.168.220.3',
+    'HSSFE_OAM_FEE_IP2': '192.168.220.4',
+    'HSSFE_OAM_FEE_MASK': '28',
+    'HSSFE_OAM_FEE_OSPF_ID': '0.0.2.1',
+    'HSSFE_OAM_FEE_TAG': '2112',
+    'HSSFE_RAD_FEE_CMX_0_26': '192.168.222.1',
+    'HSSFE_RAD_FEE_CMX_0_28': '192.168.222.2',
+    'HSSFE_RAD_FEE_IP1': '192.168.222.3',
+    'HSSFE_RAD_FEE_IP2': '192.168.222.4',
+    'HSSFE_RAD_FEE_MASK': '28',
+    'HSSFE_RAD_FEE_OSPF_ID': '0.0.2.4',
+    'HSSFE_RAD_FEE_TAG': '2072',
+    'HSSFE_SIG_FEE_1_CMX_0_26': '192.168.223.1',
+    'HSSFE_SIG_FEE_1_CMX_0_28': '192.168.223.2',
+    'HSSFE_SIG_FEE_1_IP': '192.168.223.3',
+    'HSSFE_SIG_FEE_1_MASK': '28',
+    'HSSFE_SIG_FEE_1_TAG': '2082',
+    'HSSFE_SIG_FEE_2_CMX_0_26': '192.168.223.17',
+    'HSSFE_SIG_FEE_2_CMX_0_28': '192.168.223.18',
+    'HSSFE_SIG_FEE_2_IP': '192.168.223.19',
+    'HSSFE_SIG_FEE_2_MASK': '28',
+    'HSSFE_SIG_FEE_2_TAG': '2182',
+    'HSSFE_SIG_FEE_3_CMX_0_26': '192.168.223.33',
+    'HSSFE_SIG_FEE_3_CMX_0_28': '192.168.223.34',
+    'HSSFE_SIG_FEE_3_IP': '192.168.223.35',
+    'HSSFE_SIG_FEE_3_MASK': '28',
+    'HSSFE_SIG_FEE_3_TAG': '2282',
+    'HSSFE_SIG_FEE_4_CMX_0_26': '192.168.223.49',
+    'HSSFE_SIG_FEE_4_CMX_0_28': '192.168.223.50',
+    'HSSFE_SIG_FEE_4_IP': '192.168.223.51',
+    'HSSFE_SIG_FEE_4_MASK': '28',
+    'HSSFE_SIG_FEE_4_TAG': '2382',
+    'HSSFE_SIG_FEE_OSPF_ID': '0.0.2.3',
+    'HSSFE_TIPC_PDL_TAG': '2032',
+    'HSSFE_TIPC_PDR_TAG': '2042',
+    'LDAP_LOOPBACK_CMX_0_26': '192.168.207.9',
+    'LDAP_LOOPBACK_CMX_0_28': '192.168.207.10',
+    'LDAP_VR_NAME': 'sig_data_sp',
+    'NTP1_SERVER': '10.36.146.36',
+    'OAM_LOOPBACK_CMX_0_26': '192.168.207.1',
+    'OAM_LOOPBACK_CMX_0_28': '192.168.207.2',
+    'OAM_VR_NAME': 'om_cn_sp',
+    'RAD_LOOPBACK_CMX_0_26': '192.168.207.17',
+    'RAD_LOOPBACK_CMX_0_28': '192.168.207.18',
+    'RAD_VR_NAME': 'sig_cn_sp',
+    'SIG_LOOPBACK_CMX_0_26': '192.168.207.25',
+    'SIG_LOOPBACK_CMX_0_28': '192.168.207.26',
+    'SIG_VR_NAME': 'sig_cn_sp',
+    'TIMEZONE_AREA': 'Europe',
+    'TIMEZONE_CITY': 'Stockholm'
+}
+
+
+def main():
+    global ESS_CLIENT
+    global DEPLOYMENT_ID
+    global BASELINE_ID
+    global INSTALLATION_HELPER
+    global GENTRAF
+
+    user_config = parse_commandline()
+    INSTALLATION_HELPER = st_command.Installation_helper(user_config, HSS_PACKAGES)
+
+    try:
+        envs = hss_utils.rosetta.related_environments(HOSTNAME)
+        if not envs or envs[0] is None:
+            _ERR('Error: Rosetta return an empty list or None')
+            quit_program(EXECUTION_ERROR)
+    except Exception as e:
+        _ERR('Can not fetch Object "%s" from Rosetta (%s)' % (HOSTNAME,e))
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        info = hss_utils.rosetta.services.installation_info_for(envs[0])
+    except KeyError as e:
+        _ERR('Missing data in rosetta: %s' % e)
+        quit_program(EXECUTION_ERROR)
+    except ValueError as e:
+        _ERR('%s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    if user_config.vector_supplier == 'ROSETTA':
+        try:
+            user_config.vector_supplier = envs[0].parameters.get('vector_supplier','NONE')
+        except Exception as e:
+            _WRN('Problem reading vector suppier from Rosetta: %s' % e)
+            _WRN('Node configuration will be skipped')
+
+    try:
+        node_name  = info['cabinet']['hydra_id'] + info['cabinet']['suffix']
+        node_type = info['cabinet']['type']
+        nano_right = '-R' in node_name
+        node_config = DEFAULT_CLIENT_NETWORK
+        node_config.update(DEFAULT_VALUES_NANO_RIGHT if nano_right else DEFAULT_VALUES)
+        node_config.update(info['cabinet']['config'])
+        node_scx_uri = 'ssh://advanced:ett,30@%s:2024' % info['cabinet']['config']['SYS_BSP_CNBI']
+    except KeyError as e:
+        _ERR('Problem getting node info from Rosetta %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        hlr_config = info['hlrs']['config']
+    except KeyError as e:
+        hlr_config = {}
+
+    DEPLOYMENT_ID = '%s-%s' % (node_name, user_config.id)
+    if user_config.delete_baseline:
+        BASELINE_ID = user_config.id
+
+    _INF('Node name   : %s' % node_name)
+    _INF('Node type   : %s' % node_type)
+    _INF('URI scx     : %s' % node_scx_uri)
+    _INF('')
+
+    node_config.update(update_oam_sc_port(nano_right))
+    node_config.update(hlr_config)
+    node_config.update({'NODENAME': node_name.upper()})
+
+    with open(os.path.join(user_config.output_dir,'data_from_rosetta.json'), 'w') as fd:
+        json.dump(node_config, fd, sort_keys=True, indent=2)
+
+    if user_config.rosetta_info:
+        quit_program(SUCCESS)
+
+    if not user_config.baseline:
+        _ERR('Baseline is mandatory')
+        quit_program(WRONG_PARAMETER)
+
+    if user_config.ess is None:
+        try:
+            user_config.ess = info['ait']['mgmt'][0]
+        except (KeyError, TypeError) as e:
+            _ERR('Can not fetch ESS from Rosetta (%s)' % user_config.node)
+            quit_program(EXECUTION_ERROR)
+
+    ess_uri = 'pot://%s' % user_config.ess
+    _INF('ESS URI     : %s' % ess_uri)
+
+    try:
+        ESS_CLIENT = essclient.ESS(ess_uri)
+    except Exception as e:
+        _ERR('Problem in ESS client creation: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    ESS_CLIENT.default_timeout=60.0
+    try:
+        if ESS_CLIENT.ping() != 'pong':
+            _ERR('No connection to ESS %s' % ess_uri)
+            quit_program(EXECUTION_ERROR)
+    except Exception as e:
+        _ERR('Problem in ESS client ping: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        status = ESS_CLIENT.status
+    except Exception as e:
+        _ERR('Problem in ESS client status: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    for key, value in status.iteritems():
+        if not value:
+            _ERR('ESS service %s is off line' % key)
+            quit_program(EXECUTION_ERROR)
+
+    _INF('All ESS services are running')
+
+    try:
+        ESS_CLIENT.bsp_add_connection(node_scx_uri)
+    except Exception as e:
+        if str(e) == 'BSP ERROR: OAM access already configured':
+            _DEB('BSP connection already exists')
+        else:
+            _ERR('Problem in ESS client bsp_add_connection: %s' % e)
+            quit_program(EXECUTION_ERROR)
+
+    try:
+        ESS_CLIENT.bsp_connect()
+    except Exception as e:
+        _ERR('Problem in ESS client bsp_connect: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    if user_config.tenant is None:
+        tenant = 'hss%s' % info['cabinet']['suffix']
+    else:
+        tenant = user_config.tenant
+
+    try:
+        allowed_tenants = ESS_CLIENT.bsp_status['tenants']
+    except Exception as e:
+        _ERR('Problem in ESS client bsp_status: %s' % e)
+        quit_program(EXECUTION_ERROR)
+    if tenant not in allowed_tenants:
+        _ERR('%s BSP tenant is not in allowed BSP tenants: %s' % (tenant, ' '.join(allowed_tenants)))
+        quit_program(EXECUTION_ERROR)
+
+    _INF('Setting BSP tenant: %s' % tenant)
+    try:
+        ESS_CLIENT.bsp_set_tenant(tenant)
+    except Exception as e:
+        _ERR('Problem in ESS client bsp_set_tenant: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        available_baselines = ESS_CLIENT.available_baselines
+    except Exception as e:
+        _ERR('Problem in ESS client available_baselines: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    _INF('Available baselines: %s' % ' '.join(available_baselines))
+
+    if user_config.id in available_baselines:
+        _INF('%s HSS baseline already exists in ESS' % user_config.id)
+    else:
+        _INF('Building %s HSS baseline in ESS.......It could take a long time' % user_config.id)
+        file_packages = []
+        cmd = 'ssh -i %s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@%s "mktemp -d"' % (ESS_KEY, user_config.ess)
+        _INF('Exceuting: %s' % cmd)
+        stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+        if returncode:
+            _ERR(stderr_value)
+            quit_program(EXECUTION_ERROR)
+
+        remote_dir = stdout_value.strip()
+        try:
+            packages = INSTALLATION_HELPER.packages
+            local_dir = INSTALLATION_HELPER.local_dir
+        except st_command.CommandFailure as e:
+            _ERR('%s' % e)
+            quit_program(EXECUTION_ERROR)
+
+        for package in packages:
+            pack_name = package.split('/')[-1]
+            cmd = 'download_package %s %s/%s -v' % (package, local_dir, pack_name)
+            _INF('Exceuting: %s' % cmd)
+            stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+            if returncode:
+                error_info = 'Faulty with exit code %s' % returncode
+                for line in stderr_value.split('\n'):
+                    position = line.find('stFramework_message ')
+                    if  position != -1:
+                        error_info = line[position + len('stFramework_message ') :]
+                        _ERR('%s' % error_info)
+                quit_program(EXECUTION_ERROR)
+
+            cmd = 'scp -i %s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no %s/%s root@%s:%s' % (ESS_KEY, local_dir, pack_name, user_config.ess, remote_dir)
+            _INF('Exceuting: %s' % cmd)
+            stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+            if returncode:
+                _ERR(stderr_value)
+                quit_program(EXECUTION_ERROR)
+
+            file_packages += ['file://%s/%s' % (remote_dir, pack_name)]
+
+        _DEFAULT_MANIFEST_.update({'version':user_config.id})
+
+        ESS_CLIENT.default_timeout=600.0
+        manifest = _DEFAULT_MANIFEST_
+        if '-' in user_config.id:
+            manifest['version']= '-'.join(user_config.id.split('-')[1:])
+
+        try:
+            ESS_CLIENT.install_baseline(manifest, file_packages, user_config.id)
+        except Exception as e:
+            _ERR('Problem in ESS client install_baseline: %s' % e)
+            quit_program(EXECUTION_ERROR)
+
+        ESS_CLIENT.default_timeout=60.0
+
+        cmd = 'ssh -i %s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@%s "rm -rf %s"' % (ESS_KEY, user_config.ess, remote_dir)
+        _INF('Exceuting: %s' % cmd)
+        stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+        if returncode:
+            _WRN('Remote directory %s can not be deleted: %s' % (remote_dir, stderr_value))
+
+    try:
+        ESS_CLIENT.create_deployment(DEPLOYMENT_ID, 'bsp8100',user_config.id)
+    except Exception as e:
+        _ERR('Problem in ESS client create_deployment: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        ESS_CLIENT.autodetect_deployment_settings(DEPLOYMENT_ID,user_config.blades)
+    except Exception as e:
+        _ERR('Problem in ESS client autodetect_deployment_settings: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        di = ESS_CLIENT.get_deployment_info(DEPLOYMENT_ID)
+    except Exception as e:
+        _ERR('Problem in ESS client get_deployment_info: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+
+    # Update PLs information 
+    if not user_config.nof_pls:
+        user_config.nof_pls = len(user_config.blades) - 2 if user_config.blades else int(di['blade_number']) - 2
+
+    elif user_config.nof_pls > int(di['blade_number']) - 2:
+        _ERR('Max number of PLs is %s' % (int(di['blade_number']) - 2))
+        quit_program(EXECUTION_ERROR)
+
+    # Update up-link parameters 
+    uplink_config= di['uplink_config']
+    uplink_config['diameter']['create_routes'] = 1
+    uplink_config['ldap']['create_routes'] = 4
+    uplink_config['map']['create_routes'] = 2
+    uplink_config['oam']['create_routes'] = 0
+    uplink_config['raddia']['create_routes'] = 1
+    di['uplink_config'] = uplink_config
+
+    di['multi_application'] = 1 if nano_right else 0
+
+    # Find SC blade
+    try:
+        inventory = ESS_CLIENT.bsp_status['inventory']
+    except Exception as e:
+        _ERR('Problem in ESS client bsp_status: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    if user_config.blades:
+        sc_blade = user_config.blades[0]
+    else:
+        sc_blade = 'blade:0-13' if nano_right else 'blade:0-1'
+
+    for element in inventory:
+        if element[1] == sc_blade:
+            di['blade_hardware'] = element[0]
+            _INF('SC Blade hardware: %s' % element[0])
+            break
+
+    try:
+        di = ESS_CLIENT.get_deployment_info(DEPLOYMENT_ID)
+    except Exception as e:
+        _ERR('Problem in ESS client get_deployment_info: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    config={}
+    for k,v in di.items():
+        if k.startswith('_'):
+            continue
+        config[k]=v
+
+    with open(os.path.join(user_config.output_dir,'config.json'), 'w') as fd:
+        json.dump(config, fd, sort_keys=True, indent=2)
+
+    # Update di with node_config
+    adaptor = di['_current_adaptor']
+    adaptor.update(node_config)
+    di['_current_adaptor'] = adaptor
+
+    with open(os.path.join(user_config.output_dir,'adaptor.json'), 'w') as fd:
+        json.dump(adaptor, fd, sort_keys=True, indent=2)
+
+    # Create, update and up-load installation templates
+    try:
+        deployment_templates = ESS_CLIENT.get_available_builders(DEPLOYMENT_ID)
+        if deployment_templates is None:
+            _ERR('Deployment templates not found for %s' % DEPLOYMENT_ID)
+            quit_program(EXECUTION_ERROR)
+    except Exception as e:
+        _ERR('Problem in ESS client get_available_builders: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    for element in deployment_templates:
+        try:
+            template = ESS_CLIENT.build_template(DEPLOYMENT_ID, element)
+        except Exception as e:
+            _ERR('Problem in ESS client build_template: %s' % e)
+            quit_program(EXECUTION_ERROR)
+
+        if element == 'post_installation_config':
+            try:
+                my_json = json.loads(template)
+            except Exception as e:
+                _ERR('Problem decoding %s json template: %s' % (template, e))
+                quit_program(EXECUTION_ERROR)
+            #my_json.update({'com_emergency_account_users':{'com-emergency':'com-emergency'}}) 
+            my_json.update({'la_admin_account_user_id':{'la-admin':'la-admin'}})
+            my_json["customize_values"].update({"com_emergency_account_users":{"com-emergency":'com-emergency'}})
+            if not user_config.map_pm_jobs:
+                my_json['PmJobs'] = []
+                try:
+                    my_json['Tasks'].remove('post_inst_map_threshold_monitor_pm_jobs')
+                except ValueError:
+                    _ERR('post_inst_map_threshold_monitor_pm_jobs not found in Tasks = %s' % ','.join(my_json['Tasks']))
+                    quit_program(EXECUTION_ERROR)
+
+            if user_config.snmp_target_addr is None:
+                try:
+                    my_json['Tasks'].remove('post_inst_set_snmp_target')
+                except ValueError:
+                    _ERR('post_inst_set_snmp_target not found in Tasks = %s' % ','.join(my_json['Tasks']))
+                    quit_program(EXECUTION_ERROR)
+            else:
+                my_json['SITE_SPECIFIC_bt1_snmp_target_addr'] = user_config.snmp_target_addr
+
+            template = json.dumps(my_json, sort_keys=True, indent=2)
+
+        with open(os.path.join(user_config.output_dir,element), 'w') as fd:
+            try:
+                fd.write(template)
+            except TypeError as e:
+                _ERR('Problem creating template %s' % element)
+                quit_program(EXECUTION_ERROR)
+
+        try:
+            ESS_CLIENT.store_deployment_template(DEPLOYMENT_ID, element, template)
+        except Exception as e:
+            _ERR('Problem in ESS client store_deployment_template for %s: %s' % (element,e))
+            quit_program(EXECUTION_ERROR)
+
+
+    # Installation start
+    if user_config.skip_installation:
+        quit_program(SUCCESS)
+
+    try:
+        license_file = INSTALLATION_HELPER.license_file
+    except st_command.CommandFailure as e:
+        _ERR('%s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        with open(license_file, 'r') as fd:
+            license = fd.read()
+    except IOError as e:
+        _ERR('Problem with license file %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        ESS_CLIENT.store_deployment_template(DEPLOYMENT_ID, 'lic_file', license)
+    except Exception as e:
+        _ERR('Problem in ESS client store_deployment_template for lic_file: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        ESS_CLIENT.rebuild_deployment_tasks(DEPLOYMENT_ID,'ess_deployment_tasks')
+    except Exception as e:
+        _ERR('Problem in ESS client rebuild_deployment_tasks: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    try:
+        ESS_CLIENT.start_deployment(DEPLOYMENT_ID)
+    except Exception as e:
+        _ERR('Problem in ESS client start_deployment: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+
+    WORKER_WAITING_START = 'waiting_start'
+    WORKER_STARTED = 'started'
+    WORKER_CANCELLED = 'cancelled'
+    WORKER_FAILED = 'failed'
+    WORKER_KILLED = 'killed'
+    WORKER_END = 'finished'
+
+    try:
+        status = ESS_CLIENT.get_deployment_status(DEPLOYMENT_ID)
+    except Exception as e:
+        _ERR('Problem in ESS client get_deployment_status: %s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    offset = 0
+    timeout = float(user_config.max_time)
+    while status != WORKER_END:
+        try:
+            now = time.time()
+            time.sleep(10.0)
+            try:
+                status = ESS_CLIENT.get_deployment_status(DEPLOYMENT_ID)
+            except Exception as e:
+                _ERR('Problem in ESS client get_deployment_status: %s' % e)
+                quit_program(EXECUTION_ERROR)
+            try:
+                stdout = ESS_CLIENT.get_deployment_output(DEPLOYMENT_ID).splitlines()
+            except Exception as e:
+                _ERR('Problem in ESS client get_deployment_output: %s' % e)
+                quit_program(EXECUTION_ERROR)
+
+            for line in stdout[offset:]:
+                timeout = float(user_config.max_time)
+                if line != '':
+                    _INF('%s' % line)
+                    if 'Worker error' in line and 'file://' in line:
+                        for field in line.split():
+                            if field.startswith('file://'):
+                                error_file = field[12:-1]
+                                cmd = 'scp -i %s -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@%s:/logs/execution_templates/%s* %s/ ' % (ESS_KEY, user_config.ess, error_file ,user_config.output_dir)
+                                _INF('Executing: %s' % cmd)
+                                stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+                                if returncode:
+                                    _WRN(stderr_value)
+
+            offset = len(stdout)
+
+            if status in [WORKER_CANCELLED, WORKER_FAILED, WORKER_KILLED]:
+                _ERR('Installation status: %s' % status)
+                quit_program(EXECUTION_ERROR)
+
+            timeout -= time.time() - now
+            if timeout < float(0):
+                _ERR('Timeout waiting for installation process (%s seconds)' % user_config.max_time)
+                quit_program(TIMEOUT)
+
+        except KeyboardInterrupt:
+            _WRN('Execution stopped by user')
+            break
+
+
+    if user_config.vector_supplier not in ['AVG','HLR']:
+        _INF('Vector supplier is %s. Skip node configuration' % user_config.vector_supplier)
+        quit_program(SUCCESS)
+
+    # Configuration section
+
+    cmd = 'CBA_check_all_licenses_granted'
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+    if returncode:
+        max_tries = 5
+        while True:
+            _INF('Waiting 30 seconds')
+            time.sleep(30.0)
+            cmd = 'CBA_grant_licenses'
+            _INF('Executing: %s' % cmd)
+            stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+            if returncode:
+                max_tries -= 1
+                if max_tries:
+                    _WRN('Some licenses are still in NO granted state')
+                    continue
+                else:
+                    _ERR('Too much time waiting for all licenses in granted state')
+                    quit_program(EXECUTION_ERROR)
+
+            break
+
+    _INF('All licences are present and in granted state')
+    _INF('Start node configuration')
+    access = {'host':HOSTNAME, 'user':USER}
+    GENTRAF = hss_utils.node.gentraf.GenTraf(access)
+    channel = GENTRAF.get_channel()
+
+    try:
+        population_netconf_repo = INSTALLATION_HELPER.population_netconf_repo
+    except st_command.CommandFailure as e:
+        _ERR('%s' % e)
+        quit_program(EXECUTION_ERROR)
+
+    cmd = 'CBA_run_configure -m --vector_supplier %s --output %s/population --netconf %s' % (user_config.vector_supplier,
+                                                                                             st_command.real_path(user_config.output_dir),
+                                                                                             population_netconf_repo)
+    _INF('Executing: %s' % cmd)
+    channel.write_line(cmd)
+    while (True):
+        try:
+            result = channel.expect([GENTRAF.get_sync_expression(),
+                                    '\n'])
+
+            if result == 0:
+                _INF('CBA_run_configure execution finished')
+                break
+
+            if result == 1:
+                _INF('  %s' % channel.stdout)
+
+        except pexpect.TIMEOUT, e:
+            continue
+
+        except pexpect.EOF, e:
+            _ERR('EOF received when executing CBA_run_configure')
+            quit_program(EXECUTION_ERROR)
+
+    cmd = 'CBA_create_backup AUTO -v'    
+    _INF('Executing: %s' % cmd)
+    stdout_value, stderr_value, returncode = st_command.execute_cmd(cmd,stdout= True,stderr = True)
+    if returncode:
+        error_info = 'Faulty with exit code %s' % returncode
+        for line in stderr_value.split('\n'):
+            position = line.find('stFramework_message ')
+            if  position != -1:
+                error_info = line[position + len('stFramework_message ') :]
+                _ERR('%s' % error_info)
+        quit_program(EXECUTION_ERROR)
+
+    quit_program(SUCCESS)
+
+
+def update_oam_sc_port(nano_right):
+    info = {}
+    info.update({'HSSFE_SYS_OAM_SC1_PORT': 'BP%s' % ('13' if nano_right else '1')})
+    info.update({'HSSFE_SYS_OAM_SC2_PORT': 'BP%s' % ('15' if nano_right else '3')})
+
+    return info
+
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawTextHelpFormatter,
+                        description=textwrap.dedent('''\
+                        HSS install based on Rosetta information. Rosetta is mandatory
+                        This tool shall be executed in a traffic generator belonging to the same environment
+            '''),
+            epilog=textwrap.dedent(get_exit_status()))
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('--baseline', default=None,
+                        action='store', dest='baseline',
+                        help='Baseline name used for getting SW packages from rosetta')
+
+    scenario_params.add_argument('--vector-supplier', choices=['NONE','AVG','HLR','ROSETTA'],
+                        action='store', dest='vector_supplier', default='NONE',
+                        help='Configure the HSS using the provided Vector supplier. If NONE configuration will be skipped')
+
+    scenario_params.add_argument('--nof-pls', type=int,
+                        action='store', dest='nof_pls',
+                        help='Number of PLs to be configured')
+
+    scenario_params.add_argument('--blades',nargs='*',default=[],
+                        help='Set a list of at least 3 blades to be used. Format subrack:slot',
+                        dest='blades')
+
+    scenario_params.add_argument('--map-pm-jobs',
+                      action='store_true', default=False,
+                      help='Add post installation step for enabling Map PmJobs.',
+                      dest='map_pm_jobs')
+
+    scenario_params.add_argument('--snmp-target-addr',default=None,
+                        action='store', dest='snmp_target_addr',
+                        help='Snmp target IP to be used in Post-installation')
+
+    scenario_params.add_argument('--tenant',default=None,
+                        action='store', dest='tenant',
+                        help='Specify a BSP tenant')
+
+    behaviour_params = parser.add_argument_group('Define behaviour ')
+    behaviour_params.add_argument('--ess',
+                      action='store', default=None,
+                      help='ESS IP. If not present use rosetta to find it.',
+                      dest='ess')
+
+    behaviour_params.add_argument('--rosetta-info',
+                      action='store_true', default=False,
+                      help='There is not an ESS so just find info from rosetta and store it in files.',
+                      dest='rosetta_info')
+
+    behaviour_params.add_argument('--skip-installation',
+                      action='store_true', default=False,
+                      help='DO not install, just prepare cfg files.',
+                      dest='skip_installation')
+
+    behaviour_params.add_argument('--delete',
+                      action='store_true', default=False,
+                      help='Delete the baseline in ESS.',
+                      dest='delete_baseline')
+
+    behaviour_params.add_argument('--max-time',
+                        default=5400, type=int, action='store', dest='max_time',
+                        help='Max time for installation process. By default is "%(default)s seconds"')
+
+    behaviour_params.add_argument('-o', '--output',
+                      action='store', default=None,
+                      help='Specify the output directory. Default %s' % CWD,
+                      dest='output_dir')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    if args.output_dir is not None and args.log_file is not None:
+        _ERR('Error: --log_file and -o can not be used at the same time' )
+        quit_program(ROSETTA_ERROR)
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_run_install_HSS_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.output_dir is None:
+        args.output_dir = CWD
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(st_command.real_path(args.output_dir), 'CBA_run_install_HSS_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    args.id = '%s' % args.baseline
+
+    if args.nof_pls and args.blades:
+        _ERR('Error: --nof_pls  and -blades can not be used at the same time' )
+        quit_program(ROSETTA_ERROR)
+
+    if len(args.blades) in [1,2]:
+        _ERR('Error: --blades shall be a list with at least 3 elements' )
+        quit_program(ROSETTA_ERROR)
+
+    return (args)
+
+
+if __name__ == '__main__':
+    CWD = os.getcwd()
+    signal.signal(signal.SIGINT, quit_gracefully)
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

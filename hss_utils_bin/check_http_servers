@@ -1,0 +1,349 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+import socket
+import getpass
+
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import hss_utils.node.gentraf
+import hss_utils.rosetta
+import hss_utils.rosetta.services
+import HSS_rtc_lib.components.test_cases as test_cases
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+USERID = getpass.getuser()
+def set_userid(userid):
+    global USERID
+    USERID = userid
+
+HOSTNAME = socket.gethostname()
+def set_hostname(hostname):
+    global HOSTNAME
+    HOSTNAME = hostname
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt("Signal handler")
+
+
+NODE=None
+
+def quit_program(exit_code,message=''):
+    global NODE
+
+    if NODE is not None:
+        NODE.release()
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def main():
+
+    global NODE
+    user_config = parse_commandline()
+
+    start_http1_server = False
+    start_http2_server = False
+    if user_config.host is None:
+        _INF('Checking HTTP Servers in traffic generator %s ' % HOSTNAME)
+        tg_config = {'host':HOSTNAME, 'port':user_config.tg_port,'user' : user_config.tg_user,'password' : user_config.tg_password}
+
+    else:
+        _INF('Checking HTTP Servers in traffic generator %s ' % user_config.host)
+        tg_config = {'host':user_config.host, 'port':user_config.tg_port,'user' : user_config.tg_user,'password' : user_config.tg_password}
+
+    try:
+        NODE_TG = hss_utils.node.gentraf.GenTraf(tg_config)
+    except connection.Unauthorized as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.AUTHENTICATION_ERROR)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.CONNECTION_ERROR)
+
+    except Exception as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR)
+
+
+    if user_config.http_server_type == '1' or user_config.http_server_type == 'ALL':
+        cmd = 'pidof HttpServer'
+        answer = NODE_TG.run_command(cmd)
+        _DEB('\tAnswer cmd: %s ' % answer)
+        result = NODE_TG.get_result_code()
+        _DEB('\tResult code cmd: %d ' % result)
+        if result:
+            start_http1_server = True
+            _INF('Http Server1 is NOT running.')
+        else:
+            _INF('Http Server1 already running with pid: %s' % answer)
+
+    if user_config.http_server_type == '2' or user_config.http_server_type == 'ALL':
+        cmd = 'pidof HttpServer2'
+        answer = NODE_TG.run_command(cmd)
+        _DEB('\tAnswer cmd: %s ' % answer)
+        result = NODE_TG.get_result_code()
+        _DEB('\tResult code cmd: %d ' % result)
+        if result:
+            start_http2_server = True
+            _INF('Http Server2 is NOT running. Shall be started')
+        else:
+            _INF('Http Server2 already running with pid: %s' % answer)
+
+    if not start_http1_server and not start_http2_server:
+        return
+
+    if user_config.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            user_config.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         :%s' % user_config.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable) as e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    access_config = {'host':user_config.NODE,
+                    'port':user_config.port,
+                    'user':user_config.user}
+    try:
+        NODE = hss_utils.node.cba.Cba(config = access_config)
+
+        if start_http1_server:
+            _INF('Starting Http Server1 ...')
+            try:
+                http1_uris = NODE.configured_Http_uris
+                _DEB('Http Server1 URIS: %s' % http1_uris)
+            except Exception as e:
+                _DEB('Exception when getting HTTP Uris configuration: %s' % str(e))
+
+            if http1_uris:
+                _DEB('Http Server1 URIS: %s' % http1_uris)
+                cmd = '/opt/hss/bin/HttpServer %s %s %s >/dev/null 2>&1 & ' % (http1_uris[0], user_config.http1_delay, ('true' if user_config.http1_log else 'false')) 
+                _INF('Executing cmd: %s' % cmd)
+                answer = NODE_TG.run_command(cmd, allow_local_execution = True)
+                _DEB('\tAnswer cmd: %s ' % answer)
+                result = NODE_TG.get_result_code()
+                _DEB('\tResult code cmd: %d ' % result)
+                if result:
+                    error_info = 'Error when starting Http Server: %s ' % answer
+                    _ERR(error_info)
+                else:
+                    _INF('Http Server1 started successfully')
+            else:
+                _ERR('URIS information for Http Server1 not found. Unable to start process.')
+
+        if start_http2_server:
+            _INF('Starting Http Server2 ...')
+            http2_uris = NODE.configured_Http2_uris
+            if http2_uris:
+                _DEB('Http Server2 URIS: %s' % http2_uris)
+                log_file = os.path.join(CWD, 'HtppServer2_process_%s.log' % os.getpid())
+                _INF('The Httpserver will be executed directly to avoid a high CPU use.')
+                _INF('ATTENTION!! The logs messages will be saved on the file %s .' % log_file)
+                _INF('You can use <CTRL-C> to stop the process or kill it from another terminal session.')
+                cmd = '/opt/hss/bin/HttpServer2 -m %s -ep %s -l=%s -d %s %s >%s 2>&1' % (user_config.http2_mode,http2_uris[0], ('true' if user_config.http2_log else 'false'), user_config.http2_delay,user_config.http2_params, log_file) 
+                _INF('Executing cmd: %s' % cmd)
+                answer = NODE_TG.run_command(cmd, allow_local_execution = True)
+                _DEB('\tAnswer cmd: %s ' % answer)
+                result = NODE_TG.get_result_code()
+                _DEB('\tResult code cmd: %d ' % result)
+                if result:
+                    error_info = 'Error when starting Http Server2: %s ' % answer
+                    _ERR(error_info)
+                    raise st_command.CommandFailure(error_info)
+                else:
+                    exit_info = 'HttpServer2 process started successfully'
+                    _INF(exit_info)
+                    quit_program(st_command.SUCCESS, exit_info)
+            else:
+                error_info = 'URIS information for Http Server2 not found. Unable to start process.'
+                _ERR(error_info)
+                quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.ClissError as e:
+        error_info = '%s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info.split('\n')[0])
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawTextHelpFormatter,
+                        description=textwrap.dedent('''\
+Script to check if the Http Server process are running on a Traffic Generator. '''),
+                        epilog=textwrap.dedent(st_command.get_exit_status()))
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('--host',
+                        default=None, action='store',
+                        help='Hostname or IP address of the TG where the Http Server processes are checked. Default: The local hostname where the command is executed.',
+                        dest='host')
+
+    access_params.add_argument('--tg-port',
+                      action='store', default=22,
+                      help='Port used in ssh. Default value is 22',
+                      dest='tg_port')
+
+    access_params.add_argument('--tg-user',
+                      action='store', default=USERID,
+                      help='User for ssh. User connected right now %(default)s',
+                      dest='tg_user')
+
+    access_params.add_argument('--password',
+                      action='store', default=None,
+                      help='Password used in ssh. Not used by default',
+                      dest='tg_password')
+
+    access_params.add_argument('-n','--node',
+                        default=None, action='store',
+                        help='''OAM  IP address of the node.
+If ommitted local hostname will be used to find env in rosetta
+''',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh. Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh. Default value is "com-emergency"',
+                      dest='user')
+
+    http_params = parser.add_argument_group('HTTP servers options ')
+    http_params.add_argument('--http-servers',
+                      action='store', default='ALL',
+                      choices=['1','2','ALL'],
+                      help='Type of Http Server to check if it is running. By default is "%(default)s".',
+                      dest='http_server_type')
+
+    http_params.add_argument('--http1-delay',
+                      action='store', default=60,
+                      help='Interval in secs to print request count. By default is 60 seconds',
+                      dest='http1_delay')
+
+    http_params.add_argument('--http1-log',
+                      action='store_true', default=False,
+                      help='To show request body on the screen. By default is False. Select only to activate logs.',
+                      dest='http1_log')
+
+    http_params.add_argument('--http2-delay',
+                      action='store', default=60,
+                      help='Interval in secs to print request count. By default is "%(default)s" seconds',
+                      dest='http2_delay')
+
+    http_params.add_argument('--http2-mode',
+                      action='store', default=0,
+                      help='tls mode: 0-cleartext, 1-MutualTLS, 2-SimpleTLS (default 0).',
+                      dest='http2_mode')
+
+    http_params.add_argument('--http2-log',
+                      action='store_true', default=False,
+                      help='To swith the log ON/OFF. By default if OFF (false). Select only to switch ON.',
+                      dest='http2_log')
+
+    http_params.add_argument('--http2-params',
+                      action='store', default='',
+                      help='To set directly any other parameter for Http Server2',
+                      dest='http2_params')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(check_http_servers_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'check_http_servers_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+
+    set_userid(args.user)
+
+    return (args)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

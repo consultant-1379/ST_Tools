@@ -1,0 +1,1508 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+import xml.etree.ElementTree as ET
+import glob
+
+
+import ntpath
+import signal
+import textwrap
+import socket
+import getpass
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services as rosetta_services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+import hss_utils
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt("Signal handler")
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+# Dictionary where we are going to report the info of the TCs executions
+Info_dict = {}
+TCS_dict = {}
+NODE=None
+LIST_TARGZ_DELETE = []
+REPORT_LATENCY_IMS = False
+REPORT_LATENCY_EPC = False
+REPORT_LATENCY_EPC_ESM10 = False
+APP_LOGS = ['SERVICES', 'AUTHENTICATION', 'EXT_DB', 'OAM', 'RADIUS', 'HTTP', 'MAP', 'VDICOS', 'DIAMETER', 'CMF', 'OTHER']
+
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+
+def quit_program(exit_code):
+    global NODE
+    if NODE:
+        NODE.release()
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+def init_tcs_dict():
+    TCS_list = ['TC-CROB-0100', 'TC-CROB-0500', 'TC-CROB-0502', 'TC-CROB-0507', 'TC-CROB-0600', 'TC-CROB-0607', 'TC-CROB-0608', 'TC-CROB-0609', 'TC-CROB-0610', 'TC-CACC-0202', 'TC-CACC-0210', 'TC-CACC-0211', 'TC-CACC-0214', 'TC-CACC-0150-EPM-EPC-BASE', 'TC-CACC-0150-EPM-EPC', 'TC-CACC-0150-EPM-IMS-BASE', 'TC-CACC-0150-EPM-IMS', 'TC-CACC-0151-KPI-EPC-BASE', 'TC-CACC-0151-KPI-EPC', 'TC-CACC-0502', 'TC-CSTAB-EPC-IMS-1HOUR', 'TC-CSTAB-0250', 'TC-CSTAB-0350']
+    for tc_name in TCS_list:
+        TCS_dict[tc_name] = False
+
+def get_latencies_tcs(work_dir, tc_file):
+    global Info_dict
+    global REPORT_LATENCY_IMS
+    global REPORT_LATENCY_EPC
+    global REPORT_LATENCY_EPC_ESM10
+
+    IMS_codes = ['308', '300', '301', '302', '303', '306']
+    EPC_codes = ['321', '318', '316']
+    EPC_ESM10_codes = ['318', '316']
+    if 'IMS' in tc_file:
+        Traf_codes = IMS_codes
+        REPORT_LATENCY_IMS=True
+        _DEB('Setting REPORT_LATENCY_IMS to %s for file %s' % (REPORT_LATENCY_IMS,tc_file))
+    else:
+        _DEB('Setting REPORT_LATENCY_EPC to %s for file %s' % (REPORT_LATENCY_EPC,tc_file))
+        if 'CACC-0151' in tc_file:
+            Traf_codes = EPC_ESM10_codes
+            REPORT_LATENCY_EPC_ESM10=True
+            _DEB('Setting REPORT_LATENCY_EPC_ESM10 to %s for file %s' % (REPORT_LATENCY_EPC_ESM10,tc_file))
+        else:
+            Traf_codes = EPC_codes
+            REPORT_LATENCY_EPC=True
+            _DEB('Setting REPORT_LATENCY_EPC to %s for file %s' % (REPORT_LATENCY_EPC,tc_file))
+
+    # Initializing  all the codes by default just in case some of them are not reported in the summary file
+    lat_ref = False  # Sometimes the REF values does not appear in the summary.txt file
+    for tc_code in Traf_codes:
+        tc_index = '%s_Latency_code_%s_AVG' % (tc_file.split('_')[0],tc_code)
+        Info_dict[tc_index] = 'N/A'
+        tc_index = '%s_Latency_code_%s_AVG_REF' % (tc_file.split('_')[0],tc_code)
+        Info_dict[tc_index] = 'N/A'
+        tc_index = '%s_Latency_code_%s_AVG_DEV' % (tc_file.split('_')[0],tc_code)
+        Info_dict[tc_index] = 'N/A'
+        tc_index = '%s_Latency_code_%s_AVG_DEV_REF' % (tc_file.split('_')[0],tc_code)
+        Info_dict[tc_index] = 'N/A'
+        tc_index = '%s_Latency_code_%s_STD_DEV' % (tc_file.split('_')[0],tc_code)
+        Info_dict[tc_index] = 'N/A'
+        tc_index = '%s_Latency_code_%s_STD_DEV_REF' % (tc_file.split('_')[0],tc_code)
+        Info_dict[tc_index] = 'N/A'
+
+    _INF('Getting Latency info from the file %s ' % tc_file)
+    cmd = 'grep -A9 "Latency report" %s/%s/summary.txt | awk \'{print $0}\' ' % (work_dir, tc_file)
+    stdout_value, returncode = st_command.execute_cmd(cmd)
+    if len(stdout_value):
+        for tc_info in stdout_value.splitlines():
+            if tc_info: # Avoiding empty lines
+                _DEB('latencies tc_info:%s ' % tc_info)
+                if 'Cmd code' in tc_info:
+                    if 'Ref' in tc_info:
+                        lat_ref = True
+                        _DEB('REF latencies reported:%s ' % lat_ref)
+
+                tc_info_code = tc_info.split()[0]
+                if tc_info_code in Traf_codes:
+                    lat_idx = 1
+                    tc_info_index = '%s_Latency_code_%s_AVG' % (tc_file.split('_')[0],tc_info_code)
+                    tc_info_value = '%s %s' % (tc_info.split()[lat_idx].replace('+', ''), tc_info.split()[lat_idx+1])
+                    Info_dict[tc_info_index] = tc_info_value
+
+                    if lat_ref:
+                        lat_idx+=2
+                        tc_info_index = '%s_Latency_code_%s_AVG_REF' % (tc_file.split('_')[0],tc_info_code)
+                        tc_info_value = '%s %s' % (tc_info.split()[lat_idx].replace('+', ''), tc_info.split()[lat_idx+1])
+                        Info_dict[tc_info_index] = tc_info_value
+                        _DEB('Adding AVG REF value %s' % tc_info_value)
+
+                    lat_idx+=2
+                    tc_info_index = '%s_Latency_code_%s_STD_DEV' % (tc_file.split('_')[0],tc_info_code)
+                    tc_info_value = '%s %s' % (tc_info.split()[lat_idx].replace('+', ''), tc_info.split()[lat_idx+1])
+                    Info_dict[tc_info_index] = tc_info_value
+
+                    if lat_ref:
+                        lat_idx+=2
+                        tc_info_index = '%s_Latency_code_%s_STD_DEV_REF' % (tc_file.split('_')[0],tc_info_code)
+                        tc_info_value = '%s %s' % (tc_info.split()[lat_idx].replace('+', ''), tc_info.split()[lat_idx+1])
+                        Info_dict[tc_info_index] = tc_info_value
+                        _DEB('Adding AVG REF value %s' % tc_info_value)
+
+                    lat_idx+=2
+                    tc_info_index = '%s_Latency_code_%s_AVG_DEV' % (tc_file.split('_')[0],tc_info_code)
+                    tc_info_value = '%s %s' % (tc_info.split()[lat_idx].replace('+', ''), tc_info.split()[lat_idx+1])
+                    Info_dict[tc_info_index] = tc_info_value
+
+                    if lat_ref:
+                        lat_idx+=2
+                        tc_info_index = '%s_Latency_code_%s_AVG_DEV_REF' % (tc_file.split('_')[0],tc_info_code)
+                        tc_info_value = '%s %s' % (tc_info.split()[lat_idx].replace('+', ''), tc_info.split()[lat_idx+1])
+                        Info_dict[tc_info_index] = tc_info_value
+                        _DEB('Adding AVG REF value %s' % tc_info_value)
+    else:
+        _WRN('Not Latency report info found in the summary file')
+
+
+def get_applogs_info_tcs(work_dir, tc_file):
+    global Info_dict
+
+    tc_name = tc_file.split('_')[0]
+    for applogs_type in APP_LOGS:
+        tc_info_index = '%s_AppLog_%s' % (tc_name, applogs_type)
+        Info_dict[tc_info_index] = 'N/A'
+
+    cmd = 'grep "TOTAL " %s/%s/summary.txt | grep "message logs reported:" ' % (work_dir, tc_file)
+    stdout_value, returncode = st_command.execute_cmd(cmd)
+    if len(stdout_value):
+        for applogs_info in stdout_value.splitlines():
+            applogs_info_type = applogs_info.split()[1]
+            try:
+                applogs_info_value = applogs_info.split()[5]
+            except:
+                applogs_info_value = 'N/A'
+            _DEB('Total %s messages logs: %s' % (applogs_info_type, applogs_info_value))
+            if applogs_info_type in APP_LOGS:
+                tc_info_index = '%s_AppLog_%s' % (tc_name, applogs_info_type)
+                Info_dict[tc_info_index] = applogs_info_value
+            else:
+                # WA to solve the problem that HSS_CheckApplogs reports with both MPV and MAP for the same
+                if applogs_info_type == 'MPV':
+                    tc_info_index = '%s_AppLog_MAP' % tc_name
+                    Info_dict[tc_info_index] = applogs_info_value
+                else:
+                    _WRN('%s messages logs found but not expected: %s' % (applogs_info_type, applogs_info_value))
+    else:
+        _WRN('Not APP LOGS info found in the summary file %s' % tc_file)
+
+
+
+
+def get_error_rate_tcs(work_dir, tc_file):
+    global Info_dict
+    cmd = 'grep -e "Log Directory" -e "ErrorRate loadgen Phase" %s/%s/summary.txt | awk \'{print $0}\' ' % (work_dir, tc_file)
+    stdout_value, returncode = st_command.execute_cmd(cmd)
+    if len(stdout_value):
+        tc_name = tc_file.split('_')[0]
+        TCS_dict[tc_name] = True
+        _DEB('Setting TC %s as True' % tc_name)
+        for tc_info in stdout_value.splitlines():
+            if 'Log Directory' in tc_info:
+                tc_info_index1 = '%s_Error_Rate_%s' % (tc_file.split('_')[0],tc_info.split('/')[-1])
+                tc_info_index2 = '%s_Error_Msgs_%s' % (tc_file.split('_')[0],tc_info.split('/')[-1])
+            else:
+                tc_info_error_rate = '%s' % tc_info.split()[0].replace('+', '')
+                #tc_info_error_msgs = '%s' % tc_info.split()[-1]
+                tc_info_error_msgs = '%s' % re.sub('[()]','',tc_info.split()[-1])
+                Info_dict[tc_info_index1] = tc_info_error_rate
+                Info_dict[tc_info_index2] = tc_info_error_msgs
+    else:
+        _WRN('Not BAT Error Rate found in the summary file')
+
+    # Checking Load Stability errors
+    cmd = 'grep -A1 "Load Stability" %s/%s/summary.txt | awk \'{print $0}\' ' % (work_dir, tc_file)
+    stdout_value, returncode = st_command.execute_cmd(cmd)
+    if len(stdout_value):
+        tc_info_index = '%s_Load_Stab_Error' % tc_file.split('_')[0]
+        Info_dict[tc_info_index] = 'Load Stability SUCCESS'
+        if 'FAILED' in stdout_value:
+            for tc_info in stdout_value.splitlines():
+                if not 'Load Stability' in tc_info:
+                    tc_info_error_load = '%s' % (' '.join(tc_info.split()[2:]))
+                    Info_dict[tc_info_index] = tc_info_error_load
+    else:
+        _WRN('Not Load Stability info found in the summary file')
+        tc_info_index = '%s_Load_Stab_Error' % tc_file.split('_')[0]
+        Info_dict[tc_info_index] = 'Load Stability NOT REPORTED'
+
+    cmd = 'grep -A1 "Scenario Error rate" %s/%s/summary.txt | awk \'{print $0}\' ' % (work_dir, tc_file)
+    stdout_value, returncode = st_command.execute_cmd(cmd)
+    if len(stdout_value):
+        tc_info_index = '%s_Scenario_Error_Rate' % tc_file.split('_')[0]
+        Info_dict[tc_info_index] = 'Scenario Rate  SUCCESS'
+        if 'FAILED' in stdout_value:
+            for tc_info in stdout_value.splitlines():
+                if not 'Scenario Error rate' in tc_info:
+                    tc_info_error = '%s' % (' '.join(tc_info.split()[6:]))
+                    Info_dict[tc_info_index] = tc_info_error
+    else:
+        _WRN('Not Scenario Error rate info found in the summary file')
+        tc_info_index = '%s_Scenario_Error_Rate' % tc_file.split('_')[0]
+        Info_dict[tc_info_index] = 'Scenario Rate  NOT REPORTED'
+
+
+def get_report_tcs(work_dir):
+    global Info_dict
+    from_hss_version = ''
+    upgrade_phase_list = ['PRE', 'MAIN', 'POST', 'ROLLBACK']
+    _INF('Getting report from directory %s' % work_dir)
+    file_list= sorted(glob.glob("%s/TC*" % work_dir))
+    #_INF('file list: %s ' % file_list)
+
+    num_files = len(file_list)
+    if num_files== 0:
+        _WRN('No TCs executed from the tar.gz file analyzed')
+        return 0
+
+    _INF('Parsing %s input files' % num_files)
+    cmd = 'ls %s | grep TC' % (work_dir)
+    stdout_value, returncode = st_command.execute_cmd(cmd)
+    if returncode:
+        _ERR('Error executing: %s' % cmd)
+        quit_program(EXECUTION_ERROR)
+    for tc_file in stdout_value.splitlines():
+        _INF('Analyzing file %s ' % tc_file)
+        if 'TC-CROB-0600' in tc_file:
+            Info_dict["TC-CROB-0600_Rebooting_time_1"] = 'N/A'
+            Info_dict["TC-CROB-0600_Rebooting_time_2"] = 'N/A'
+            cmd = 'grep drbd_switchover %s/%s/summary.txt | awk \'{print $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('drbd_switchover values:%s ' % stdout_value)
+                tc_info_id=1
+                for tc_info_time in stdout_value.splitlines():
+                    tc_info_index = '%s_Rebooting_time_%d' % (tc_file.split('_')[0],tc_info_id)
+                    Info_dict[tc_info_index] = tc_info_time
+                    tc_info_id +=1
+            else:
+                _WRN('Not Locking SC information found in the summary file')
+
+        if 'TC-CROB-0607' in tc_file:
+            Info_dict["TC-CROB-0607_Locking_time_1"] = 'N/A'
+            Info_dict["TC-CROB-0607_Locking_time_2"] = 'N/A'
+            Info_dict["TC-CROB-0607_Locking_time_3"] = 'N/A'
+            Info_dict["TC-CROB-0607_Locking_time_4"] = 'N/A'
+            Info_dict["TC-CROB-0607_Unlocking_time_1"] = 'N/A'
+            Info_dict["TC-CROB-0607_Unlocking_time_2"] = 'N/A'
+            Info_dict["TC-CROB-0607_Unlocking_time_3"] = 'N/A'
+            Info_dict["TC-CROB-0607_Unlocking_time_4"] = 'N/A'
+
+            cmd = 'grep Locking %s/%s/summary.txt | awk \'{print $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Locking values:%s ' % stdout_value)
+                tc_info_id=1
+                for tc_info_time in stdout_value.splitlines():
+                    tc_info_index = '%s_Locking_time_%d' % (tc_file.split('_')[0],tc_info_id)
+                    Info_dict[tc_info_index] = tc_info_time
+                    tc_info_id +=1
+            else:
+                _WRN('Not Locking SC information found in the summary file')
+
+            cmd = 'grep Unlocking %s/%s/summary.txt | awk \'{print $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Unlocking values:%s ' % stdout_value)
+                tc_info_id=1
+                for tc_info_time in stdout_value.splitlines():
+                    tc_info_index = '%s_Unlocking_time_%d' % (tc_file.split('_')[0],tc_info_id)
+                    Info_dict[tc_info_index] = tc_info_time
+                    tc_info_id +=1
+            else:
+                _WRN('Not Unlocking SC information found in the summary file')
+
+        if 'TC-CROB-0608' in tc_file:
+            cmd = 'grep Locking %s/%s/summary.txt | awk \'{print $2,$NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Locking values:%s ' % stdout_value)
+                for tc_info in stdout_value.splitlines():
+                    pl_name = tc_info.split()[0]
+                    if pl_name in LIST_PLS:
+                        _DEB('pl_name %s found in the LIST_PLS' % pl_name)
+                    tc_info_index = '%s_Locking_time_%s' % (tc_file.split('_')[0],pl_name)
+                    Info_dict[tc_info_index] = tc_info.split()[1]
+            else:
+                _WRN('Not Locking information for PLs found in the summary file')
+
+            cmd = 'grep Unlocking %s/%s/summary.txt | awk \'{print $2,$NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Unlocking values:%s ' % stdout_value)
+                for tc_info in stdout_value.splitlines():
+                    tc_info_index = '%s_Unlocking_time_%s' % (tc_file.split('_')[0],tc_info.split()[0])
+                    Info_dict[tc_info_index] = tc_info.split()[1]
+                    tc_info_id +=1
+            else:
+                _WRN('Not Unlocking information for PLs found in the summary file')
+
+        if 'TC-CROB-0609' in tc_file:
+            cmd = 'grep Reboot %s/%s/summary.txt | awk \'{print $2,$NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Reboot values:%s ' % stdout_value)
+                for tc_info in stdout_value.splitlines():
+                    tc_info_index = '%s_Reboot_time_%s' % (tc_file.split('_')[0],tc_info.split()[0])
+                    Info_dict[tc_info_index] = tc_info.split()[1]
+            else:
+                _WRN('Not Reboot information for PLs found in the summary file')
+
+        if 'TC-CACC-0214' in tc_file:
+            from_hss_version = ' from  %s' % tc_file.split('-')[5]
+            for phase in upgrade_phase_list:
+                tc_info_index = '%s_Upgrade_Phase_time_%s' % (tc_file.split('_')[0],phase)
+                Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "Time check:" %s/%s/summary.txt | awk \'{print $4,$8, $9, $10, $11}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Upgrade Phases Times:%s ' % stdout_value)
+                for tc_info in stdout_value.splitlines():
+                    tc_info_index = '%s_Upgrade_Phase_time_%s' % (tc_file.split('_')[0],tc_info.split()[0])
+                    tc_info_time = '%s' % (' '.join(tc_info.split()[1:]))
+                    Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not Upgrade Time for the Phases found in the summary file')
+
+            tc_info_index = '%s_Restore_after_Upgrade_time' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "Restore Backup Time" %s/%s/summary.txt | awk \'{print $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Restore Backup Time:%s ' % stdout_value)
+                for tc_info in stdout_value.splitlines():
+                    tc_info_index = '%s_Restore_after_Upgrade_time' % tc_file.split('_')[0]
+                    tc_info_time = '%s secs' % tc_info.split()[0]
+                    Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not Restore Backup Time after Upgrade found in the summary file')
+
+            tc_info_index = '%s_Reload_after_Upgrade_time' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "Reload Time" %s/%s/summary.txt | awk \'{print $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Reload Time:%s ' % stdout_value)
+                for tc_info in stdout_value.splitlines():
+                    tc_info_index = '%s_Reload_after_Upgrade_time' % tc_file.split('_')[0]
+                    try:
+                        tc_info_time = '%.2f secs' % float(tc_info.split()[0])
+                    except:
+                        tc_info_time = 'N/A'
+                    Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not Reload Time after Upgrade found in the summary file')
+
+
+        if 'TC-CACC-0210' in tc_file:
+            for phase in upgrade_phase_list:
+                tc_info_index = '%s_Dummy_Upgrade_Phase_time_%s' % (tc_file.split('_')[0],phase)
+                tc_info_time = 'N/A' 
+                Info_dict[tc_info_index] = tc_info_time
+            cmd = 'grep "Time check:" %s/%s/summary.txt | awk \'{print $4,$8, $9, $10, $11}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Dummy_Upgrade Phases Times:%s ' % stdout_value)
+                for tc_info in stdout_value.splitlines():
+                    tc_info_index = '%s_Dummy_Upgrade_Phase_time_%s' % (tc_file.split('_')[0],tc_info.split()[0])
+                    tc_info_time = '%s' % (' '.join(tc_info.split()[1:]))
+                    Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not Dummy_Upgrade Time for the Phases found in the summary file')
+
+
+        if 'TC-CACC-0202' in tc_file:
+            tc_info_index = '%s_Create_Backup_time' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            tc_info_index = '%s_Create_Backup_size' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "Create Backup" %s/%s/summary.txt | awk \'{print $7, $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Create Backup info:%s ' % stdout_value)
+                tc_info = stdout_value
+                tc_info_index = '%s_Create_Backup_time' % tc_file.split('_')[0]
+                try:
+                    tc_info_time = '%.2f secs' % float(tc_info.split()[0])
+                except:
+                    tc_info_time = 'N/A'
+                Info_dict[tc_info_index] = tc_info_time
+                tc_info_index = '%s_Create_Backup_size' % tc_file.split('_')[0]
+                Info_dict[tc_info_index] = tc_info.split()[1]
+            else:
+                _WRN('Not Create Backup info found in the summary file')
+
+            tc_info_index = '%s_Delete_Backup_time' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "Delete Backup" %s/%s/summary.txt | awk \'{print $7}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Delete Backup info:%s ' % stdout_value)
+                tc_info = stdout_value
+                tc_info_index = '%s_Delete_Backup_time' % tc_file.split('_')[0]
+                try:
+                    tc_info_time = '%.2f secs' % float(tc_info.split()[0])
+                except:
+                    tc_info_time = 'N/A'
+                Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not Delete Backup info found in the summary file')
+
+            tc_info_index = '%s_Restore_Backup_time' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            tc_info_index = '%s_Restore_Reload_time' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "Restore Backup" %s/%s/summary.txt | awk \'{print $8, $(NF-1)}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Restore Backup info:%s ' % stdout_value)
+                tc_info = stdout_value
+                tc_info_index = '%s_Restore_Backup_time' % tc_file.split('_')[0]
+                tc_info_time = '%s secs' % tc_info.split()[0]
+                Info_dict[tc_info_index] = tc_info_time
+                tc_info_index = '%s_Restore_Reload_time' % tc_file.split('_')[0]
+                try:
+                    tc_info_time = '%.2f secs' % float(tc_info.split()[1])
+                except:
+                    tc_info_time = 'N/A'
+                Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not Restore Backup info found in the summary file')
+
+        # TC-CACC-0502_HSS-FE-BACKWARD-COMPATIBILITY
+        if 'TC-CACC-0502' in tc_file:
+            tc_info_index = '%s_Restore' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "Restore Backup Time" %s/%s/summary.txt | awk \'{print $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Restore Backup Time:%s ' % stdout_value)
+                for tc_info in stdout_value.splitlines():
+                    tc_info_index = '%s_Restore' % tc_file.split('_')[0]
+                    try:
+                        tc_info_time = '%.2f secs' % float(tc_info.split()[0])
+                    except:
+                        tc_info_time = 'N/A'
+                    Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not Restore Backup Time after Upgrade found in the summary file')
+
+            tc_info_index = '%s_Reload' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "Reload Time" %s/%s/summary.txt | awk \'{print $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Reload Time:%s ' % stdout_value)
+                for tc_info in stdout_value.splitlines():
+                    tc_info_index = '%s_Reload' % tc_file.split('_')[0]
+                    try:
+                        tc_info_time = '%.2f secs' % float(tc_info.split()[0])
+                    except:
+                        tc_info_time = 'N/A'
+                    Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not Reload Time after Upgrade found in the summary file')
+
+        if 'TC-CROB-0100' in tc_file:
+            tc_info_index = '%s_Cluster_Reboot_time' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "Cluster Reboot" %s/%s/summary.txt | awk \'{print $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Cluster Reboot info:%s ' % stdout_value)
+                tc_info = stdout_value
+                tc_info_index = '%s_Cluster_Reboot_time' % tc_file.split('_')[0]
+                try:
+                    tc_info_time = '%.2f secs' % float(tc_info.split()[0])
+                except:
+                    tc_info_time = 'N/A'
+                Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not Cluster Reboot info found in the summary file')
+
+            tc_info_index = '%s_CMW_Reboot_time' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "CMW Reboot" %s/%s/summary.txt | awk \'{print $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('CMW Reboot info:%s ' % stdout_value)
+                tc_info = stdout_value
+                tc_info_index = '%s_CMW_Reboot_time' % tc_file.split('_')[0]
+                try:
+                    tc_info_time = '%.2f secs' % float(tc_info.split()[0])
+                except:
+                    tc_info_time = 'N/A'
+                Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not CMW Reboot info found in the summary file')
+
+            tc_info_index = '%s_Cluster_Reload_time' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "Cluster Reload" %s/%s/summary.txt | awk \'{print $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('Cluster Reload info:%s ' % stdout_value)
+                tc_info = stdout_value
+                tc_info_index = '%s_Cluster_Reload_time' % tc_file.split('_')[0]
+                try:
+                    tc_info_time = '%.2f secs' % float(tc_info.split()[0])
+                except:
+                    tc_info_time = 'N/A'
+                Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not Cluster Reload info found in the summary file')
+
+
+        if 'TC-CACC-0150' in tc_file and 'BASE' not in tc_file:
+            get_latencies_tcs(work_dir, tc_file)
+
+        if 'TC-CACC-0151' in tc_file and 'BASE' not in tc_file:
+            get_latencies_tcs(work_dir, tc_file)
+
+        if 'TC-CROB-0502' in tc_file:
+            tc_info_index = '%s_Stack_Restart_time' % tc_file.split('_')[0]
+            Info_dict[tc_info_index] = 'N/A'
+            cmd = 'grep "SS7 Stack Reset" %s/%s/summary.txt | awk \'{print $NF}\' ' % (work_dir, tc_file)
+            stdout_value, returncode = st_command.execute_cmd(cmd)
+            if len(stdout_value):
+                ##_INF('SS7 Stack Reset info:%s ' % stdout_value)
+                tc_info = stdout_value
+                try:
+                    tc_info_time = '%.2f secs' % float(tc_info.split()[0])
+                except:
+                    tc_info_time = 'N/A'
+                Info_dict[tc_info_index] = tc_info_time
+            else:
+                _WRN('Not SS7 Stack Reset info found in the summary file')
+
+
+        get_error_rate_tcs(work_dir, tc_file)
+        get_applogs_info_tcs(work_dir, tc_file)
+
+    return from_hss_version
+
+
+
+def print_report_applogs_cl2(work_dir, HSS_RELEASE, type_report='Native', from_version=''):
+    global Info_dict
+    try:
+        text_str = ' '
+        text_str += '%s %s, , ' % (HSS_RELEASE, from_version)
+
+        # Upgrade & Rollback Error Rate
+        if TCS_dict['TC-CACC-0214']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0214_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CACC-0214')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0214_AppLog_%s' % applogs_type
+                text_str += 'N/A, ' 
+        text_str += ', '
+
+        # 1 hour EPC-IMS stability Error Rate
+        if TCS_dict['TC-CSTAB-EPC-IMS-1HOUR']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CSTAB-EPC-IMS-1HOUR_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CSTAB-EPC-IMS-1HOUR')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CSTAB-EPC-IMS-1HOUR_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # Stability IMS Error Rate
+        if TCS_dict['TC-CSTAB-0250']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CSTAB-0250_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CSTAB-0250')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CSTAB-0250_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # Stability EPC Error Rate
+        if TCS_dict['TC-CSTAB-0350']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CSTAB-0350_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CSTAB-0350')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CSTAB-0350_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # Dummy Upgrade Error Rate
+        if TCS_dict['TC-CACC-0210']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0210_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CACC-0210')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0210_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # LOCK/UNLOCK SCs Error Rate
+        if TCS_dict['TC-CROB-0607']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0607_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CROB-0607')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0607_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # LOCK/UNLOCK PLs Error Rate
+        if TCS_dict['TC-CROB-0608']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0608_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CROB-0608')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0608_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # PLs Reboot Error Rate
+        if TCS_dict['TC-CROB-0609']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0609_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CROB-0609')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0609_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # Backward-Compatibility Error Rate
+        if TCS_dict['TC-CACC-0502']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0502_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CACC-0502')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0502_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # Create, Restore, Delete  Error Rate
+        if TCS_dict['TC-CACC-0202']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0202_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CACC-0202')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0202_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # EPM-EPC Base Error Rate
+        if TCS_dict['TC-CACC-0150-EPM-EPC-BASE']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0150-EPM-EPC-BASE_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CACC-0150-EPM-EPC-BASE')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0150-EPM-EPC-BASE_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # EPM-IMS Base Error Rate
+        if TCS_dict['TC-CACC-0150-EPM-IMS-BASE']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0150-EPM-IMS-BASE_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CACC-0150-EPM-IMS-BASE')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0150-EPM-IMS-BASE_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # EPM-EPC ESM-10 Base Error Rate
+        if TCS_dict['TC-CACC-0151-KPI-EPC-BASE']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0151-KPI-EPC-BASE_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CACC-0151-KPI-EPC-BASE')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0151-KPI-EPC-BASE_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # EPM-EPC Error Rate
+        if TCS_dict['TC-CACC-0150-EPM-EPC']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0150-EPM-EPC_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CACC-0150-EPM-EPC')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0150-EPM-EPC_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # EPM-IMS Error Rate
+        if TCS_dict['TC-CACC-0150-EPM-IMS']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0150-EPM-IMS_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CACC-0150-EPM-IMS')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0150-EPM-IMS_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # KPI-EPC ESM-10 Error Rate
+        if TCS_dict['TC-CACC-0151-KPI-EPC']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0151-KPI-EPC_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CACC-0151-KPI-EPC')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CACC-0151-KPI-EPC_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # MAP-NO-ANSWER-FROM-HLR
+        if TCS_dict['TC-CROB-0500']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0500_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CROB-0500')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0500_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # MAP-SS7-STACK-RESTART
+        if TCS_dict['TC-CROB-0502']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0502_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CROB-0502')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0502_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # RESTART SC AND  SWITCHOVER
+        if TCS_dict['TC-CROB-0600']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0600_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CROB-0600')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0600_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+        # HSS-RELOAD
+        if TCS_dict['TC-CROB-0100']:
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0100_AppLog_%s' % applogs_type
+                text_str += '%s, ' % Info_dict[tc_info_index]
+        else:
+            _DEB('Not info available for TC-CROB-0100')
+            for applogs_type in APP_LOGS:
+                tc_info_index = 'TC-CROB-0100_AppLog_%s' % applogs_type
+                text_str += 'N/A, '
+        text_str += ', '
+
+
+        with open("%s/%s_%s_AppLogs_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+            text_file.write('%s\n' % text_str)
+        _DEB('AppLogs info saved:%s' % text_str)
+
+    except KeyError as e:
+        _DEB('Exception KeyError when reporting:%s ' % e)
+        pass
+    except Exception as e:
+        _DEB('Exception when reporting:%s ' % e)
+        pass
+
+
+def print_report_latencies_cl2(work_dir, HSS_RELEASE, type_report='Native', from_version=''):
+    global REPORT_LATENCY_IMS
+    global REPORT_LATENCY_EPC
+    global REPORT_LATENCY_EPC_ESM10
+    global Info_dict
+    IMS_codes = ['308', '300', '301', '302', '303', '306']
+    EPC_codes = ['321', '318', '316']
+    EPC_ESM10_codes = ['318', '316']
+
+    with open("%s/%s_%s_EPC_Latencies_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        Traf_codes = EPC_codes
+        text_str = ' '
+        for tr_code in Traf_codes:
+            if REPORT_LATENCY_EPC:
+                prefix_idx = 'TC-CACC-0150-EPM-EPC_Latency_code'
+                idx_avg = '%s_%s_AVG' % (prefix_idx, tr_code)
+                idx_avg_base = '%s_%s_AVG_REF' % (prefix_idx, tr_code)
+                idx_std_dev = '%s_%s_STD_DEV' % (prefix_idx, tr_code)
+                idx_std_dev_base = '%s_%s_STD_DEV_REF' % (prefix_idx, tr_code)
+                idx_avg_dev = '%s_%s_AVG_DEV' % (prefix_idx, tr_code)
+                idx_avg_dev_base = '%s_%s_AVG_DEV_REF' % (prefix_idx, tr_code)
+                text_str += '%s %s,' % (HSS_RELEASE, from_version)
+                text_str += ' %s, %s, %s, %s, %s, %s, ,' % (Info_dict[idx_avg], Info_dict[idx_avg_base], Info_dict[idx_std_dev], Info_dict[idx_std_dev_base], Info_dict[idx_avg_dev], Info_dict[idx_avg_dev_base])
+            else:
+                _DEB('Reporting with REPORT_LATENCY_EPC=%s ' % REPORT_LATENCY_EPC)
+                text_str += '%s %s,' % (HSS_RELEASE, from_version)
+                text_str += ' N/A, N/A, N/A, N/A, N/A, N/A, ,'
+
+        # Latencies for TC-CACC-0151  ESM10 script only
+        Traf_codes = EPC_ESM10_codes
+        for tr_code in Traf_codes:
+            if REPORT_LATENCY_EPC_ESM10:
+                prefix_idx = 'TC-CACC-0151-KPI-EPC_Latency_code'
+                idx_avg = '%s_%s_AVG' % (prefix_idx, tr_code)
+                idx_avg_base = '%s_%s_AVG_REF' % (prefix_idx, tr_code)
+                idx_std_dev = '%s_%s_STD_DEV' % (prefix_idx, tr_code)
+                idx_std_dev_base = '%s_%s_STD_DEV_REF' % (prefix_idx, tr_code)
+                idx_avg_dev = '%s_%s_AVG_DEV' % (prefix_idx, tr_code)
+                idx_avg_dev_base = '%s_%s_AVG_DEV_REF' % (prefix_idx, tr_code)
+                text_str += '%s %s,' % (HSS_RELEASE, from_version)
+                text_str += ' %s, %s, %s, %s, %s, %s, ,' % (Info_dict[idx_avg], Info_dict[idx_avg_base], Info_dict[idx_std_dev], Info_dict[idx_std_dev_base], Info_dict[idx_avg_dev], Info_dict[idx_avg_dev_base])
+            else:
+                text_str += '%s %s,' % (HSS_RELEASE, from_version)
+                text_str += ' N/A, N/A, N/A, N/A, N/A, N/A, ,'
+
+        text_file.write('%s\n' % text_str)
+        _DEB('INFO for EPC Latency is:%s' % text_str)
+
+    with open("%s/%s_%s_IMS_Latencies_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        Traf_codes = IMS_codes
+        text_str = ' '
+        for tr_code in Traf_codes:
+            if REPORT_LATENCY_IMS:
+                prefix_idx = 'TC-CACC-0150-EPM-IMS_Latency_code'
+                idx_avg = '%s_%s_AVG' % (prefix_idx, tr_code)
+                idx_avg_base = '%s_%s_AVG_REF' % (prefix_idx, tr_code)
+                idx_std_dev = '%s_%s_STD_DEV' % (prefix_idx, tr_code)
+                idx_std_dev_base = '%s_%s_STD_DEV_REF' % (prefix_idx, tr_code)
+                idx_avg_dev = '%s_%s_AVG_DEV' % (prefix_idx, tr_code)
+                idx_avg_dev_base = '%s_%s_AVG_DEV_REF' % (prefix_idx, tr_code)
+                text_str += '%s %s,' % (HSS_RELEASE, from_version)
+                text_str += ' %s, %s, %s, %s, %s, %s, ,' % (Info_dict[idx_avg], Info_dict[idx_avg_base], Info_dict[idx_std_dev], Info_dict[idx_std_dev_base], Info_dict[idx_avg_dev], Info_dict[idx_avg_dev_base])
+            else:
+                text_str += '%s %s,' % (HSS_RELEASE, from_version)
+                text_str += ' N/A, N/A, N/A, N/A, N/A, N/A, ,'
+        text_file.write('%s\n' % text_str)
+        _DEB('INFO for IMS Latency with REPORT_LATENCY=%s is:%s' % (REPORT_LATENCY_IMS, text_str))
+
+
+def print_report_reloads_cl2(work_dir,HSS_RELEASE,type_report='Native', from_version=''):
+    global Info_dict
+    text_str = ' '
+    text_str += '%s %s, ,' % (HSS_RELEASE, from_version)
+
+    # Upgrade & Rollback Times
+    if TCS_dict['TC-CACC-0214']:
+        text_str += ' %s, %s, %s, %s, ' % (Info_dict["TC-CACC-0214_Upgrade_Phase_time_PRE"], Info_dict["TC-CACC-0214_Upgrade_Phase_time_POST"], Info_dict["TC-CACC-0214_Upgrade_Phase_time_MAIN"], Info_dict["TC-CACC-0214_Upgrade_Phase_time_ROLLBACK"])
+        text_str += ' %s, %s' % (Info_dict["TC-CACC-0214_Restore_after_Upgrade_time"], Info_dict["TC-CACC-0214_Reload_after_Upgrade_time"])
+    else:
+        _DEB('Not info available for TC-CACC-0214')
+        text_str += ' N/A, N/A, N/A, N/A,'
+        text_str += ' N/A, N/A'
+
+    # Dummy Upgrade Times
+    if TCS_dict['TC-CACC-0210']:
+        text_str += ', , %s, %s, %s' % (Info_dict["TC-CACC-0210_Dummy_Upgrade_Phase_time_PRE"], Info_dict["TC-CACC-0210_Dummy_Upgrade_Phase_time_POST"], Info_dict["TC-CACC-0210_Dummy_Upgrade_Phase_time_MAIN"])
+    else:
+        _DEB('Not info available for TC-CACC-0210')
+        text_str += ', , N/A, N/A, N/A'
+
+    # Backward-Compatibility Times
+    if TCS_dict['TC-CACC-0502']:
+        text_str += ', %s, %s, ' % (Info_dict["TC-CACC-0502_Restore"], Info_dict["TC-CACC-0502_Reload"])
+    else:
+        _DEB('Not info available for BACKWARD COMPATIBILITY TC-CACC-0502')
+        text_str += ', , , '
+
+    # Backup Operation Times
+    if TCS_dict['TC-CACC-0202']:
+        text_str += ', , %s, %s, %s, %s, %s' % (Info_dict["TC-CACC-0202_Create_Backup_time"], Info_dict["TC-CACC-0202_Delete_Backup_time"], Info_dict["TC-CACC-0202_Restore_Backup_time"], Info_dict["TC-CACC-0202_Restore_Reload_time"], Info_dict["TC-CACC-0202_Create_Backup_size"])
+    else:
+        _DEB('Not info available for TC-CACC-0202')
+        text_str += ', , N/A, N/A, N/A, N/A, N/A'
+
+    # SS7 STACK Restart Times
+    if TCS_dict['TC-CROB-0502']:
+        text_str += ', , %s' % (Info_dict["TC-CROB-0502_Stack_Restart_time"])
+    else:
+        _DEB('Not info available for TC-CROB-0502')
+        text_str += ', , N/A'
+
+    # Reload/Reboot Times
+    if TCS_dict['TC-CROB-0100']:
+        text_str += ', , %s, %s, %s' % (Info_dict["TC-CROB-0100_Cluster_Reboot_time"], Info_dict["TC-CROB-0100_CMW_Reboot_time"], Info_dict["TC-CROB-0100_Cluster_Reload_time"])
+    else:
+        _DEB('Not info available for TC-CROB-0100')
+        text_str += ', , N/A, N/A, N/A'
+
+    with open("%s/%s_%s_Reloads_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        text_file.write('%s\n' % text_str)
+
+
+def print_report_times_cl2(work_dir,HSS_RELEASE,type_report='Native', from_version=''):
+    global Info_dict
+
+    text_str = ' '
+    text_str += '%s %s, ,' % (HSS_RELEASE, from_version)
+    if TCS_dict['TC-CROB-0607']:
+        text_str += ' %s, %s, %s, %s,' % (Info_dict["TC-CROB-0607_Locking_time_1"], Info_dict["TC-CROB-0607_Unlocking_time_1"], Info_dict["TC-CROB-0607_Locking_time_2"], Info_dict["TC-CROB-0607_Unlocking_time_2"])
+        text_str += ' %s, %s, %s, %s' % (Info_dict["TC-CROB-0607_Locking_time_3"], Info_dict["TC-CROB-0607_Locking_time_4"], Info_dict["TC-CROB-0607_Unlocking_time_3"], Info_dict["TC-CROB-0607_Unlocking_time_4"])
+    else:
+        _DEB('Not info available for TC-CROB-0607')
+        text_str += ' N/A, N/A, N/A, N/A,'
+        text_str += ' N/A, N/A, N/A, N/A'
+
+    if TCS_dict['TC-CROB-0600']:
+        text_str += ', , %s, %s,' % (Info_dict["TC-CROB-0600_Rebooting_time_1"], Info_dict["TC-CROB-0600_Rebooting_time_2"])
+    else:
+        _DEB('Not info available for TC-CROB-0600')
+        text_str += ', , N/A, N/A'
+
+    with open("%s/%s_%s_SC_Times_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        text_file.write('%s\n' % text_str)
+    _DEB('SC Times Info saved:%s' % text_str)
+
+    text_str = ' '
+    text_str += '%s %s, ,' % (HSS_RELEASE, from_version)
+    if TCS_dict['TC-CROB-0608']:
+        for pl_name in sorted(LIST_PLS):
+            try:
+                idx_name = 'TC-CROB-0608_Locking_time_%s' % pl_name
+                text_str += ' %s, ' % Info_dict[idx_name]
+            except KeyError as e:
+                _DEB('Exception KeyError in TC-CROB-0608 for PL %s:%s ' % (pl_name, e))
+                text_str += ' N/A, '
+            try:
+                idx_name = 'TC-CROB-0608_Unlocking_time_%s' % pl_name
+                text_str += ' %s, ' % Info_dict[idx_name]
+            except KeyError as e:
+                _DEB('Exception KeyError in TC-CROB-0608 for PL %s:%s ' % (pl_name, e))
+                text_str += ' N/A, '
+    else:
+        _DEB('Not info available for TC-CROB-0608')
+        for pl_name in sorted(LIST_PLS):
+            text_str += ' N/A, N/A, '
+
+    text_str += ', '
+    if TCS_dict['TC-CROB-0609']:
+        for pl_name in sorted(LIST_PLS):
+            try:
+                idx_name = 'TC-CROB-0609_Reboot_time_%s' % pl_name
+                text_str += ' %s, ' % Info_dict[idx_name]
+            except KeyError as e:
+                _DEB('Exception KeyError in TC-CROB-0609 for PL %s:%s ' % (pl_name, e))
+                text_str += ' N/A, '
+    else:
+        _DEB('Not info available for TC-CROB-0609')
+        for pl_name in sorted(LIST_PLS):
+            text_str += ' N/A, '
+
+    with open("%s/%s_%s_PL_Times_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        text_file.write('%s\n' % text_str)
+    _DEB('PL Times info saved:%s' % text_str)
+
+
+def print_report_traffic_error_cl2(work_dir,HSS_RELEASE,type_report='Native', from_version=''):
+    global Info_dict
+    try:
+        text_str = ' '
+        text_str += '%s %s, ,' % (HSS_RELEASE, from_version)
+
+        # Upgrade & Rollback Error Rate
+        if TCS_dict['TC-CACC-0214']:
+            text_str += ' %s %%, %s %%, %s %%, %s %%, ' % (Info_dict["TC-CACC-0214_Error_Rate_BAT_EPC_SYNC"], Info_dict["TC-CACC-0214_Error_Rate_BAT_IMS_SYNC"], Info_dict["TC-CACC-0214_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CACC-0214_Error_Rate_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CACC-0214_Load_Stab_Error"], Info_dict["TC-CACC-0214_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CACC-0214')
+            text_str += ' N/A, N/A, N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # 1 hour EPC-IMS stability Error Rate
+        if TCS_dict['TC-CSTAB-EPC-IMS-1HOUR']:
+            text_str += ', %s, %s, %s, %s, ' % (Info_dict["TC-CSTAB-EPC-IMS-1HOUR_Error_Msgs_BAT_EPC_SYNC"], Info_dict["TC-CSTAB-EPC-IMS-1HOUR_Error_Msgs_BAT_IMS_SYNC"], Info_dict["TC-CSTAB-EPC-IMS-1HOUR_Error_Msgs_BAT_EPC_ASYNC"], Info_dict["TC-CSTAB-EPC-IMS-1HOUR_Error_Msgs_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CSTAB-EPC-IMS-1HOUR_Load_Stab_Error"], Info_dict["TC-CSTAB-EPC-IMS-1HOUR_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CSTAB-EPC-IMS-1HOUR')
+            text_str += ', N/A, N/A, N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # Stability IMS Error Rate
+        if TCS_dict['TC-CSTAB-0250']:
+            text_str += ', %s %%, %s, ' % (Info_dict["TC-CSTAB-0250_Error_Rate_BAT_IMS_ASYNC"], Info_dict["TC-CSTAB-0250_Error_Msgs_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CSTAB-0250_Load_Stab_Error"], Info_dict["TC-CSTAB-0250_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CSTAB-0250')
+            text_str += ', N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # Stability EPC Error Rate
+        if TCS_dict['TC-CSTAB-0350']:
+            text_str += ', %s %%, %s, ' % (Info_dict["TC-CSTAB-0350_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CSTAB-0350_Error_Msgs_BAT_EPC_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CSTAB-0350_Load_Stab_Error"], Info_dict["TC-CSTAB-0350_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CSTAB-0350')
+            text_str += ', N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # Dummy Upgrade Error Rate
+        if TCS_dict['TC-CACC-0210']:
+            text_str += ', %s %%, %s %%, %s %%, %s %%, ' % (Info_dict["TC-CACC-0210_Error_Rate_BAT_EPC_SYNC"], Info_dict["TC-CACC-0210_Error_Rate_BAT_IMS_SYNC"], Info_dict["TC-CACC-0210_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CACC-0210_Error_Rate_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CACC-0210_Load_Stab_Error"], Info_dict["TC-CACC-0210_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CACC-0210')
+            text_str += ', N/A, N/A, N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # LOCK/UNLOCK SCs Error Rate
+        if TCS_dict['TC-CROB-0607']:
+            text_str += ', %s, %s, %s, %s, ' % (Info_dict["TC-CROB-0607_Error_Msgs_BAT_EPC_SYNC"], Info_dict["TC-CROB-0607_Error_Msgs_BAT_IMS_SYNC"], Info_dict["TC-CROB-0607_Error_Msgs_BAT_EPC_ASYNC"], Info_dict["TC-CROB-0607_Error_Msgs_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CROB-0607_Load_Stab_Error"], Info_dict["TC-CROB-0607_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CROB-0607')
+            text_str += ', N/A, N/A, N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # LOCK/UNLOCK PLs Error Rate
+        if TCS_dict['TC-CROB-0608']:
+            text_str += ', %s %%, %s %%, %s %%, %s %%, ' % (Info_dict["TC-CROB-0608_Error_Rate_BAT_EPC_SYNC"], Info_dict["TC-CROB-0608_Error_Rate_BAT_IMS_SYNC"], Info_dict["TC-CROB-0608_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CROB-0608_Error_Rate_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CROB-0608_Load_Stab_Error"], Info_dict["TC-CROB-0608_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CROB-0608')
+            text_str += ', N/A, N/A, N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # PLs Reboot Error Rate
+        if TCS_dict['TC-CROB-0609']:
+            text_str += ', %s %%, %s %%, %s %%, %s %%, ' % (Info_dict["TC-CROB-0609_Error_Rate_BAT_EPC_SYNC"], Info_dict["TC-CROB-0609_Error_Rate_BAT_IMS_SYNC"], Info_dict["TC-CROB-0609_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CROB-0609_Error_Rate_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CROB-0609_Load_Stab_Error"], Info_dict["TC-CROB-0609_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CROB-0609')
+            text_str += ', N/A, N/A, N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # Backward-Compatibility Error Rate
+        if TCS_dict['TC-CACC-0502']:
+            text_str += ', %s %%, %s %%, %s %%, %s %%, ' % (Info_dict["TC-CACC-0502_Error_Rate_BAT_EPC_SYNC"], Info_dict["TC-CACC-0502_Error_Rate_BAT_IMS_SYNC"], Info_dict["TC-CACC-0502_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CACC-0502_Error_Rate_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CACC-0502_Load_Stab_Error"], Info_dict["TC-CACC-0502_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CACC-0502')
+            text_str += ', , , , , , ,'
+
+        # Create, Restore, Delete  Error Rate
+        if TCS_dict['TC-CACC-0202']:
+            text_str += ', %s %%, %s %%, %s %%, %s %%, ' % (Info_dict["TC-CACC-0202_Error_Rate_BAT_EPC_SYNC"], Info_dict["TC-CACC-0202_Error_Rate_BAT_IMS_SYNC"], Info_dict["TC-CACC-0202_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CACC-0202_Error_Rate_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,' % (Info_dict["TC-CACC-0202_Load_Stab_Error"], Info_dict["TC-CACC-0202_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CACC-0202')
+            text_str += ', N/A, N/A, N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # EPM-EPC Base Error Rate
+        if TCS_dict['TC-CACC-0150-EPM-EPC-BASE']:
+            text_str += ', %s %%, %s, ' % (Info_dict["TC-CACC-0150-EPM-EPC-BASE_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CACC-0150-EPM-EPC-BASE_Error_Msgs_BAT_EPC_ASYNC"])
+            text_str += ' %s %s, ,' % (Info_dict["TC-CACC-0150-EPM-EPC-BASE_Load_Stab_Error"], Info_dict["TC-CACC-0150-EPM-EPC-BASE_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CACC-0150-EPM-EPC-BASE')
+            text_str += ', N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # EPM-IMS Base Error Rate
+        if TCS_dict['TC-CACC-0150-EPM-IMS-BASE']:
+            text_str += ', %s %%, %s, ' % (Info_dict["TC-CACC-0150-EPM-IMS-BASE_Error_Rate_BAT_IMS_ASYNC"], Info_dict["TC-CACC-0150-EPM-IMS-BASE_Error_Msgs_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CACC-0150-EPM-IMS-BASE_Load_Stab_Error"], Info_dict["TC-CACC-0150-EPM-IMS-BASE_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CACC-0150-EPM-IMS-BASE')
+            text_str += ', N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # EPM-EPC ESM-10 Base Error Rate
+        if TCS_dict['TC-CACC-0151-KPI-EPC-BASE']:
+            text_str += ', %s %%, %s, ' % (Info_dict["TC-CACC-0151-KPI-EPC-BASE_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CACC-0151-KPI-EPC-BASE_Error_Msgs_BAT_EPC_ASYNC"])
+            text_str += ' %s %s, ,' % (Info_dict["TC-CACC-0151-KPI-EPC-BASE_Load_Stab_Error"], Info_dict["TC-CACC-0151-KPI-EPC-BASE_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CACC-0151-KPI-EPC-BASE')
+            text_str += ', N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # EPM-EPC Error Rate
+        if TCS_dict['TC-CACC-0150-EPM-EPC']:
+            text_str += ', %s %%, %s, ' % (Info_dict["TC-CACC-0150-EPM-EPC_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CACC-0150-EPM-EPC_Error_Msgs_BAT_EPC_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CACC-0150-EPM-EPC_Load_Stab_Error"], Info_dict["TC-CACC-0150-EPM-EPC_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CACC-0150-EPM-EPC')
+            text_str += ', N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # EPM-IMS Error Rate
+        if TCS_dict['TC-CACC-0150-EPM-IMS']:
+            text_str += ', %s %%, %s, ' % (Info_dict["TC-CACC-0150-EPM-IMS_Error_Rate_BAT_IMS_ASYNC"], Info_dict["TC-CACC-0150-EPM-IMS_Error_Msgs_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,'  % (Info_dict["TC-CACC-0150-EPM-IMS_Load_Stab_Error"], Info_dict["TC-CACC-0150-EPM-IMS_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CACC-0150-EPM-IMS')
+            text_str += ', N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # KPI-EPC ESM-10 Error Rate
+        if TCS_dict['TC-CACC-0151-KPI-EPC']:
+            text_str += ', %s %%, %s, ' % (Info_dict["TC-CACC-0151-KPI-EPC_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CACC-0151-KPI-EPC_Error_Msgs_BAT_EPC_ASYNC"])
+            text_str += ' %s %s, ,' % (Info_dict["TC-CACC-0151-KPI-EPC_Load_Stab_Error"], Info_dict["TC-CACC-0151-KPI-EPC_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CACC-0151-KPI-EPC')
+            text_str += ', N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # MAP-NO-ANSWER-FROM-HLR
+        if TCS_dict['TC-CROB-0500']:
+            text_str += ', %s %%, %s %%, %s %%, %s %%, ' % (Info_dict["TC-CROB-0500_Error_Rate_BAT_EPC_SYNC"], Info_dict["TC-CROB-0500_Error_Rate_BAT_IMS_SYNC"], Info_dict["TC-CROB-0500_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CROB-0500_Error_Rate_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,' % (Info_dict["TC-CROB-0500_Load_Stab_Error"], Info_dict["TC-CROB-0500_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CROB-0500')
+            text_str += ', N/A, N/A, N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # MAP-SS7-STACK-RESTART
+        if TCS_dict['TC-CROB-0502']:
+            text_str += ', %s %%, %s %%, %s %%, %s %%, ' % (Info_dict["TC-CROB-0502_Error_Rate_BAT_EPC_SYNC"], Info_dict["TC-CROB-0502_Error_Rate_BAT_IMS_SYNC"], Info_dict["TC-CROB-0502_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CROB-0502_Error_Rate_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,' % (Info_dict["TC-CROB-0502_Load_Stab_Error"], Info_dict["TC-CROB-0502_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CROB-0502')
+            text_str += ', N/A, N/A, N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # RESTART SC AND  SWITCHOVER
+        if TCS_dict['TC-CROB-0600']:
+            text_str += ', %s , %s , %s , %s , ' % (Info_dict["TC-CROB-0600_Error_Msgs_BAT_EPC_SYNC"], Info_dict["TC-CROB-0600_Error_Msgs_BAT_IMS_SYNC"], Info_dict["TC-CROB-0600_Error_Msgs_BAT_EPC_ASYNC"], Info_dict["TC-CROB-0600_Error_Msgs_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,' % (Info_dict["TC-CROB-0600_Load_Stab_Error"], Info_dict["TC-CROB-0600_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CROB-0600')
+            text_str += ', N/A, N/A, N/A, N/A, '
+            text_str += ' N/A, ,'
+
+        # HSS-RELOAD
+        if TCS_dict['TC-CROB-0100']:
+            text_str += ', %s %%, %s %%, %s %%, %s %%, ' % (Info_dict["TC-CROB-0100_Error_Rate_BAT_EPC_SYNC"], Info_dict["TC-CROB-0100_Error_Rate_BAT_IMS_SYNC"], Info_dict["TC-CROB-0100_Error_Rate_BAT_EPC_ASYNC"], Info_dict["TC-CROB-0100_Error_Rate_BAT_IMS_ASYNC"])
+            text_str += ' %s %s, ,' % (Info_dict["TC-CROB-0100_Load_Stab_Error"], Info_dict["TC-CROB-0100_Scenario_Error_Rate"])
+        else:
+            _DEB('Not info available for TC-CROB-0100')
+            text_str += ', N/A, N/A, N/A, N/A, '
+            text_str += ' N/A, ,'
+
+
+        with open("%s/%s_%s_Traffic_Errors_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+            text_file.write('%s\n' % text_str)
+        _DEB('Traffic Errors info saved:%s' % text_str)
+
+    except KeyError as e:
+        _DEB('Exception KeyError when reporting:%s ' % e)
+        pass
+    except Exception as e:
+        _DEB('Exception when reporting:%s ' % e)
+        pass
+
+
+def print_report_tcs_not_executed(work_dir,HSS_RELEASE,type_report='Native'):
+    global Info_dict
+    text_str = ' '
+    text_str += '%s NOT EXECUTED ,' % (HSS_RELEASE)
+    with open("%s/%s_%s_SC_Times_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        text_file.write('%s\n' % text_str)
+    with open("%s/%s_%s_PL_Times_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        text_file.write('%s\n' % text_str)
+    with open("%s/%s_%s_Reloads_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        text_file.write('%s\n' % text_str)
+    with open("%s/%s_%s_Traffic_Errors_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        text_file.write('%s\n' % text_str)
+    with open("%s/%s_%s_EPC_Latencies_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        text_file.write('%s\n' % text_str)
+    with open("%s/%s_%s_IMS_Latencies_CL2.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        text_file.write('%s\n' % text_str)
+
+
+def print_report_tcs(work_dir,HSS_RELEASE,type_report='Native',from_version=''):
+    global Info_dict
+    _INF('Generating output files with the values obtained for %s execution' % type_report)
+
+    with open("%s/%s_%s_TCS_EXECUTION.csv" % (work_dir, HSS_RELEASE, type_report), "w") as text_file:
+        header = 'Measure,     Value'
+        text_file.write('%s\n' % header)
+        for key,val in Info_dict.items():
+            text_str = '%s, %s' % (key, val)
+            text_file.write('%s\n' % (text_str))
+
+    print_report_reloads_cl2(work_dir,HSS_RELEASE,type_report,from_version)
+    print_report_times_cl2(work_dir,HSS_RELEASE,type_report,from_version)
+    print_report_traffic_error_cl2(work_dir,HSS_RELEASE,type_report,from_version)
+    print_report_latencies_cl2(work_dir,HSS_RELEASE,type_report,from_version)
+    print_report_applogs_cl2(work_dir, HSS_RELEASE, type_report,from_version)
+
+    _INF('\tOutput files generated under directory %s  for %s execution' % (work_dir, type_report))
+
+
+def analize_executions(execution_files, execs_dir, work_dir):
+    global Info_dict
+    global LIST_TARGZ_DELETE
+
+    TMP_EXEC_DIR = '%s/opt/hss/hss_st/' % work_dir
+    init_tcs_dict()
+    for tgz_file in execution_files.splitlines():
+        _INF('Analyzing %s file' % tgz_file)
+        cmd = 'tar -xzf %s/%s -C %s --wildcards "*ummary.txt" ' % (execs_dir, tgz_file, work_dir)
+        (stdout_value,stdout_err,returncode) = st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        if returncode:
+            if 'Not found in archive' in stdout_err:
+                _WRN('%s file does not contain summary files' % tgz_file)
+                LIST_TARGZ_DELETE.append(tgz_file)
+                continue
+            else:
+                _ERR('Error executing: %s' % cmd)
+                quit_program(EXECUTION_ERROR)
+
+        _DEB('Analyzing %s directory' % TMP_EXEC_DIR)
+        if not os.path.exists(TMP_EXEC_DIR):
+            _ERR('Directory with result not available yet: %s' % TMP_EXEC_DIR)
+            quit_program(EXECUTION_ERROR)
+
+        exec_directory = tgz_file[:-7]
+        TEST_RESULT_DIR = '%s%s/test_result' % (TMP_EXEC_DIR,exec_directory)
+        report_status = get_report_tcs(TEST_RESULT_DIR)
+        if report_status == 0:
+            LIST_TARGZ_DELETE.append(tgz_file)
+        else:
+            from_hss_version = report_status
+
+    return from_hss_version
+
+def main():
+    global NODE
+    global LIST_PLS
+    global Info_dict
+    global LIST_TARGZ_DELETE
+    global REPORT_LATENCY_IMS
+    global REPORT_LATENCY_EPC
+    global REPORT_LATENCY_EPC_ESM10
+
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+    NODE = hss_utils.node.cba.Cba(config = access_config)
+    LIST_PLS = NODE.payload
+    _INF('PLs obtained from the system:%s ' % LIST_PLS)
+
+    OUTPUT_DIRECTORY = user_config.output_dir
+    if not os.path.exists(OUTPUT_DIRECTORY):
+        os.makedirs(OUTPUT_DIRECTORY)
+
+    if not os.path.exists(user_config.INPUT):
+        _ERR('Wrong --input value: %s' % user_config.INPUT)
+        quit_program(WRONG_PARAMETER)
+    HSS_RELEASE = user_config.INPUT.split('/')[-1]
+    if not len(HSS_RELEASE):
+        HSS_RELEASE = user_config.INPUT.split('/')[-2]
+
+    cmd = 'ls -rt %s | grep native' % (user_config.INPUT)
+    list_executions, returncode = st_command.execute_cmd(cmd)
+    if returncode:
+        _DEB('NOT Native executions found: %s' % list_executions)
+        _WRN('NOT Native executions found')
+        _INF('Reporting info for Native execution as NOT EXECUTED')
+        print_report_tcs_not_executed(user_config.output_dir,HSS_RELEASE,type_report='Native')
+    else:
+        _INF('Native executions: %s' % list_executions)
+        from_hss_version = analize_executions(list_executions, user_config.INPUT, OUTPUT_DIRECTORY)
+        print_report_tcs(user_config.output_dir,HSS_RELEASE,type_report='Native',from_version=from_hss_version)
+
+    Info_dict = dict()
+    _DEB('Setting LATENCY_REPORT to False for Virtual check')
+    REPORT_LATENCY_IMS = False
+    REPORT_LATENCY_EPC = False
+    REPORT_LATENCY_EPC_EMS = False
+    init_tcs_dict()
+    cmd = 'ls -rt %s | grep virtual' % (user_config.INPUT)
+    list_executions, returncode = st_command.execute_cmd(cmd)
+    if returncode:
+        _DEB('NOT Virtual executions found: %s' % list_executions)
+        _WRN('NOT Virtual executions found')
+        _INF('Reporting info for Virtual execution as NOT EXECUTED')
+        print_report_tcs_not_executed(user_config.output_dir,HSS_RELEASE,type_report='Virtual')
+    else:
+        _INF('Virtual executions: %s' % list_executions)
+        from_hss_version = analize_executions(list_executions, user_config.INPUT, OUTPUT_DIRECTORY)
+        print_report_tcs(user_config.output_dir,HSS_RELEASE,type_report='Virtual',from_version=from_hss_version)
+
+
+    if len(LIST_TARGZ_DELETE):
+        wrn_message = 'Following files may be removed since not relevant information was found in them:\n'
+        for file_tgz in LIST_TARGZ_DELETE:
+                wrn_message += '\t%s \n' % file_tgz
+
+        _WRN('%s' % wrn_message)
+
+    cmd = 'rm -rf %s/opt' % OUTPUT_DIRECTORY
+    stdout_value, returncode = st_command.execute_cmd(cmd)
+    if returncode:
+        _ERR('Error executing: %s' % cmd)
+
+    quit_program(SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+
+            formatter_class=argparse.RawTextHelpFormatter,
+            description=textwrap.dedent('''\
+Extracting info from TC executions to csv files
+The input will be the directory where the logs of the TC's executions are
+''') ,
+                        epilog=textwrap.dedent(get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+    script_params = parser.add_argument_group('script options')
+    script_params.add_argument('-i','--input-dir',
+                        action='store', default=CWD,
+                        help='Full local path where execution log files are stored. Default %s' % CWD,
+                        dest='INPUT')
+
+    script_params.add_argument('-o', '--output-dir',
+                      action='store', default=CWD,
+                      help='Specify the output directory where the files will be generated. Default %s' % CWD,
+                      dest='output_dir')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+    e3utils.log.CONSOLE_PREFIX='(CBA_report_execution_to_csv_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_report_execution_to_csv_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        if sys.version_info[0] == 2:
+            _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+        else:
+            _DEB('** Binary MD5: %s' % hashlib.md5(str.encode(myself.read())).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        env, config = rosetta_services.get_env_for_localhost()
+        _INF('Environment  : %s' % env)
+        args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+        _INF('Node         : %s' % args.NODE)
+
+    return (args)
+
+
+if __name__ == '__main__':
+
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user with Ctrl-c')
+        quit_program(SUCCESS)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(SUCCESS)
+
+
+

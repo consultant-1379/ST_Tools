@@ -1,0 +1,469 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services as rosetta_services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+TC=None
+env_name=''
+type_vnf=''
+list_vms=''
+user_config={}
+
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        if TC.first_error is not None and exit_code == st_command.SUCCESS:
+            message = TC.first_error
+            exit_code = st_command.EXECUTION_ERROR
+
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def is_telco(type_vnf):
+    if 'Telco' in type_vnf:
+        return True
+    else:
+        return False
+
+def display_processor_computes():
+    ####    Showing the relationship bewtween HSS nodes and Virtual Machines
+    display_info = '\nNODE \tVIRTUAL MACHINE\n---- \t----------------'
+    processors = TC.all_processors
+    for processor in processors:
+        node_uuid = TC.processor_uuid(processor)
+        vm = list_vms[node_uuid]
+        display_info = display_info + '\n' + '%s \t%s' % (processor, vm)
+
+    _INF('%s\n' % display_info)
+
+
+def display_vm_computes_status(pod_name, vnf_name):
+    hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+    show_params = ['status','ha-policy','hypervisor_id','hypervisor']
+    _INF('\n%s\n' % rosetta_services.display_hss_vnf_info(hss_vnf_data, list_vms, show_params))
+    return hss_vnf_data
+
+def display_computes_failure(hss_vnf_data):
+    ####    Showing the list of computes that are going to be LOCKED
+    list_computes = rosetta_services.get_hss_vnf_hypervisor_ha_policy(hss_vnf_data, user_config.ha_policy)
+    if not list_computes:
+        error_info = 'Not computes found for environment %s with ha-policy %s \n' % (env_name, user_config.ha_policy)
+        _ERR(error_info)
+        quit_program(st_command.RESOURCES_ERROR, error_info)
+
+    list_computes_info=''
+    for compute_name in list_computes:
+        list_computes_info=list_computes_info+ "\n\t" + compute_name
+    _INF('List of computes with ha-policy %s: %s \n' % (user_config.ha_policy,list_computes_info))
+    return list_computes
+
+
+def check_evip_cdiam ():
+    # Check distribution of eVIP elements for Telco environments
+    _INF('Multi compute (Telco) environment: Showing eVIP elements distribution')
+    cmd = 'CBA_get_FEE_eVIP_elements --node %s --user %s --port %s --ip' % (user_config.NODE,
+                                                      user_config.user, user_config.port)
+    TC.run_stFramework_command(cmd, check_result = True)
+
+    # Check Diameter connections distribution for Telco environments
+    _INF('Multi compute (Telco) environment: Checking Diameter connections distribution')
+    cmd = 'CBA_check_diacc_dump_json --node %s --user %s --port %s' % (user_config.NODE, user_config.user, user_config.port)
+    (output,output_code) = st_command.execute_cmd(cmd, stdout=False, stderr=False)
+    if output_code:
+        error_info = 'Error when executing command CBA_check_diacc_dump_json'
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+def show_free_computes(pod_name, vnf_name):
+        _INF('Showing available computes for %s environment %s' % (type_vnf, env_name))
+        free_computes_info = ''
+        free_computes = rosetta_services.get_vnf_free_computes (pod_name, vnf_name)
+        if free_computes:
+            for compute_name in free_computes:
+               free_computes_info = free_computes_info + '\n\t' + compute_name
+            _INF('%s' % free_computes_info)
+        else:
+            _INF('Not computes available for environment %s' % env_name)
+
+
+def wait_change_status_compute(pod_name, vnf_name, compute_name, c_state='down'):
+    init_time = time.time()
+    timeout = float(user_config.max_time)
+    _INF('Waiting until compute %s state changes to %s' % (compute_name,c_state))
+    while  True:
+        now = time.time()
+        time.sleep(float(1))
+        compute_state, compute_status = rosetta_services.get_vnf_compute_status (pod_name, vnf_name, compute_name)
+        if c_state in compute_state:
+            break
+        timeout -= time.time() - now
+        if timeout < 0:
+            error_info = 'Timeout waiting for Compute state %s' % c_state
+            _ERR(error_info)
+            quit_program(st_command.TIMEOUT, error_info)
+
+    change_time = now - init_time
+    return change_time
+
+
+def unlock_compute_node (compute_name):
+
+    pod_name = env_name.split('-')[0]
+    vnf_name = env_name.split('-')[1]
+
+    # Step 3: Check ha-policy used by VMs and the hosts (hypervisors)
+    _INF('Showing information BEFORE UNLOCKING compute %s' % compute_name)
+    display_vm_computes_status(pod_name, vnf_name)
+
+    _INF('UnLocking the compute node %s ' % compute_name)
+    answer = rosetta_services.vnf_unlock_compute (pod_name,vnf_name,compute_name)
+    _INF('%s' % answer)
+    init_lock = time.time()
+
+    _INF('Showing information just AFTER unlock compute %s' % compute_name)
+    display_vm_computes_status(pod_name, vnf_name)
+
+    time_wait = wait_change_status_compute(pod_name, vnf_name, compute_name, c_state='up')
+    end_lock = time.time()
+    change_time = (end_lock - init_lock)
+    _INF('Compute %s changed to state "up" after %s seconds' % (compute_name,change_time))
+
+    _INF('Showing information after compute state is "UP" ')
+    display_vm_computes_status(pod_name, vnf_name)
+
+    # Step 11: waiting to the node to recover
+    timeout = user_config.max_time
+    _INF('Waiting for system to recover ...' )
+    reload_time = TC.wait_for_node_reload(timeout, reconnect=True)
+    _INF('Compute UNLOCK time: %s' % reload_time)
+
+    TC.release_node()
+    TC.connect_to_node()
+
+    _INF('Showing information after unlock compute %s' % compute_name)
+    display_vm_computes_status(pod_name, vnf_name)
+
+    # Check distribution of eVIP elements and Check Diameter connections for Telco environments
+    if is_telco(type_vnf):
+        check_evip_cdiam()
+
+
+def lock_compute_node (compute_name):
+    pod_name = env_name.split('-')[0]
+    vnf_name = env_name.split('-')[1]
+    hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+
+    # Step 3: Check ha-policy used by VMs and the hosts (hypervisors)
+    _INF('Showing information before LOCKING the compute %s' % compute_name)
+    display_vm_computes_status(pod_name, vnf_name)
+
+    compute_state, compute_status = rosetta_services.get_vnf_compute_status (pod_name, vnf_name, compute_name)
+    _INF('Compute %s with state=%s and status=%s' % (compute_name,compute_state,compute_status))
+
+    # Step X: Check distribution of eVIP elements and Diameter connections for Telco environments
+    if is_telco(type_vnf):
+        check_evip_cdiam()
+
+    # Step 4: Locking the compute
+    _INF('Locking the compute node %s ' % compute_name)
+    answer = rosetta_services.vnf_lock_compute (pod_name,vnf_name,compute_name)
+    _INF('%s' % answer)
+    init_lock = time.time()
+
+    _INF('Showing information just after LOCKING the compute %s' % compute_name)
+    display_vm_computes_status(pod_name, vnf_name)
+
+    wait_change_status_compute(pod_name, vnf_name, compute_name, c_state='down')
+    end_lock = time.time()
+    change_time = (end_lock - init_lock)
+    _INF('Compute %s changed to state "down" after %s seconds' % (compute_name,change_time))
+
+    _INF('Showing information just after the compute state is down')
+    display_vm_computes_status(pod_name, vnf_name)
+
+    # Step 7: Check alarms both in CEE and HSS-FE
+    cee_alarms=rosetta_services.get_vnf_cee_list_alarms (pod_name)
+    if cee_alarms:
+        _INF('CEE alarms environment:\n%s' % cee_alarms)
+    else:
+        _INF('NO CEE alarms found')
+
+    # Step 15: Check distribution of eVIP elements and Check Diameter connections for Telco environments
+    if is_telco(type_vnf):
+        check_evip_cdiam()
+
+
+def main():
+    global TC
+    global env_name
+    global type_vnf
+    global list_vms
+    global user_config
+
+    user_config = parse_commandline()
+    access_config = {'host':user_config.NODE,
+                        'port':user_config.port,
+                        'user':user_config.user}
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+
+        TC.connect_to_node()
+        _INF('Controllers status')
+        TC.display_controllers_state()
+        state=TC.controller_state('SC-1')
+        sc_standby = 'SC-1' if 'STANDBY' in state else 'SC-2'
+
+        _INF('Processors status')
+        TC.display_processors_state()
+        TC.start_alarm_monitoring()
+        TC.alarm_monitor.max_time_for_reconnection = user_config.max_time
+
+        env, config = rosetta_services.get_env_for_localhost()
+        env_type = config.get_cabinet_type()
+        env_name = config.get_cabinet_name()
+        if (env_type != "VNF"):
+            error_info = 'Error: Environment %s is NOT VIRTUAL. This Test Case only applies to Virtual Environments' % env_name
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+        hypervisor_migrate = ''
+        vm_pl_name_migrate = ''
+
+        # Script to test TC's CROB-0730 and CROB-731 simulating compute failure
+        pod_name = env_name.split('-')[0]
+        vnf_name = env_name.split('-')[1]
+
+        rosetta_services.vnf_apis_rosetta()
+        hss_vnf_data = rosetta_services.get_hss_vnf_info (pod_name, vnf_name)
+        list_vms = rosetta_services.get_hss_vnf_vms (hss_vnf_data)
+        type_vnf = rosetta_services.get_hss_vnf_type (hss_vnf_data,list_vms)
+        if not is_telco(type_vnf) and user_config.ha_policy == "ha-offline":
+            error_info = 'Error: Environment %s is %s  but the ha_policy selected for the TC is %s. Configuration not allowed.' % (env_name, type_vnf, user_config.ha_policy)
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+        _INF('Showing information for %s environment %s' % (type_vnf, env_name))
+        hss_vnf_data = display_vm_computes_status(pod_name, vnf_name)
+
+        list_computes = display_computes_failure(hss_vnf_data)
+
+        _INF('Showing NODES and VIRTUAL MACHINES association:')
+        display_processor_computes()
+
+        show_free_computes(pod_name, vnf_name)
+
+        ####    Locking/Unlocking conmpute nodes according to their ha-policy
+        _INF('Virtual Environment %s. Forcing failure on computes with ha-policy %s' % (env,user_config.ha_policy))
+
+
+        for compute_name in list_computes:
+            _INF('##################################################################################')
+            _INF('LOCKING COMPUTE NODE %s ' % compute_name)
+            _INF('##################################################################################')
+            lock_compute_node (compute_name)
+
+
+            _INF('Waiting %s seconds with the compute LOCKED' % user_config.wait_time)
+            time.sleep(float(user_config.wait_time))
+
+            _INF('UNLOCKING COMPUTE NODE %s ' % compute_name)
+            unlock_compute_node (compute_name)
+
+        _INF('Waiting %s seconds for next action' % user_config.wait_time)
+        time.sleep(float(user_config.wait_time))
+        TC.check_non_cleared_alarms()
+        TC.display_non_expected_alarms()
+
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError as e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, hss_utils.rosetta.InfoNotFound) as e:
+        error_info = 'Error: %s. Use command line parameter -V' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.ROSETTA_ERROR,error_info)
+
+    except (hss_utils.rosetta.ActionFailure) as e:
+        error_info = 'Error when executing E3cloud action: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Simulate compute node failures to by locking/unlocking them',
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('--ha-policy',
+                        default='managed-on-host', action='store', dest='ha_policy',
+                        help='Type of ha-policy of the computes to force to failure. By default is "%(default)s"')
+
+    scenario_params.add_argument('-t', '--time',
+                        default=30, type=int, action='store', dest='wait_time',
+                        help='Waiting time for action. By default is "%(default)s"')
+
+    scenario_params.add_argument('--max_time',
+                        default=600, type=int, action='store', dest='max_time',
+                        help='Max time waiting for every single reboot. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_vnf_failure_compute_node_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_vnf_failure_compute_node_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if args.NODE is None:
+        env, config = rosetta_services.get_env_for_localhost()
+        _INF('Environment  : %s' % env)
+        args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+        _INF('Node         :%s' % args.NODE)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)

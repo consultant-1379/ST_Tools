@@ -1,0 +1,285 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+import ldap
+
+import ntpath
+import signal
+import textwrap
+import string
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    print 'Cannot import hss_utils.rosetta: %s' % e
+    print 'Rosetta access will be disabled'
+    _ROSETTA_AVAILABLE_ = False
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Ldap error',
+10: 'Wrong parameter value',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+SUCCESS = 0
+LDAP_ERROR = 1
+WRONG_PARAMETER = 10
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+def quit_program(exit_code):
+
+    sys.exit(exit_code)
+
+
+class Subscriber(object):
+    def __init__(self, subid):
+
+        self.__subId = subid
+        self.__dn = []
+
+    @property
+    def subId(self):
+        return self.__subId
+
+    @property
+    def dn(self):
+        return self.__dn
+
+    def search(self, client):
+        for base in self.dn:
+            client.ldap_search(base)
+
+
+class IMS_Subscriber(Subscriber):
+    def __init__(self, subid):
+        Subscriber.__init__(self, subid)
+
+        self.dn.append('IMPI=UserName%s_0@ericsson.se,dc=impi,ou=identities,dc=operator,dc=com' % self.subId)
+        self.dn.append('IMSI=%s,dc=imsi,ou=identities,dc=operator,dc=com' % (262280000000000 + int(self.subId)))
+        self.dn.append('IMPU=sip:UserName%s_0PublicID0@ericsson.se,dc=impu,ou=identities,dc=operator,dc=com' % self.subId)
+
+class EPC_Subscriber(Subscriber):
+    def __init__(self, subid):
+        Subscriber.__init__(self, subid)
+
+        self.dn.append('IMSI=%s,dc=imsi,ou=identities,dc=operator,dc=com' % (262280000000000 + int(self.subId)))
+
+class LdapClient(object):
+    def __init__(self, config):
+        self.__host = config.server
+        self.__port = config.port 
+        self.__user = config.user
+        self.__password = config.password
+        host = self.__host
+        if config.ipv6:
+            host = "[%s]" % self.__host
+        print '\nLdap server configuration'
+        print '\tURI:       : ldap://%s:%s' % (host,self.__port)
+        print '\tUser       : %s' % self.__user
+        print '\tPassword   : %s\n' % self.__password
+        try:
+            try:
+                self.__client = ldap.open(host, port=self.__port)
+            except AttributeError:
+                self.__client = ldap.initialize('ldap://%s:%s' % (host,self.__port))
+
+            self.__client.protocol_version = ldap.VERSION3
+            self.__client.simple_bind_s(self.__user, self.__password)
+            self.deref(True)
+
+        except ldap.LDAPError, e:
+            print 'ldap error: %s' % e
+            quit_program(LDAP_ERROR)
+
+    def deref(self, enable):
+        if enable:
+            self.__client.set_option(ldap.OPT_DEREF, ldap.DEREF_ALWAYS)
+        else:
+            self.__client.set_option(ldap.OPT_DEREF, 0)
+
+    def ldap_search(self,base, searchScope = ldap.SCOPE_SUBTREE, timeout=5.0,attrlist=['*']):
+        def is_printable(value):
+            return all(c in string.printable for c in value)
+
+        def decode(value):
+            import base64
+            return base64.b64encode(value)
+
+        try:
+            ldap_result_id = self.__client.search(base, searchScope, attrlist=attrlist)
+            result_set = []
+            while 1:
+                result_type, result_data = self.__client.result(ldap_result_id, 0)
+                if (result_data == []):
+                    break
+                elif result_type == ldap.RES_SEARCH_ENTRY:
+                    for entry in result_data:
+                        dn, atrr = entry
+                        print '\ndn: %s' % dn
+                        for key, values in atrr.iteritems():
+                            for value in values:
+                                if not is_printable(value):
+                                    value = decode(value)
+                                    print '%s:: %s' % (key,value)
+                                else:
+                                    print '%s: %s' % (key,value)
+
+
+        except ldap.LDAPError, e:
+            print 'ldap error: %s' % e
+            quit_program(LDAP_ERROR)
+
+
+def main():
+
+    user_config = parse_commandline()
+    client = LdapClient(user_config)
+
+    if user_config.dn is None:
+        subscriber = eval('%s_Subscriber(%s)' % (user_config.traffic, user_config.subid))
+        subscriber.search(client)
+
+    else:
+        for dn in user_config.dn:
+            client.ldap_search(dn)
+
+
+    quit_program(SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Search subscriber info in ExtDb'
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('--server',
+                        action='store', default=None,
+                        help='Ldap  server IP address. If ommitted local hostname will be used to find env in rosetta',
+                        dest='server')
+
+    access_params.add_argument('--port',
+                      action='store', default=389,type=int, 
+                      help='Ldap server port.  Default value is 389',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='cudbUser=HSSUser,ou=admin,dc=operator,dc=com',
+                      help='User for bind.  Default value is %(default)s',
+                      dest='user')
+
+    access_params.add_argument('--password',
+                      action='store', default='HSSUserNEW',
+                      help='Password used in ssh.  Default value is %(default)s',
+                      dest='password')
+
+    access_params.add_argument('-6',
+                        default=False, action='store_true',
+                        dest='ipv6',
+                        help='Select IPv6')
+
+
+    search_params = parser.add_argument_group('Define search parameters ')
+    search_params.add_argument('-t', '--traffic',action='store', dest='traffic',
+                        choices = ['IMS', 'EPC'],default=None,
+                        help='Traffic type used as filter')
+
+    search_params.add_argument('-s','--subscriber',action='store', dest='subid',
+                        type=int, default=None,
+                        help='Subscriber used for search')
+
+    search_params.add_argument('--dn',action='store', dest='dn',
+                        nargs='+',default=None,
+                        help='list of specific dn used for search')
+
+
+    args = parser.parse_args()
+
+    try:
+        if args.server is None:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            if config.raw['extdbs']:
+                args.server = config.get_extdb_ldap_ip(extdb=0, IPv6=args.ipv6)
+            else:
+                print 'Ldap server IP not found. Use command line parameter --server'
+                quit_program(ROSETTA_ERROR)
+    except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+        print 'Error: %s. Use command line parameter --server' % str(e)
+        quit_program(ROSETTA_ERROR)
+
+
+    if args.dn is None:
+        if args.traffic is None or args.subid is None:
+            print 'Missing parameters. Use (-t and -s) or --dn'
+            quit_program(WRONG_PARAMETER)
+    else:
+        if args.traffic is not None or args.subid is not None:
+            print 'Not compatible parameters. Use (-t and -s) or --dn'
+            quit_program(WRONG_PARAMETER)
+
+
+    return (args)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        print 'Execution stopped by user'
+        quit_program(0)
+    except Exception, e:
+        print 'Unhandled Exception, please report this LOG to tools team'
+        print 'Additional information: %s' % str(e)
+        print '** STACK TRACE **'
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            print tb
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            print tb
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

@@ -1,0 +1,8 @@
+*.pyc
+*.*~
+*.log
+*.o
+**/build
+**/dist
+*~
+MANIFEST

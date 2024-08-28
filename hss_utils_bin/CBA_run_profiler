@@ -1,0 +1,340 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+
+import ntpath
+import signal
+import textwrap
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+NODE=None
+
+def quit_program(exit_code):
+    global NODE
+
+    if NODE is not None:
+        NODE.release()
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+def main():
+
+    global NODE
+    user_config = parse_commandline()
+    connections = {}
+    try:
+        if st_command.get_ip(user_config.NODE) is None:
+            _ERR('Node value %s is not valid' % user_config.NODE)
+            quit_program(st_command.WRONG_PARAMETER)
+
+
+        access_config = {'host':user_config.NODE,
+                          'port':user_config.port,
+                          'user':user_config.user}
+
+
+        NODE = hss_utils.node.cba.Cba(config = access_config)
+        NODE.force_primary_controller()
+        allowed_processors = NODE.processors
+        processors = []
+        if  user_config.processors is None:
+            processors = NODE.processors
+        else:
+            for processor in user_config.processors:
+                if processor not in allowed_processors:
+                    _ERR('Processor %s not valid. Allowed values are: %s' % (processor, ' '.join(allowed_processors)))
+                    quit_program(WRONG_PARAMETER)
+
+            processors = user_config.processors
+
+        cmd = 'rm -rf /home/vdicos/profile_out' 
+        _INF('Executing: %s' % cmd)
+        NODE.run_command(cmd) 
+
+        cmd = 'vdicos-profiler-start -i %s' % user_config.interval 
+
+        for processor in processors:
+            cmd += ' -n %s' % processor
+            NODE.extend_connection(identity = processor, host = processor)
+
+        _INF('Executing: %s' % cmd)
+        answer = NODE.run_command(cmd)
+        if len(answer):
+            if 'Profiler started on' in answer[0]:
+                _INF('%s' % answer[0])
+            else:
+                _ERR('%s' % answer[0])
+                quit_program(EXECUTION_ERROR)
+        else:
+            _ERR('Error executing %s' % cmd)
+            quit_program(EXECUTION_ERROR)
+
+
+    except connection.Unauthorized, e: 
+        _ERR('Error: %s' % str(e))
+        quit_program(AUTHENTICATION_ERROR)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed), e: 
+        _ERR('Error: %s' % str(e))
+        quit_program(CONNECTION_ERROR)
+
+    try:
+        if user_config.execution_time is None:
+            _DEB('Profiler running......Press ctrl-c to stop')
+            print '\n\nProfiler running......Press ctrl-c to stop'
+            signal.pause()
+        else:
+            _DEB('Profiler will run for %s seconds. Press ctrl-c to stop' % user_config.execution_time)
+            print '\n\nProfiler will run for %s seconds. Press ctrl-c to stop' % user_config.execution_time
+            time.sleep(float(user_config.execution_time))
+
+    except KeyboardInterrupt:
+        _DEB('Execution stopped by user!')
+        print '\n Execution stopped by user!'
+
+    cmd = 'vdicos-profiler-stop' 
+    _INF('Executing: %s' % cmd)
+    answer = NODE.run_command(cmd)
+    profiler_path = ''
+    if len(answer):
+        if 'Analysed files will be in the following path' in answer[0]:
+            profiler_path = answer[0].split()[-1]
+
+    if profiler_path == '':
+        _ERR('Profiler data not found')
+        quit_program(EXECUTION_ERROR)
+
+    analysis_pending = True
+    while analysis_pending:
+        time.sleep(float(user_config.check_analysis_interval_time))
+        try:
+            analysis_pending = False
+            cmd = 'ps -eaf | grep vdprofan | grep -v grep | wc -l' 
+            for processor in processors:
+                _INF('Executing in %s: %s' % (processor,cmd))
+                answer = NODE.run_command(cmd, identity = processor)
+                if len(answer):
+                    if answer[0] != '0':
+                        analysis_pending = True
+                        _INF('Profile data analysis still running on %s' % processor)
+                        break
+                    else:
+                        _INF('Profile data analysis finished on %s' % processor)
+
+        except KeyboardInterrupt:
+            _WRN('Execution stopped by user! Data file will not be downloaded')
+            quit_program(SUCCESS)
+
+    cmd = 'cd %s' % profiler_path
+    _INF('Executing: %s' % cmd)
+    NODE.run_command(cmd) 
+
+    tar_file = 'profiler_data.tgz'
+    cmd = 'tar zcvf %s *.txt' % tar_file
+    _INF('Executing: %s' % cmd)
+    answer = NODE.run_command(cmd)
+    if answer[0].startswith('tar:'):
+        _ERR('Error packing data: %s' % answer[0])
+        quit_program(EXECUTION_ERROR)
+
+
+    try:
+        file_to_dowload = os.path.join(profiler_path,tar_file)
+        _INF('Executing: download of %s to %s' % (file_to_dowload, user_config.output_file))
+        NODE.download(file_to_dowload, user_config.output_file)
+        cmd = 'rm  -rf %s' % profiler_path
+        _INF('Executing: %s' % cmd)
+        NODE.run_command(cmd)
+
+    except IOError, e:
+        _ERR('Error copying /home/*_%s.pcap : %s' % (os.getpid(), str(e)))
+        quit_program(EXECUTION_ERROR)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed), e: 
+        _ERR('Error copying /home/*_%s.pcap : %s' % (os.getpid(), str(e)))
+        quit_program(CONNECTION_ERROR)
+
+
+    quit_program(SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description='Start profiler on CBA and download the data',
+                        epilog=textwrap.dedent(get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='OAM  IP address of the node. If ommitted local hostname will be used to find env in rosetta',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('-t', '--time',
+                        default=None, action='store', dest='execution_time', type=int,
+                        help='Duration of the profile execution in sec. If not set the tool wait for user to press ctrl-c')
+
+    scenario_params.add_argument('--check_analysis_interval_time',
+                        default=15, action='store', dest='check_analysis_interval_time', type=int,
+                        help='Time in seconds for checking that analysis is finished. Default: %(default)s')
+
+    scenario_params.add_argument('-p', '--processors', nargs='+',
+                        default=None, action='store', dest='processors',
+                        help='List of processors. If not set all the PLs will be used')
+
+    scenario_params.add_argument('-i', '--interval',
+                        default=1000, action='store', dest='interval', type=int,
+                        help='Time in ms to be used as interval in vdicos-profiler-start. Default: %(default)s')
+
+    scenario_params.add_argument('-o', '--output_path',
+                        default=CWD, action='store', dest='output_path',
+                        help='Profiler output full path. Default: %(default)s')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_run_profiler_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if args.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_run_profiler_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    if args.NODE is None:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         : %s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable), e:
+            _ERR('Error: %s. Use command line parameter --node' % str(e))
+            quit_program(ROSETTA_ERROR)
+
+    try:
+        if args.output_path != CWD:
+            if not os.path.exists(args.output_path):
+                os.makedirs(args.output_path)
+
+        args.output_file = os.path.join(args.output_path, 'CBA_profiler_%s.tar' % os.getpid())
+
+    except Exception, e:
+        _DEB('Exception: %s' % str(e))
+        _ERR('output file value %s is not valid' % args.output_file)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception, e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

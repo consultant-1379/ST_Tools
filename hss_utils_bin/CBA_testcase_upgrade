@@ -1,0 +1,745 @@
+#!/usr/bin/env python
+#
+
+import sys
+import os
+CWD = os.getcwd()
+import os.path
+import time
+import shutil
+import hashlib
+import tempfile
+import pexpect
+import socket
+HOSTNAME = socket.gethostname()
+import traceback
+import argparse
+import re
+import copy
+import json
+
+import ntpath
+import signal
+import textwrap
+from datetime import datetime
+
+import hss_utils.st_command as st_command
+import hss_utils.connection as connection
+import hss_utils.node
+import hss_utils.node.cba
+import HSS_rtc_lib.components.test_cases as test_cases
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError as e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+TC=None
+action_begin=''
+action_end=''
+time_messages={}
+next_step=False
+phase_name='PRE'
+
+
+def quit_program(exit_code,message=''):
+    global TC
+
+    if TC is not None:
+        TC.quit_test_case(exit_code,message)
+
+    if message != '':
+        _INF('stTool_message %s ' % message)
+
+    _DEB('Exit code: %s (%s)' % (exit_code, st_command.EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+def send_time_messages():
+    global time_messages
+    for key,message in time_messages.items():
+        TC.send_test_case_info('%s' % message)
+
+
+def check_upgrade_action(action_message):
+    global action_begin
+    global action_end
+    global time_messages
+    global phase_name
+    if 'Action began:' in action_message:
+        action_begin = action_message.split(':',1)[-1]
+
+    elif 'Action ended:' in action_message:
+        action_end = action_message.split(':',1)[-1]
+
+    elif 'Upgrade Creation lasted' in action_message:
+        if "seconds" in action_message:
+            TC.send_test_case_info('%s' % action_message)
+            TC.send_test_case_info('        Action began: %s      Action ended: %s' % (action_begin, action_end))
+
+    elif 'Upgrade Preparation lasted' in action_message:
+        if "min" in action_message:
+            TC.send_test_case_info('%s' % action_message)
+            TC.send_test_case_info('        Action began: %s      Action ended: %s' % (action_begin, action_end))
+
+    elif 'Upgrade Activation lasted' in action_message:
+        if "min" in action_message:
+            TC.send_test_case_info('%s' % action_message)
+            TC.send_test_case_info('        Action began: %s      Action ended: %s' % (action_begin, action_end))
+    elif 'Confirm upgrade command' in action_message:
+        action_begin = datetime.now()
+
+    elif 'CONFIRM action lasted' in action_message:
+        action_end = datetime.now()
+        TC.send_test_case_info('%s' % action_message)
+        TC.send_test_case_info('        Action began: %s      Action ended: %s' % (action_begin, action_end))
+
+    elif 'Backup ' in action_message:
+        if 'lasted' in action_message and 'min' in action_message:
+            TC.send_test_case_info('%s' % action_message)
+            TC.send_test_case_info('        Action began: %s      Action ended: %s' % (action_begin, action_end))
+    elif 'Time check: Phase ' in action_message:
+        if 'PRE' in action_message:
+             phase_name='PRE'
+        elif 'MAIN' in action_message:
+             phase_name='MAIN'
+        elif 'POST' in action_message:
+             phase_name='POST'
+        else:
+             phase_name='ROLLBACK'
+        if 'lasted in TOTAL' in action_message:
+            time_messages[phase_name] = action_message
+
+
+def upgrade_upload (user_config, source, destination):
+    _INF('Uploading %s to %s' % (source,destination))
+    temp_dir="/tmp/upgrade/"
+    if user_config.user != 'root':
+        _DEB('User is not root. Creating connection with root privileges.')
+        cmd = 'mkdir -p %s ; chmod 777 %s; rm %s*' % (temp_dir,temp_dir,temp_dir)
+        _INF('Executing %s' % cmd)
+        TC.run_node_command(cmd)
+        _INF('Uploading %s' % source)
+        TC.upload(source,temp_dir)
+        cmd = 'cp %s/* %s' % (temp_dir,destination)
+        _INF('Executing %s' % cmd)
+        TC.run_node_command(cmd)
+    else:
+        TC.upload(source,destination)
+
+def run_upgrade_tool(upgrade_type, config, resume=False, phase=''):
+    global next_step
+    global phase_name
+
+    try:
+        cmd = 'cd /cluster/storage/Hss_Upgrade_Tool'
+        _INF('Executing %s' % cmd)
+        TC.run_node_command(cmd)
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        if resume:
+            _WRN('Connection closed by remote host. Reconnection to SC needed')
+            TC.close_connection()
+            return True
+        else:
+            error_info = 'Error: %s' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        if resume:
+            _WRN('Connection closed by remote host. Reconnection to SC needed')
+            TC.close_connection()
+            return True
+        else:
+            error_info = 'Error: %s' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    cmd = './HssUpgradeTool %s %s %s' % (phase, ('--resume' if resume else ''), ('--next_step' if next_step else ''))
+    _INF('Executing %s' % cmd)
+    TC.channel.write_line('%s' % cmd)
+    executing = True
+    next_step = False
+    action_message = ''
+    while (executing):
+        try:
+            result = TC.channel.expect([TC.sync_expression,
+                                            '\(OK, Exit\)\??:\r\n',
+                                            'Type OK and press enter when finish or type Exit and press enter to stop the automatic tool',
+                                            'If you wish to continue, type OK and press Enter',
+                                            'Type OK and press enter when it is done and you want to continue',
+                                            'Are all the nodes configured as fixed\?: \(yes\/no\)',
+                                            'You have read and the limitations and workaround: \(yes\/no\)',
+                                            'Do you want the tool execute the cluster reboot command\?: \(yes\/no\)',
+                                            'Type yes if your environment meets one of the requirements, or type no to skip the step: \(yes\/no\)',
+                                            'Do you want to change to ONE_STEP execution method \? \(yes\/no\)',
+                                            'If yes type restore, if not type skip: \(skip\/restore\)',
+                                            'The system is going down for reboot NOW!',
+                                            'Incorrect answer provided',
+                                            'Step failed',
+                                            'Execution stopped',
+                                            'HealthCheck status is not HEALTHY',
+                                            '\r\n'],
+                                            timeout=1.0 )
+
+            if result == 0:
+                executing = False
+                _INF('HssUpgradeTool execution finished')
+
+                continue
+
+            elif result in [1,2,3,4]:
+                _INF('%s' % TC.channel.stdout)
+                TC.channel.write_line('OK')
+
+            elif result in [5,6,7,8]:
+                _INF('%s' % TC.channel.stdout)
+                TC.channel.write_line('yes')
+
+            elif result == 9:
+                _INF('%s' % TC.channel.stdout)
+                answer = 'yes' if upgrade_type == 'ONE_STEP' else 'no'
+                TC.channel.write_line(answer)
+
+            elif result == 10:
+                _INF('%s' % TC.channel.stdout)
+                TC.channel.write_line('restore')
+
+            elif result == 11:
+                _INF('%s' % TC.channel.stdout)
+                _INF('Reconnection to SC needed')
+                TC.close_connection()
+                return True
+
+            elif result in [12,13,14]:
+                error_info = 'HssUpgradeTool execution FAILED'
+                _ERR(error_info)
+                get_HssUpgradeTool_log()
+                TC.close_connection()
+                quit_program(st_command.EXECUTION_ERROR, error_info)
+
+            elif result == 15:
+                _INF('%s' % TC.channel.stdout)
+                if phase_name != 'POST':
+                    error_info = 'HealthCheck reported failure. Resuming execution skipping step'
+                    _INF(error_info)
+                    resume = True
+                    next_step = True
+                    _DEB('After HealthCheck: the Upgrade tool with resume=%s and next_step= %s' % (('True' if resume else 'False'), ('True' if next_step else 'False'))) 
+                    TC.close_connection()
+                    return True
+
+            else: # Other logs from the tool
+                _INF('%s' % TC.channel.stdout)
+                action_message = TC.channel.stdout
+                check_upgrade_action(action_message)
+
+        except pexpect.TIMEOUT as e:
+            continue
+            _WRN('Connection closed by remote host. Reconnection to SC needed')
+            TC.close_connection()
+            return True
+
+        except KeyboardInterrupt:
+            TC.channel.write_line('\x03')
+            TC.close_connection()
+            error_info = 'HssUpgradeTool stopped by user'
+            _WRN(error_info)
+            quit_program(st_command.EXECUTION_ERROR, error_info)
+
+
+
+    # reconnection not needed
+    return False
+
+
+def get_HssUpgradeTool_log():
+    if TC is None:
+        _WRN('Unable to get HssUpgradeTool logs')
+        return
+
+    TC.download('/cluster/storage/Hss_Upgrade_Tool/*.log', './')
+    TC.download('/cluster/storage/Hss_Upgrade_Tool/*.txt', './')
+
+
+def acces_config_to_ACTIVE(user_config):
+    access_config = {'host':user_config.NODE,
+                      'port':user_config.port,
+                      'user':user_config.user}
+
+
+    node = hss_utils.node.cba.Cba(config = access_config)
+    host, ip = node.get_primary_sc()
+    access_config['host'] = ip
+    node.release()
+
+    _INF('Active %s IP : %s' %  (host, access_config['host']))
+    return access_config
+
+def main():
+    global TC
+    global next_step
+    global action_begin
+    global action_end
+    global time_messages
+    user_config = parse_commandline()
+    access_config = acces_config_to_ACTIVE(user_config)
+
+    if not access_config:
+        error_info = 'Problem selecting the active SC'
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    try:
+        TC = test_cases.CBA_TestCaseBase(access_config, user_config.stand_alone)
+        TC.connect_to_node()
+        hss_version = TC.node.get_envdata('HSS_VERSION')
+        if hss_version is None:
+            error_info = 'HSS version not found'
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR,error_info)
+
+        _INF('HSS version  :%s' % hss_version)
+
+        cliss_connection = test_cases.clissConnection(TC.node,
+                                                'hssadministrator')
+
+        origin_list_backup = []
+        backup_list = cliss_connection.search(hss_utils.node.cba.BACKUP_CLISS_DN,
+                                              'BrmBackup')
+
+        scheduled_backup_name = cliss_connection.search('%s,BrmBackupScheduler=SYSTEM_DATA' % hss_utils.node.cba.BACKUP_CLISS_DN,
+                                              'scheduledBackupName')
+
+        backup_to_be_created = [user_config.BACKUPNAME]
+        if user_config.config_file is not None:
+            with open(user_config.config_file) as f:
+                content = f.readlines()
+            content = [x.strip() for x in content]
+            for line in content:
+                if line.startswith('backup.'):
+                    backup_to_be_created += [line.split('=')[-1]]
+
+        for backup in backup_list:
+            if backup.startswith('SMF'):
+                TC.delete_backup(backup)
+            elif backup in backup_to_be_created:
+                TC.delete_backup(backup)
+            elif backup.startswith(scheduled_backup_name[0]):
+                child = '%s,BrmBackup=%s' % (hss_utils.node.cba.BACKUP_CLISS_DN,backup)
+                backup_type = cliss_connection.search(child,'creationType')
+                if backup_type[0] == 'SCHEDULED':
+                    TC.delete_backup(backup)
+                else:
+                    origin_list_backup.append(backup)
+            else:
+                origin_list_backup.append(backup)
+
+        max_backups = TC.max_backups()
+        if max_backups < len(origin_list_backup) + 9:
+            clissDn = '%s,BrmBackupHousekeeping=SYSTEM_DATA' % hss_utils.node.cba.BACKUP_CLISS_DN
+            cliss_connection.update_parameters([{"clissDn":clissDn,
+                                                 "data":[{"name":"maxStoredManualBackups",
+                                                          "value":'%s' % (len(origin_list_backup) + 9)}]}])
+
+        cliss_connection.disconnect()
+
+        cmd = 'rm -rf /cluster/storage/Hss_Upgrade_Tool'
+        TC.run_node_command(cmd)
+        upgrade_upload (user_config, user_config.UPGRADETOOL, '/cluster/storage/')
+        cmd = 'cd /cluster/storage'
+        TC.run_node_command(cmd)
+        cmd = 'tar zxvf %s' % os.path.basename(user_config.UPGRADETOOL)
+        TC.run_node_command(cmd)
+
+        if user_config.config_file is not None:
+            upgrade_upload (user_config, user_config.config_file, '/cluster/storage/Hss_Upgrade_Tool/config/')
+
+        cmd = 'rm -rf /cluster/storage/upgrade_hss'
+        TC.run_node_command(cmd)
+
+        cmd = 'mkdir -p /cluster/storage/upgrade_hss'
+        TC.run_node_command(cmd)
+
+        upgrade_upload (user_config, user_config.UPGRADEPACKAGE, '/cluster/storage/upgrade_hss/')
+        if user_config.license_file is not None:
+            upgrade_upload (user_config, user_config.license_file, '/cluster/')
+
+        resume = False
+        next_step = False
+        while True:
+            if run_upgrade_tool(user_config.upgrade_type, user_config, resume):
+                max_tries = 3
+                while True:
+                    time.sleep(180)
+                    TC.reconnect(1800)
+                    access_config = acces_config_to_ACTIVE(user_config)
+                    if access_config:
+                        break
+                    else:
+                        TC.close_connection()
+                        max_tries -= 1
+                        if max_tries == 0:
+                            error_info = 'Problem selecting the active SC after a reconnection'
+                            _ERR(error_info)
+                            quit_program(st_command.EXECUTION_ERROR,error_info)
+
+                try:
+                    TC.change_connection_to_node(access_config)
+                except Exception as e:
+                    error_info = 'Error connecting to %s:%s  during upgrade: %s' % (user_config.NODE, user_config.port, e)
+                    _ERR(error_info)
+                    quit_program(st_command.EXECUTION_ERROR,error_info)
+
+                time.sleep(user_config.wait_for_resume)
+                resume = True
+            else:
+                break
+
+        # Sending time messages once the upgrade has finished
+        send_time_messages()
+        time_messages={}
+
+        access_config = {'host':user_config.NODE,
+                         'port':'22',
+                         'user':user_config.user}
+
+        try:
+            TC.change_connection_to_node(access_config)
+        except Exception as e:
+            error_info = 'Error connecting to %s:%s  after upgrade: %s' % (user_config.NODE, user_config.port, e)
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR,error_info)
+
+        cliss_connection = test_cases.clissConnection(TC.node,
+                                                    'hssadministrator')
+
+        final_list_backup = cliss_connection.search(hss_utils.node.cba.BACKUP_CLISS_DN,
+                                              'BrmBackup')
+        delta_list_backup = list(set(final_list_backup) - set(origin_list_backup))
+
+
+        if user_config.parameters is not None:
+            try:
+                with open(user_config.parameters) as json_data:
+                    data = json.load(json_data)
+            except Exception, e:
+                error_info = 'Error parsing json %s file: %s' % (user_config.parameters, str(e))
+                _ERR(error_info)
+                quit_program(st_command.EXECUTION_ERROR,error_info)
+
+
+            base_line_found = False
+            for release in data:
+                if release['release_base'] == hss_version:
+                    base_line_found = True
+                    continue
+
+                if base_line_found:
+                    _INF('Updating configuration parameters to %s' % release['release_base'])
+
+                    for change in release['changes']:
+                        try:
+                            for condition in change['conditions']:
+                                if TC.use_root_access:
+                                    user = 'root'
+                                else:
+                                    user = condition['user']
+
+                                cliss_connection = test_cases.clissConnection(TC.node,user)
+                                for element in condition['data']:
+                                    _INF('Checking conditions  %s = %s' %(element['name'],element['value']))
+                                    value = cliss_connection.search(condition['clissDn'],element['name'])
+                                    if value[0] != element['value']:
+                                        raise test_cases.ClissConditionCheckFailed('%s != %s' %(element['name'],
+                                                                                                element['value']))
+                                    _INF('OK')
+                        except KeyError:
+                            _INF('Not conditions for %s changes' % release['release_base'])
+
+                        except test_cases.ClissConditionCheckFailed, e:
+                            _INF('Skip parameters update due to %s' % str(e))
+                            continue
+
+                        if TC.use_root_access:
+                            user = 'root'
+                        else:
+                            user = change['user']
+
+                        cliss_connection = test_cases.clissConnection(TC.node,user)
+                        cliss_connection.update_parameters(change['parameters'])
+
+            if not base_line_found:
+                _WRN('Release base "%s" for updating configuration parameters not found in %s' % (hss_version, user_config.parameters))
+
+
+        TC.create_backup(user_config.BACKUPNAME)
+        # Jira HSSSTT-192: Collecting onfiguration info for checking with maiden installations
+        cmd = 'HSS_getConfigEnv --node %s --user %s --port %s' % (user_config.NODE, user_config.user, user_config.port)
+        _DEB('Executing command: %s' % cmd)
+        (output,returncode) = st_command.execute_cmd(cmd)
+        if returncode:
+            TC.send_test_case_info('HSS_getConfigEnv: FAILED')
+            error_info = 'Error when executing command HSS_getConfigEnv'
+            _ERR(error_info)
+            _ERR(output)
+        else:
+            TC.send_test_case_info('HSS_getConfigEnv: SUCCESS    File config_info_env_%s  generated.' % user_config.NODE)
+            _INF('Configuration file generated properly after upgrade')
+
+        # Jira HSSSTT-191: We wait for more than 5 minutes to check the generation of the PMF counter files
+        _DEB('Waiting for 5 minutes before checking the PMF counter files')
+        time.sleep(float(300))
+        cmd = 'CBA_check_pmf_counter_update --node %s --user %s --port %s -v' % (user_config.NODE, user_config.user, user_config.port)
+        _DEB('Executing command: %s' % cmd)
+        stdout, stderr, returncode = TC.run_stFramework_command(cmd, check_result = False)
+        if returncode:
+            TC.send_test_case_info('CBA_check_pmf_counter_update: FAILED')
+            error_info = 'Error when executing command CBA_check_pmf_counter_update'
+            _ERR(error_info)
+            quit_program(st_command.EXECUTION_ERROR, stderr)
+        else:
+            TC.send_test_case_info('CBA_check_pmf_counter_update: SUCCESS')
+            _INF('PMF counter files generated properly after upgrade')
+
+        if user_config.rollback:
+
+            _INF('Waiting %s seconds before executing rollback ' % user_config.wait_for_rollback)
+            time.sleep(float(user_config.wait_for_rollback))
+
+            resume = False
+            next_step = False
+            while True:
+                if run_upgrade_tool(user_config.upgrade_type, user_config, resume=resume, phase='--upgradePhase ROLLBACK'):
+                    max_tries = 3
+                    while True:
+                        time.sleep(180)
+                        TC.reconnect(1800)
+                        access_config = acces_config_to_ACTIVE(user_config)
+                        if access_config:
+                            break
+                        else:
+                            TC.close_connection()
+                            max_tries -= 1
+                            if max_tries == 0:
+                                error_info = 'Problem selecting the active SC after a reconnection'
+                                _ERR(error_info)
+                                quit_program(st_command.EXECUTION_ERROR,error_info)
+
+                    time.sleep(user_config.wait_for_resume)
+                    try:
+                        TC.change_connection_to_node(access_config)
+                    except Exception as e:
+                        error_info = 'Error connecting to %s:%s  after rollback: %s' % (user_config.NODE, user_config.port, e)
+                        _ERR(error_info)
+                        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+                    resume = True
+                else:
+                    break
+
+            # Sending time messages once the Rollback has finished
+            send_time_messages()
+
+
+        get_HssUpgradeTool_log()
+
+        for backup in delta_list_backup:
+            TC.delete_backup(backup)
+
+        if user_config.wait_scenario_stable and not user_config.stand_alone:
+            _INF('Max time waiting for scenario stable: %s seconds ' % user_config.wait_scenario_stable)
+            TC.wait_scenario_stable(user_config.wait_scenario_stable)
+
+
+    except IOError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except connection.Unauthorized as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.AUTHENTICATION_ERROR, error_info)
+
+    except (connection.ConnectionTimeout, connection.ConnectionFailed) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except (connection.ConnectionFailedTimeout ,connection.ConnectionFailedEOF) as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.CONNECTION_ERROR, error_info)
+
+    except test_cases.TestCaseError as e:
+        error_info = 'Error: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR, error_info)
+
+    except test_cases.TestCaseConfigurationError as e:
+        error_info = 'Usage not allowed: %s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except test_cases.ClissError as e:
+        error_info = '%s' % str(e)
+        _ERR(error_info)
+        quit_program(st_command.EXECUTION_ERROR,error_info)
+
+    except st_command.CommandFailure as e:
+        _ERR('Error: %s' % str(e))
+        quit_program(st_command.EXECUTION_ERROR,str(e))
+
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user!')
+
+    quit_program(st_command.SUCCESS)
+
+def parse_commandline():
+
+    parser = argparse.ArgumentParser(
+                        formatter_class=argparse.RawTextHelpFormatter,
+                        description=textwrap.dedent('Upgrade HSS in a CBA platform'),
+                        epilog=textwrap.dedent(st_command.get_exit_status())
+    )
+
+    access_params = parser.add_argument_group('Access options')
+    access_params.add_argument('-n','--node',
+                        action='store', default=None,
+                        help='''OAM  IP address of the node. 
+If ommitted local hostname will be used to find env in rosetta
+''',
+                        dest='NODE')
+
+    access_params.add_argument('--port',
+                      action='store', default=22,
+                      help='Port used in ssh.  Default value is 22',
+                      dest='port')
+
+    access_params.add_argument('--user',
+                      action='store', default='com-emergency',
+                      help='User for ssh.  Default value is "com-emergency"',
+                      dest='user')
+
+
+    scenario_params = parser.add_argument_group('Define scenario ')
+    scenario_params.add_argument('UPGRADETOOL',
+                                 help='Full path where the upgrade tool is stored')
+
+    scenario_params.add_argument('UPGRADEPACKAGE',
+                                 help='Full path where the upgrade package is stored')
+
+    scenario_params.add_argument('BACKUPNAME',
+                                 help='Name of the backup after upgrade')
+
+    scenario_params.add_argument('-l','--license_file',default=None,
+                        action='store', dest='license_file',
+                        help='Full path where License file is stored')
+
+    scenario_params.add_argument('-c','--config',default=None,
+                        action='store', dest='config_file',
+                        help='Full path where specific config.properties file is stored.')
+
+    scenario_params.add_argument('-p','--parameters',default=None,
+                        action='store', dest='parameters',
+                        help='Full path where node configuration parameters to be updated file is stored')
+
+    scenario_params.add_argument('--type',default='ROLLING',
+                        action='store', dest='upgrade_type',
+                        choices = ['ROLLING', 'ONE_STEP'],
+                        help='Select type of Upgrade. By default is "%(default)s"')
+ 
+    scenario_params.add_argument('--rollback',
+                      action='store_true', default=False,
+                      help='Execute the rollback after the upgrade.',
+                      dest='rollback')
+
+    scenario_params.add_argument('--wait-for-rollback',
+                        default=300, type=int, action='store', dest='wait_for_rollback',
+                        help='Time waiting after upgrade before execute rollback. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-scenario-stable',
+                        default=600, type=int, action='store', dest='wait_scenario_stable',
+                        help='Max time waiting for load stable and/or failure rate lower than 0.1. By default is "%(default)s"')
+
+    scenario_params.add_argument('--wait-for-resume',
+                        default=60, type=int, action='store', dest='wait_for_resume',
+                        help='Sleep time waiting after reconnecting and continue with the Upgrade. By default is "%(default)s"')
+
+    scenario_params.add_argument('-s','--stand_alone',
+                      action='store_true', default=False,
+                      help='Allow the usage without HSS_rtc.',
+                      dest='stand_alone')
+
+    logging=e3utils.log.add_logging_options(parser)
+
+    args = parser.parse_args()
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_testcase_upgrade_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(args)
+
+    if not args.log_file:
+        e3utils.log.add_file_logging(os.path.join(CWD, 'CBA_testcase_upgrade_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+
+    if not args.NODE:
+        _INF('Using rosetta for getting enviroment info')
+        try:
+            env, config = hss_utils.rosetta.services.get_env_for_localhost()
+            _INF('Environment  : %s' % env)
+            args.NODE = config.get_cabinet_oam_vip(cabinet=0)
+            _INF('Node         : %s' % args.NODE)
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable) as e:
+            error_info = 'Error: %s. Use command line parameter --node' % str(e)
+            _ERR(error_info)
+            quit_program(st_command.ROSETTA_ERROR, error_info)
+
+    return (args)
+
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, quit_gracefully)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _ERR('Additional information: %s' % str(e))
+        _ERR('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _ERR(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _ERR(tb)
+        quit_program(st_command.IMPLEMENTATION_ERROR)
+
+    quit_program(0)
+
+
+

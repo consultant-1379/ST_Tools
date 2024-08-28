@@ -1,0 +1,12 @@
+Source: hss-st-scenariodeploygenerator
+Section: networking
+Priority: optional
+Maintainer: <mitxel.garcia@ericsson.com>
+Build-Depends: debhelper (>= 7)
+Standards-Version: 3.9.2
+
+Package: hss-st-scenariodeploygenerator
+Architecture: amd64
+Section: networking
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Create cfg for HSS BAT execution

@@ -1,0 +1,17 @@
+hss-st-diaproxy (5.0-35) UNRELEASED; urgency=medium
+
+  * Update log printouts. (Closes: #XXXXXX)
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Tue, 09 Feb 2021 10:00:04 +0200
+
+hss-st-diaproxy (5.0-34) UNRELEASED; urgency=medium
+
+  * Initial release. (Closes: #XXXXXX)
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Fri, 29 Jan 2021 10:00:04 +0200
+
+hss-st-diaproxy (5.0-27) UNRELEASED; urgency=medium
+
+  * Initial release. (Closes: #XXXXXX)
+
+ -- mitxel Garcia MARTINEZ <mitxel.garcia@ericsson.com>  Wed, 07 Aug 2019 14:49:04 +0200

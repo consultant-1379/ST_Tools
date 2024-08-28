@@ -1,0 +1,29 @@
+{
+    "GET": {
+	"/nudm-voice-uecm/v1/imsi-*/context-data?dataRef=TADS": {
+	    "status": 200,
+	    "additional_headers": {"content-type": "application/json"},
+	    "data": "{\"tadsInformation\": {\"imsVoPSSupported\": true, \"ratType\": \"NR\"}}"
+	},
+	"/nudm-voice-uecm/v1/msisdn-*/context-data?dataRef=LOCATION&currentLocation=true": {
+	    "status": 200,
+	    "additional_headers": {"content-type": "application/json"},
+	    "data": "{\"locationInformation\":{\"ncgi\":{\"plmnId\":{\"mcc\":\"107\",\"mnc\":\"08\"},\"nrCellId\":\"acef1225a\"},\"ecgi\":{\"plmnId\":{\"mcc\":\"460\",\"mnc\":\"01\"},\"eutraCallId\":\"5bd6007\"},\"tail\":{\"plmnId\":{\"mcc\":\"824\",\"mnc\":\"46\"},\"tac\":\"8dfc\"},\"locationEstimate\":{\"point\":{\"lon\":107,\"lat\":73},\"shape\":\"POINT\"},\"amfId\":\"f5ca9031-1b93-489f-9b58-818805c19f2a\",\"currentLocationRetrieved\":false,\"ageOfLocationEstimate\":3600,\"vPlmnId\":{\"mcc\":\"717\",\"mnc\":\"17\"},\"localTimeZone\":\"Beijing\",\"ratType\":\"NR\"}}"
+	}
+    },    
+    "POST": {
+	"/nhss-irat4g5g/v1/imsi-*/registrations/mmelocation": {
+	    "status": 200,
+	    "additional_headers": {"content-type": "application/json"},
+	    "data": "{\"response\": ${URL}s}"
+	},
+    "/nudm-irat4g5g/v1/imsi-*/registrations/amflocation": {
+        "status": 200,
+        "data": "",
+        "additional_headers": {"content-type": "text/plain; charset=utf-8"}
+    },
+    "/nudm-voice-uecm/v1/imsi-*/ims-registration/?eregistration": {
+        "status": 204
+    }
+    }
+}

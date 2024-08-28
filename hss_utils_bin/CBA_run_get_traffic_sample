@@ -1,0 +1,1022 @@
+#!/usr/bin/python2.7
+
+
+import os
+CWD = os.getcwd()
+import os.path
+import sys
+import json
+import time
+from datetime import datetime
+import tempfile
+import atexit
+import socket
+import random
+import hashlib
+import argparse
+import textwrap
+import signal
+import socket
+import pexpect
+
+HOSTNAME = socket.gethostname()
+
+import getpass
+import traceback
+import threading
+import subprocess
+from optparse import OptionParser
+from distutils.spawn import find_executable
+import shlex
+
+import e3utils.log
+_INF = e3utils.log.info
+_DEB = e3utils.log.debug
+_ERR = e3utils.log.error
+_WRN = e3utils.log.warning
+
+try:
+    import hss_utils.rosetta
+    import hss_utils.rosetta.services
+    _ROSETTA_AVAILABLE_ = True
+except ImportError, e:
+    _WRN('Cannot import hss_utils.rosetta: %s' % e)
+    _WRN('Rosetta access will be disabled')
+    _ROSETTA_AVAILABLE_ = False
+
+import hss_utils.st_command
+import hss_utils.connection as connection
+import hss_utils.node.gentraf
+
+
+def quit_gracefully(*args):
+    raise KeyboardInterrupt, "Signal handler"
+
+
+EXIT_ERRORS =  {
+0: 'Success',
+1: 'Not found / do not exist',
+2: 'Execution error',
+3: 'Execution Timeout',
+4: 'Connection error',
+5: 'Authentication error',
+10: 'Wrong parameter value',
+20: 'Command not supported',
+40: 'Rosetta error',
+100: 'Implementation error'
+    }
+
+# Exit status
+EXIT_CODE = 0
+SUCCESS = 0
+NOT_FOUND = 1
+EXECUTION_ERROR = 2
+TIMEOUT = 3
+CONNECTION_ERROR = 4
+AUTHENTICATION_ERROR = 5
+WRONG_PARAMETER = 10
+NOT_SUPPORTED = 20
+ROSETTA_ERROR = 40
+IMPLEMENTATION_ERROR = 100
+
+def get_exit_status():
+    exit_status = '''\
+    EXIT STATUS
+'''
+    for key in sorted(EXIT_ERRORS):
+        exit_status += '\t%s\t%s\n' % (key, EXIT_ERRORS[key])
+
+    return exit_status
+
+TRAFFIC_HANDLER=None
+TCP_DUMP_HANDLER=None
+HTTPSERVER_HANDLER=None
+
+def quit_program(exit_code):
+    global TRAFFIC_HANDLER
+
+    if TCP_DUMP_HANDLER is not None:
+        TCP_DUMP_HANDLER.release()
+
+    if TRAFFIC_HANDLER is not None:
+        TRAFFIC_HANDLER.release()
+
+    if HTTPSERVER_HANDLER is not None:
+        HTTPSERVER_HANDLER.release()
+
+    _DEB('Exit code: %s (%s)' % (exit_code, EXIT_ERRORS.get(exit_code, 'unknown error code')))
+    sys.exit(exit_code)
+
+
+
+def parse_commandline():
+    FILE_MASK = ['USER', 'ACTION', 'PARALLEL']
+
+    parser = argparse.ArgumentParser(
+            formatter_class=argparse.RawTextHelpFormatter,
+            description=textwrap.dedent('''\
+            Automation tool for taking a wireshark capture using TCP Dump tool in provided cabinet on FEs processor(s).
+            It captures all traffic incoming and outgoing from the cabinet.
+            Actions:
+                - Start HttpServer if configured
+                - Start a TCP dump if configured
+                - Start run_titansim_HSS_BAT (by defualt range 1 for 1 subcriber 
+                - Stop a TCP dump if configured
+                - Analyze traffic after traffic execution
+                - Stop HttpServer if configured
+                '''),
+            epilog=textwrap.dedent(get_exit_status()))
+
+    parser.add_argument('TRAFFIC_CASES',nargs='+',
+                        help='''Traffic cases to be executed.
+The format is "TRAFFIC_CASE_NAME:SUBSCRIBER_OFFSET:SUBSCRIBER_COUNT"
+TRAFFIC_CASE_NAME may be a substring in the available traffic cases names that must identify only one script to run. A list of traffic cases can be selected to run different traffic scripts.
+Both SUBSCRIBER_OFFSET and SUBSCRIBER_COUNT are optionals. Default values will be used.
+The script will add the WEIGHT to generate the TRAFFIC CASE that will be executed by the "run_titansim_HSS_BAT" script ''')
+
+    scenario_params = parser.add_argument_group('Define SUT, Titan components and auxiliary tools ')
+    scenario_params.add_argument('-V', '--cabinet-ip',
+                      action='store', default='',
+                      help='''Set the IP list of the cabinet and the ExtDB IP. Format is [OAM[:DIA_TCP:DIA_SCTP:RADIUS:CONTROL:EXT_DB:SOAP:UDM]]
+    If argument is ommitted then the local hostname will be used to find env information in rosetta
+    If you set the IP list the first one (OAM) is mandatory
+    If you set only the OAM the rest of information will be fetched automatically from the HSS.
+
+    The CONTROL (if defined) shall be the OAM IP for CBA
+
+''',
+                      dest='vip_data')
+
+    scenario_params.add_argument('--user',
+                        action='store', default='com-emergency',
+                        help='User to get connected to the node. Default value is %(default)s if ommitted',
+                        dest='user')
+
+    scenario_params.add_argument('--set-bat-cfg-path',
+                      action='store', default='/opt/hss/system_test/share/BAT',
+                      help='Set specific BAT CONFIGURATION path. By default is "%(default)s"',
+                      dest='bat_cfg_path')
+
+    behaviour_params = parser.add_argument_group('Configure tool behavior')
+    behaviour_params.add_argument('-v', '--verbose',
+                      action='store_true', default=False,
+                      help='verbose. Prints internal input/output from command.',
+                      dest='verbose')
+
+    behaviour_params.add_argument('-6',
+                      action='store_true', default=False,
+                      help='Select IPv6 traffic.',
+                      dest='ipv6')
+
+    behaviour_params.add_argument('-s', '--skip-tcpdump',
+                      action='store_true', default=False,
+                      help='Do NOT get a TCP Dump, just run traffic.',
+                      dest='skip_tcpdump')
+
+    behaviour_params.add_argument('--skip-http-server',
+                      action='store_true', default=False,
+                      help='Do NOT start an http server as UDM client.',
+                      dest='skip_httpserver')
+
+    behaviour_params.add_argument('--show-tool-info',
+                      action='store_true', default=False,
+                      help='Show in console information provided by tcpdump and run_titansim.',
+                      dest='show_tool_info')
+
+    behaviour_params.add_argument('--check-stats',
+                      action='store_true', default=False,
+                      help='Check the traffic statistic file provided by BAT.',
+                      dest='check_stats')
+
+    tcp_dump_params = parser.add_argument_group('Parameters to be added to TCP Dump default command line')
+
+    tcp_dump_params.add_argument('--processors', nargs='+',
+                        default=None, action='store', dest='processors',
+                        help='List of processors')
+
+    tcp_dump_params.add_argument('--albs',nargs='+',
+                        default=None, action='store', dest='alb',
+                        help='List of ALBs')
+
+    tcp_dump_params.add_argument('--filter',
+                        default=None, action='store', dest='eth_filter',
+                        help='packet filter in libpcap filter syntax. It must be quotted')
+
+    tcp_dump_params.add_argument('--skip-merge',
+                        default=False, action='store_true', dest='skip_merge',
+                        help='DO NOT merge pcap files. User can do it using mergecap command')
+
+
+    traffic_params = parser.add_argument_group('Parameters to be added to run_titansim_HSS_BAT default command line')
+
+    traffic_params.add_argument('-r', '--range',
+                      action='store', type=int, default=0,
+                      help='Set execution mode to "by range" setting it to RANGE_LOOPS number.',
+                      dest='range_loops')
+
+    traffic_params.add_argument('-b', '--bat-binary',
+                      action='store', default=None,dest='bat_binary',
+                      help='Set BAT binary file to a different one than official one (stable versions). Useful for bat development/testing.')
+
+    traffic_params.add_argument('-E', '--extra-parameters',
+                      action='append',default=[], 
+                      help='''Modify a set of parameters included on DEFINE configuration file section.
+    Format is TYPE:PARAM_NAME:PARAM_VALUE. Allowed values for TYPE: "q" to add quotes to parameter value or any other value to avoid them
+
+''',
+                      dest='extra_parameters')
+
+    traffic_params.add_argument('-L', '--logmask',
+                      action='store', default='ERROR',
+                      help='''Set, using quottes, the File Log Mask that will be added to default value %s
+    ERROR will be added automatically if parameter is omitted.
+    For removing ERROR from logmask set the parameter value to empty: -L ""
+
+''' % '|'.join(FILE_MASK),
+
+                      dest='file_mask')
+
+    traffic_params.add_argument('--hss-version',
+                      action='store', default=None,
+                      help='''Force an specific HSS version used for selecting the TrafficMix file that shall be stored on $BAT_CFG_PATH/traffic_<type>/
+
+''',
+                      dest='hss_version')
+
+    traffic_params.add_argument('--trafficmix-preffix',
+                      action='store', default='',
+                      help='''Set an specific TrafficMix file that shall be stored on $BAT_CFG_PATH/traffic_<type>/
+If traffic-mix is not set the application will search the right one based on HSS_VERSION got from the cabinet
+and if not found the default one will be used
+
+''',
+                      dest='trafficmix_preffix')
+
+    traffic_params.add_argument('--dia-port-offset',
+                      action='store', type=int, default=None,
+                      help='Offset used for selecting diaproxy ports (-li and -udp). If no set a randon values will be used',
+                      dest='dia_port_offset')
+
+
+    logging=e3utils.log.add_logging_options(parser)
+    logging.add_argument('--set-working-path',
+                      action='store', default=None,
+                      help='Set specific working path. Default is "%s"' % CWD,
+                      dest='working_path')
+
+    options = parser.parse_args()
+    #options, unknown = parser.parse_known_args()
+
+
+    if options.verbose:
+        options.e3utils_log_debug = options.verbose
+        options.e3utils_log_debug_internal = options.verbose
+
+    if options.working_path is not None and options.log_file is not None:
+        _ERR('Error: --log_file and --set-working-path can not be used at the same time' )
+        quit_program(CMDLINE_ERROR)
+
+    e3utils.log.CONSOLE_PREFIX='(CBA_run_get_traffic_sample_%s.log)' % os.getpid()
+    e3utils.log.setup_logging_options(options)
+
+    if options.working_path is None:
+        options.working_path = CWD
+    else:
+        options.working_path = hss_utils.st_command.real_path(options.working_path)
+
+    if not os.path.exists(options.working_path):
+        os.makedirs(options.working_path)
+
+    if options.log_file is None:
+        e3utils.log.add_file_logging(os.path.join(options.working_path, 'CBA_run_get_traffic_sample_%s.log' % os.getpid()),
+                                     level=e3utils.log.DEBUG)
+
+    with open(os.path.realpath(__file__), 'r') as myself:
+        _DEB('** Binary MD5: %s' % hashlib.md5(myself.read()).hexdigest())
+    _DEB('** Commandline: "%s"' % ' '.join(sys.argv))
+    _INF('Working path : %s' % options.working_path)
+
+    if options.vip_data == '':
+        _INF('Using rosetta for getting enviroment info')
+        env, config = hss_utils.rosetta.services.get_env_for_localhost()
+        _INF('Environment  : %s' % env)
+        try:
+            options.vip_data = config.get_cabinet_oam_vip(cabinet=0)
+            options.node = options.vip_data
+
+        except (hss_utils.rosetta.ObjectNotFound, hss_utils.rosetta.RosettaUnavailable, hss_utils.rosetta.InfoNotFound) as e:
+            _ERR('Error: %s. Use command line parameter -V' % str(e))
+            quit_program(ROSETTA_ERROR)
+
+    else:
+        options.node = options.vip_data.split(':') [0]
+        if len(options.vip_data.split(':'))==1:
+            options.vip_data += '::::::%s:' % options.vip_data
+
+
+    options.user_tcp_dump_options = ''
+    if options.processors:
+        options.user_tcp_dump_options += ' --processors %s' % ' '.join(options.processors)
+
+    if options.alb:
+        options.user_tcp_dump_options += ' --albs %s' % ' '.join(options.alb)
+
+    if options.eth_filter:
+        options.user_tcp_dump_options += ' --filter "%s"' % options.eth_filter
+
+    if options.skip_merge:
+        options.user_tcp_dump_options += ' --skip_merge'
+
+    options.user_traffic_options = ''
+    if options.bat_binary:
+        options.user_traffic_options += ' --bat-binary %s' % options.bat_binary
+
+    if options.extra_parameters:
+        options.user_traffic_options += ' -E "%s"' % ' '.join(options.extra_parameters)
+
+    if options.file_mask != 'ERROR':
+        options.user_traffic_options += ' -L "%s"' % options.file_mask
+
+    if options.hss_version:
+        options.user_traffic_options += ' --hss_version %s' % options.hss_version
+
+    if options.trafficmix_preffix:
+        options.user_traffic_options += ' --trafficmix-preffix %s' % options.trafficmix_preffix
+
+    if options.dia_port_offset:
+        options.user_traffic_options += ' --dia-port-offset %s' % options.dia_port_offset
+
+
+    #print unknown
+    #quit_program(0)
+
+    return (options)
+
+class Traffic_case(object):
+    def __init__(self, data, user_config):
+        self.__data = self.parse_data(data)
+        self.__user_config = user_config
+        self.__bat_data_file = None
+        self.__bat_cfg_path =  hss_utils.st_command.real_path(user_config.bat_cfg_path)
+        self.__groupNames = []
+        self.__working_path = os.path.abspath(os.path.join(self.__user_config.working_path,
+                                            '%s_%s' % (time.strftime("%Y%m%d-%H%M%S"), self.name) ))
+
+
+    def __str__(self):
+        oupput = '\n\n\t\t\t********* Traffic data ***********'
+        oupput += '\n\t\t\t\tCase     : %s' % self.name
+        oupput += '\n\t\t\t\tScenario : %s ' % self.scenario
+        oupput += '\n\t\t\t\tMode     : %s ' % ('ASYNC' if self.async else 'SYNC')
+        oupput += '\n\t\t\t**********************************\n'
+        return oupput
+
+    def parse_data(self, data):
+        # insert ":" for the weight as the second element of the traffic case
+        nofvalues = len(data.split(':'))
+        if nofvalues == 1:
+            value = data + ':::1'
+        elif nofvalues == 2:
+            prefix_value=data.split(':')[0]
+            suffix_value=data.split(':')[1]
+            value = prefix_value + '::' + suffix_value + ':1'
+        elif nofvalues == 3:
+            prefix_value=data.split(':')[0]
+            offset_value=data.split(':')[1]
+            subscr_value=data.split(':')[2]
+            if len(subscr_value):
+                value = prefix_value + '::' + offset_value + ':' + subscr_value
+            else:
+                value = prefix_value + '::' + offset_value + ':1'
+        else: # Wrong format if nofvalues greater than 4
+            _ERR('WRONG TRAFFIC CASE format passed as parameter: %s' % data)
+            quit_program(WRONG_PARAMETER)
+        return value
+
+    @property
+    def async(self):
+        return ' -Z' if 'EXCLUDE_FOR_SYNC' in self.groupNames else ''
+
+    @property
+    def scenario(self):
+        return 'EPC' if 'EPC' in self.bat_data_file else 'IMS'
+
+    @property
+    def name(self):
+        return self.__data.split(':')[0]
+
+    @property
+    def show_tool_info(self):
+        return self.__user_config.show_tool_info
+
+    @property
+    def bat_data_file(self):
+        if self.__bat_data_file is None:
+            cmd = 'grep %s %s/*/*_Traffic.data' % (self.name, self.__bat_cfg_path)
+            _INF('Executing:  "%s"' % cmd)
+
+            stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd, stdout=True, stderr=True)
+            if returncode:
+                _ERR('Traffic case %s does not exist' % self.name)
+                quit_program(WRONG_PARAMETER)
+
+            if len(stdout_value.splitlines()) >1:
+                _ERR('Traffic case %s matches more than 1 traffic script. Be more specific with the name. ' % self.name)
+                quit_program(WRONG_PARAMETER)
+
+            self.__bat_data_file = stdout_value.split('\n')[0].split(':')[0]
+
+        return self.__bat_data_file
+
+    @property
+    def groupNames(self):
+
+        try:
+            with open(self.bat_data_file) as f:
+                info = f.readlines()
+        except IOError as e:
+            _ERR('%s' % e)
+            quit_program(EXECUTION_ERROR)
+
+        located = False
+        for line in info:
+            if 'tcName' in line and self.name in line:
+                located = True
+            elif located and 'groupName' in line:
+                self.__groupNames.append(line.split()[-1])
+            elif line.startswith('tcName') and located :
+                break
+
+        return self.__groupNames
+
+    @property
+    def working_path(self):
+        return self.__working_path
+
+
+    @property
+    def traffic_cmd(self):
+        cmd = 'run_titansim_HSS_BAT -A -z 1:1 -E :SYNC:5 -C %s -V %s' % (self.scenario, self.__user_config.vip_data)
+        cmd += ' %s' % ('-6' if self.__user_config.ipv6 else '')
+        cmd += ' -r %s' % (self.__user_config.range_loops if self.__user_config.range_loops else 1)
+        cmd += ' --set-bat-cfg-path %s --set-working-path %s' % (self.__bat_cfg_path, os.path.join(self.working_path,'traffic'))
+        cmd += ' -x %s %s --node-type CBA' % (self.__data, self.async)
+        cmd += '%s' % ' -E :RADIUS_PORT:1813' if self.scenario == 'IMS' else ''
+        cmd += ' --cliss-user %s' % self.__user_config.user
+
+        cmd += self.__user_config.user_traffic_options
+        return cmd
+
+    @property
+    def tcp_dump_file(self):
+        return os.path.abspath(os.path.join(self.working_path,'%s.pcap' % self.name) )
+
+    @property
+    def tcp_dump_cmd(self):
+        cmd = 'CBA_run_tcpdump --node %s' % self.__user_config.node
+        cmd += ' -o %s ' % self.tcp_dump_file
+        cmd += ' --user %s' % self.__user_config.user
+
+        cmd += self.__user_config.user_tcp_dump_options
+        return cmd
+
+
+class HTTP_server_handler(threading.Thread):
+    def __init__(self, url, working_path, ipv6=False):
+
+        threading.Thread.__init__(self)
+        self.__ipv6 = ipv6
+        if ipv6:
+            idx_port = url.rindex(':')
+            self.__host = url[0 : idx_port]
+            self.__port = url[idx_port+1 : len(url)]
+        else:
+            self.__host = url.split(':')[0]
+            self.__port = url.split(':')[1]
+
+        self.__working_path = working_path
+        self.__logfile = None
+        self.__test_case_received_req = 0
+        self.__status = 'idle'
+        self.__id = 'HTTP_SERVER_HANDLER'
+
+        access_config = {'host':self.__host}
+        try:
+            self.__node = hss_utils.node.gentraf.GenTraf(config = access_config)
+            self.__channel = self.__node.get_channel()
+        except connection.Unauthorized as e:
+            _ERR('%s creation problem: %s' % (self.__id ,str(e)))
+            quit_program(CONNECTION_ERROR)
+
+        except (connection.ConnectionFailed, connection.ConnectionTimeout) as e: 
+            _ERR('%s creation problem: %s' % (self.__id ,str(e)))
+            quit_program(CONNECTION_ERROR)
+
+        except KeyboardInterrupt:
+            _WRN('%s creation cancelled by user' % self.__id)
+            quit_program(CONNECTION_ERROR)
+
+        except Exception as e:
+            _ERR('%s creation problem: %s' % (self.__id ,str(e)))
+            quit_program(CONNECTION_ERROR)
+
+        self.__sync_expression = self.__node.get_connection().sync_expression
+
+    @property
+    def status(self):
+        return self.__status
+
+    @property
+    def channel(self):
+        return self.__channel
+
+    def release(self):
+        self.stop_http_server()
+
+
+    def start_http_server(self, max_time=30.0):
+        self.__status = 'starting'
+        self.start()
+        while self.status == 'starting':
+            now = time.time()
+            time.sleep(1.0)
+            max_time -= time.time() - now
+            if max_time > 0:
+                continue
+            break
+
+
+    def stop_http_server(self):
+        if self.status in ['running','starting']:
+            _INF('%s Stop HttpServer' % self.__id)
+            self.__status = 'stopping'
+            self.channel.write_line(chr(3))
+
+    def start_tc(self,tc):
+        self.__test_case_received_req = 0
+        self.log('')
+        self.log('************  %s started  ************' % tc)
+        self.log('')
+
+    def stop_tc(self,tc):
+        self.log('Total request received: %s' % self.__test_case_received_req)
+        self.log('')
+        self.log('************  %s stopped  ************' % tc)
+        self.log('')
+
+    def log(self,info):
+        if self.__logfile:
+            self.__logfile.write('%s:\t%s\n' % (datetime.now(), info))
+
+    def run(self):
+        if self.__ipv6:
+            if '[' in self.__host:
+                cmd = 'HttpServer %s:%s 5' % (self.__host, self.__port)
+            else:
+                _WRN('IPv6 "%s" should have go between brackets' % self.__host)
+                cmd = 'HttpServer [%s]:%s 5' % (self.__host, self.__port)
+        else:
+            cmd = 'HttpServer %s:%s 5' % (self.__host, self.__port)
+        _INF('%s Executing:  "%s"' % (self.__id, cmd))
+        self.channel.write_line(cmd)
+
+        while True:
+            try:
+                result = self.channel.expect(['start server on %s:%s' % (self.__host, self.__port),
+                                            'bind: address already in use',
+                                            self.__sync_expression,
+                                            '\r\n'])
+
+                if result == 0:
+                     _INF('')
+                     self.__status = 'running'
+                     self.__logfile = open(os.path.join(self.__working_path,'HttpServer_%s.log' % os.getpid()),"w+",0)
+                     self.log('HttpServer started on %s:%s' % (self.__host, self.__port))
+
+                elif result == 1:
+                    _ERR('%s HttpServer execution failed: address already in use' % (self.__id))
+
+                    self.__status = 'stopped'
+                    if self.__logfile:
+                        self.log('HttpServer faulty: address already in use')
+                        self.__logfile.close()
+                        self.__logfile = None
+                    break
+
+                elif result == 2:
+                    if self.status == 'stopping':
+                        _INF('%s HttpServer executed success' % (self.__id))
+                    else:
+                        _ERR('%s HttpServer execution failed' % (self.__id))
+
+                    self.__status = 'stopped'
+                    if self.__logfile:
+                        self.log('HttpServer stopped')
+                        self.__logfile.close()
+                        self.__logfile = None
+                    break
+
+                elif result == 3 and self.channel.stdout:
+                    _DEB('%s %s' % (self.__id, self.channel.stdout))
+                    if 'Increment count' in self.channel.stdout:
+                        increment = int(self.channel.stdout.split()[-1])
+                        if increment > 0:
+                            self.__test_case_received_req += increment
+                            self.log(self.channel.stdout)
+
+                    elif 'Request count' not in self.channel.stdout:
+                        self.log(self.channel.stdout)
+
+            except pexpect.TIMEOUT as e:
+                _DEB('%s pexpect.TIMEOUT received' % self.__id)
+
+            except pexpect.EOF as e:
+                _ERR('%s pexpect.EOF received' % self.__id)
+                quit_program(CONNECTION_ERROR)
+
+        self.__node.release()
+
+
+
+class TCP_dump_handler(threading.Thread):
+    def __init__(self, testcase):
+
+        threading.Thread.__init__(self)
+        self.__tc  = testcase
+        self.__status = 'idle'
+        self.__id = 'TCP_DUMP_HANDLER'
+
+        access_config = {'host':HOSTNAME} 
+        try:
+            self.__node = hss_utils.node.gentraf.GenTraf(config = access_config)
+            self.__node.working_dir = testcase.working_path
+            self.__channel = self.__node.get_channel()
+        except connection.Unauthorized as e: 
+            _ERR('%s creation problem: %s' % (self.__id ,str(e)))
+            quit_program(CONNECTION_ERROR)
+
+        except (connection.ConnectionFailed, connection.ConnectionTimeout) as e: 
+            _ERR('%s creation problem: %s' % (self.__id ,str(e)))
+            quit_program(CONNECTION_ERROR)
+
+        except KeyboardInterrupt:
+            _WRN('%s creation cancelled by user' % self.__id)
+            quit_program(CONNECTION_ERROR)
+
+        except Exception as e:
+            _ERR('%s creation problem: %s' % (self.__id ,str(e)))
+            quit_program(CONNECTION_ERROR)
+
+        self.__sync_expression = self.__node.get_connection().sync_expression
+
+    @property
+    def status(self):
+        return self.__status
+
+    @property
+    def channel(self):
+        return self.__channel
+
+    def release(self):
+        self.stop_tcpdump()
+
+
+    def start_tcpdump(self, max_time=120.0):
+        self.start()
+        while self.status != 'running':
+            now = time.time()
+            time.sleep(1.0)
+            max_time -= time.time() - now
+            if max_time > 0:
+                continue
+            break
+
+
+    def stop_tcpdump(self):
+        if self.status  in ['running','starting']:
+            _INF('%s Stop tcpdump' % self.__id)
+            self.channel.write_line(chr(3))
+
+
+    def run(self):
+        _INF('%s Executing:  "%s"' % (self.__id, self.__tc.tcp_dump_cmd))
+        self.channel.write_line(self.__tc.tcp_dump_cmd)
+        self.__status = 'starting'
+
+        while True:
+            try:
+                result = self.channel.expect(['Press ctrl-c to stop',
+                                            self.__sync_expression,
+                                            '\r\n',
+                                            'Capture stopped by user!'])
+
+                if result == 0:
+                     _INF('%s TCP dump for %s capturing.....' % (self.__id, self.__tc.name))
+                     _INF('')
+                     self.__status = 'running'
+
+                elif result == 1:
+                    if self.status == 'stopping':
+                        _INF('%s TCP dump for %s success' % (self.__id, self.__tc.name))
+                    else:
+                        _ERR('%s TCP dump for %s failed' % (self.__id, self.__tc.name))
+
+                    self.__status = 'stopped'
+                    break
+
+                elif result == 2 and self.__tc.show_tool_info:
+                    if ' DEB ' not in self.channel.stdout and not self.channel.stdout.startswith('debug') and  len(self.channel.stdout) > 4:
+                        print '%s' % self.channel.stdout[1:]
+
+                elif result == 3:
+                     _INF('%s TCP dump for %s stopping.....' % (self.__id, self.__tc.name))
+                     _INF('')
+                     self.__status = 'stopping'
+
+            except pexpect.TIMEOUT as e:
+                _DEB('%s pexpect.TIMEOUT received' % self.__id)
+
+            except pexpect.EOF as e:
+                _ERR('%s pexpect.EOF received' % self.__id)
+                quit_program(CONNECTION_ERROR)
+
+        self.__node.release()
+
+class Traffic_handler(object):
+    def __init__(self, user_config):
+        self.__tc = None
+        self.__id = 'TRAFFIC_HANDLER'
+        self.__traffic_status = 'idle'
+        access_config = {'host':HOSTNAME} 
+        try:
+            self.__node = hss_utils.node.gentraf.GenTraf(config = access_config, allow_x11_forwarding = True)
+            self.__channel = self.__node.get_channel()
+        except connection.Unauthorized as e: 
+            _ERR('%s creation problem: %s' % (self.__id, str(e)))
+            quit_program(CONNECTION_ERROR)
+
+        except (connection.ConnectionFailed, connection.ConnectionTimeout) as e: 
+            _ERR('%s creation problem: %s' % (self.__id, str(e)))
+            quit_program(CONNECTION_ERROR)
+
+        except KeyboardInterrupt:
+            _WRN('%s creation cancelled by user' % self.__id)
+            quit_program(CONNECTION_ERROR)
+
+        except Exception as e:
+            _ERR('%s creation problem: %s' % (self.__id, str(e)))
+            quit_program(CONNECTION_ERROR)
+
+        self.__sync_expression = self.__node.get_connection().sync_expression
+
+    @property
+    def channel(self):
+        return self.__channel
+
+    @property
+    def node(self):
+        return self.__node
+
+    def release(self):
+        if self.node is None:
+            return
+
+        self.node.release()
+        self.__node = None
+
+
+    def analyze_traffic_error(self):
+        _INF('')
+        _INF('Traffic Result:')
+        for phase in ['PRE', 'LOAD', 'POST']:
+            cmd = 'grep "TRAFFIC ERROR" traffic/*.log | grep %s' % phase
+            _DEB('%s executing %s' % (self.__id, cmd))
+            stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=self.__tc.working_path)
+            if returncode:
+                _INF('\t%s\t\tErrors: 0' % phase)
+                continue
+
+            _ERR('\t%s\t\tErrors: %s' % (phase, len(stdout_value.splitlines())))
+            cmd = 'grep "TRAFFIC ERROR" traffic/*.log | grep %s >> BAT_execution_errors.txt' % phase
+            _DEB('%s executing %s' % (self.__id, cmd))
+            stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=self.__tc.working_path)
+            if returncode:
+                _ERR('%s problem saving %s traffic errors in %s' % (self.__id, phase, os.path.join(self.__tc.working_path,'BAT_execution_errors.txt')))
+                quit_program(EXECUTION_ERROR)
+
+
+    def analyze_statistic_file(self):
+        cmd = 'find  . -name "*.txt" | grep --color=never "stats_-Measure"'
+        _DEB('%s executing %s' % (self.__id, cmd))
+        stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=os.path.join(self.__tc.working_path,'traffic'))
+        if returncode:
+            _ERR('%s problem finding statistic file ' % self.__id)
+            quit_program(EXECUTION_ERROR)
+
+        for line in stdout_value.split():
+            if 'No such file or directory' in line or line == '""':
+                continue
+            if 'stats_-Measure' in line:
+                stat_file = line
+                _DEB('%s statistic file %s' % (self.__id, line))
+                break
+
+        if not stat_file:
+            _ERR('%s problem finding statistic file ' % self.__id)
+            quit_program(EXECUTION_ERROR)
+
+        cmd = 'tail -2 "%s"' % stat_file
+        _DEB('%s executing %s' % (self.__id, cmd))
+        stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=os.path.join(self.__tc.working_path,'traffic'))
+        if returncode:
+            _ERR('%s problem parsing statistic file ' % (self.__id,stat_file))
+            quit_program(EXECUTION_ERROR)
+
+
+        values = stdout_value.splitlines()[0].split(':')[-1]
+        values = values.split()
+        if len(values) == 9:
+            _INF('')
+            _INF('Traffic Statistics:')
+            if values[0]:
+                _INF('\tPRE\t\tExecuted: %s\tSuccess: %s\tFailed: %s' % (values[0],values[1],values[2]))
+            if values[3]:
+                _INF('\tLOAD\t\tExecuted: %s\tSuccess: %s\tFailed: %s' % (values[3],values[4],values[5]))
+            if values[6]:
+                _INF('\tPOST\t\tExecuted: %s\tSuccess: %s\tFailed: %s' % (values[6],values[7],values[8]))
+        else:
+            _ERR('%s problem parsing statistic file %s ' % (self.__id, stat_file))
+            quit_program(EXECUTION_ERROR)
+
+    @property
+    def traffic_status(self):
+        return self.__traffic_status
+
+    @property
+    def traffic_executed(self):
+        return self.__traffic_status == 'executed'
+
+    def run(self, testcase):
+        self.__tc  = testcase
+
+        _INF('%s Executing:  "%s"' % (self.__id, testcase.traffic_cmd))
+        self.__traffic_status = 'starting'
+        self.channel.write_line(testcase.traffic_cmd)
+
+        while True:
+            try:
+                result = self.channel.expect(['Automatic mode detected, sleeping 25 seconds to go',
+                                            self.__sync_expression,
+                                            '\r\n',
+                                            'Alias sent',
+                                            'Scenario deploy generator failed!'])
+
+                if result == 0:
+                    _INF('%s traffic for %s finished. Waiting for counters' % (self.__id, self.__tc.name))
+                    self.__traffic_status = 'executed'
+
+                elif result == 1:
+                    if self.__traffic_status == 'faulty_scenario':
+                        _ERR('%s analyze %s file  ' % (self.__id, os.path.join(self.__tc.working_path,'traffic','scenarioGenerator_result.txt')))
+
+
+                    elif self.__traffic_status != 'executed':
+                        _ERR('%s execution for %s failed' % (self.__id, self.__tc.name))
+                        cmd = 'check_traffic_configuration.sh >> traffic_configuration.txt'
+                        _INF('%s executing: %s' % (self.__id, cmd))
+                        stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=os.path.join(self.__tc.working_path,'traffic'))
+                        if returncode:
+                            _ERR('%s problem finding traffic configuration errors ' % self.__id)
+                            quit_program(EXECUTION_ERROR)
+
+                        cmd = 'check_traffic_configuration.sh -d >> traffic_configuration.txt'
+                        _INF('%s executing: %s' % (self.__id, cmd))
+                        stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd,stdout= True,stderr = True,cwd=os.path.join(self.__tc.working_path,'traffic'))
+                        if returncode:
+                            _ERR('%s problem finding BAT dynamic errors ' % self.__id)
+                            quit_program(EXECUTION_ERROR)
+
+                        _ERR('%s analyze %s file  ' % (self.__id, os.path.join(self.__tc.working_path,'traffic','traffic_configuration.txt')))
+
+                    break
+
+                elif result == 2 and self.__tc.show_tool_info:
+                    if ' DEB ' not in self.channel.stdout and not self.channel.stdout.startswith('debug') and  len(self.channel.stdout) > 4:
+                        print '%s' % self.channel.stdout[1:]
+
+                elif result == 3:
+                    _INF('%s traffic for %s running' % (self.__id, self.__tc.name))
+                    self.__traffic_status = 'running'
+
+                elif result == 4:
+                    _ERR('%s faulty scenario for %s ' % (self.__id, self.__tc.name))
+                    self.__traffic_status = 'faulty_scenario'
+
+            except KeyboardInterrupt:
+                _WRN('%s Cancelled by user' % self.__id)
+                self.__traffic_status = 'stopping'
+                self.channel.write_line(chr(3))
+                quit_program(SUCCESS)
+
+            except pexpect.TIMEOUT as e:
+                _DEB('%s pexpect.TIMEOUT received' % self.__id)
+
+            except pexpect.EOF as e:
+                _ERR('%s pexpect.EOF received' % self.__id)
+                quit_program(CONNECTION_ERROR)
+
+
+def main():
+    global TRAFFIC_HANDLER
+    global TCP_DUMP_HANDLER
+    global HTTPSERVER_HANDLER
+    user_config = parse_commandline()
+
+    _INF('Node         : %s' % user_config.node)
+    _INF('')
+
+    if not user_config.skip_httpserver:
+        cmd = 'CBA_get_traffic_info %s -s udmClient --user %s' % ('-6' if user_config.ipv6 else '', user_config.user)
+        _INF('Executing:  "%s"' % cmd)
+
+        stdout_value, stderr_value, returncode = hss_utils.st_command.execute_cmd(cmd, stdout=True, stderr=True)
+        httpserver_started = False
+        if returncode:
+            _WRN('Problem reading UDM CLIENT info from cabinet')
+
+        for line in stdout_value.splitlines():
+            if 'udmClient' in line and 'None' not in line:
+                HTTPSERVER_HANDLER = HTTP_server_handler(line.split('=')[-1],user_config.working_path, user_config.ipv6)
+                HTTPSERVER_HANDLER.start_http_server()
+                httpserver_started = True
+
+        if not httpserver_started:
+            _WRN('Httpserver has not been started')
+
+    TRAFFIC_HANDLER = Traffic_handler(user_config)
+    try:
+        for traf_case in user_config.TRAFFIC_CASES:
+            tc = Traffic_case(traf_case, user_config)
+            _INF('')
+            _INF('Start execution for %s ' % str(tc))
+            _INF('')
+            if not user_config.skip_tcpdump:
+                TCP_DUMP_HANDLER = TCP_dump_handler(tc)
+                TCP_DUMP_HANDLER.start_tcpdump()
+                if TCP_DUMP_HANDLER.status != 'running':
+                    _ERR('TCP dump start problem')
+                    quit_program(CONNECTION_ERROR)
+
+            if HTTPSERVER_HANDLER:
+                HTTPSERVER_HANDLER.start_tc(tc.name)
+                if HTTPSERVER_HANDLER.status != 'running':
+                    _ERR('Http server start problem')
+                    quit_program(CONNECTION_ERROR)
+
+            TRAFFIC_HANDLER.run(tc)
+
+            if HTTPSERVER_HANDLER:
+                HTTPSERVER_HANDLER.stop_tc(tc.name)
+
+            if TCP_DUMP_HANDLER:
+                TCP_DUMP_HANDLER.stop_tcpdump()
+                if TCP_DUMP_HANDLER.is_alive():
+                    _INF('Waiting for TCP_DUMP_HANDLER shutdown. Max time 30 seconds.')
+                    TCP_DUMP_HANDLER.join(30.0)
+                TCP_DUMP_HANDLER = None
+
+            if TRAFFIC_HANDLER.traffic_executed:
+                _INF('Execution for %s success' % tc.name)
+                _INF('')
+                TRAFFIC_HANDLER.analyze_traffic_error()
+                _INF('')
+                if user_config.check_stats:
+                    TRAFFIC_HANDLER.analyze_statistic_file()
+    except KeyboardInterrupt:
+        _INF('Execution stopped by user')
+
+
+    quit_program(SUCCESS)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        _ERR('Unhandled Ctr-C, please report this LOG to tools team')
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+    except Exception as e:
+        _ERR('Unhandled Exception, please report this LOG to tools team')
+        _DEB('Additional information: %s' % str(e))
+        _DEB('** STACK TRACE **')
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        for tb in traceback.format_tb(exc_traceback):
+            _DEB(tb)
+        for tb in traceback.format_exception(exc_type, exc_value, exc_traceback):
+            _DEB(tb)
+        quit_program(50)
+
+    quit_program(0)
